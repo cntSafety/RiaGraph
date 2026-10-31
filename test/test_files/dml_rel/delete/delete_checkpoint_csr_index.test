@@ -1,0 +1,63 @@
+-DATASET CSV EMPTY
+
+--
+
+# Regression test for cntsafety/RiaGraph#16 (LadybugDB/ladybug#611).  # riag-rename:skip upstream provenance
+#
+# `CSRNodeGroup::checkpointInMemAndOnDisk` collects per-region changes first, and that
+# collection pass invalidates every in-memory row it finds deleted by writing an
+# INVALID_ROW_IDX sentinel into the CSR index. When the pass concludes that no region
+# needs to be written (every in-memory rel in the node group had been deleted, and
+# nothing persistent changed) the function used to return early, before
+# `finalizeCheckpoint`. That left the in-memory chunked groups attached and the CSR
+# index full of sentinels, which a later scan or checkpoint turns into an out-of-range
+# chunk group index.
+#
+# The observable invariant: after a checkpoint, a rel node group has no in-memory
+# chunked groups left.
+-CASE DeleteAllInMemRelsThenCheckpointClearsInMemState
+-SKIP_IN_MEM
+-STATEMENT CREATE NODE TABLE person (id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE REL TABLE knows (FROM person TO person, val INT64);
+---- ok
+-STATEMENT CREATE (a:person {id: 0});
+---- ok
+-STATEMENT CREATE (a:person {id: 1});
+---- ok
+-STATEMENT CREATE (a:person {id: 2});
+---- ok
+-STATEMENT CREATE (a:person {id: 3});
+---- ok
+-STATEMENT CREATE (a:person {id: 4});
+---- ok
+-STATEMENT CREATE (a:person {id: 5});
+---- ok
+# First rel plus a checkpoint, so the node group ends up with a persistent chunk group
+# and later checkpoints take the `checkpointInMemAndOnDisk` path.
+-STATEMENT MATCH (a:person), (b:person) WHERE a.id = 0 AND b.id = 1 CREATE (a)-[:knows {val: 1}]->(b);
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+# These two commit into the in-memory chunked groups of the same node group.
+-STATEMENT MATCH (a:person), (b:person) WHERE a.id = 2 AND b.id = 3 CREATE (a)-[:knows {val: 2}]->(b);
+---- ok
+-STATEMENT MATCH (a:person), (b:person) WHERE a.id = 4 AND b.id = 5 CREATE (a)-[:knows {val: 3}]->(b);
+---- ok
+# Delete exactly the in-memory rels: no persistent row is touched, so the checkpoint
+# below finds no region to write.
+-STATEMENT MATCH (a:person)-[e:knows]->(b:person) WHERE a.id = 2 OR a.id = 4 DELETE e;
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT CALL storage_info('knows') WHERE residency = 'IN_MEMORY' RETURN count(*);
+---- 1
+0
+# The untouched rel must still be readable, in this session and after a reload.
+-STATEMENT MATCH (a:person)-[e:knows]->(b:person) RETURN a.id, b.id, e.val;
+---- 1
+0|1|1
+-RELOADDB
+-STATEMENT MATCH (a:person)-[e:knows]->(b:person) RETURN a.id, b.id, e.val;
+---- 1
+0|1|1

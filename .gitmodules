@@ -1,0 +1,24 @@
+[submodule "extension"]
+	path = extension
+	url = https://github.com/cntSafety/RiaGraphExtension.git
+[submodule "benchmark"]
+	path = benchmark
+	url = https://github.com/cntSafety/RiaGraphBenchmark.git
+[submodule "dataset"]
+	path = dataset
+	url = https://github.com/cntSafety/RiaGraphDataset.git
+[submodule "tools/java_api"]
+	path = tools/java_api
+	url = https://github.com/cntSafety/RiaGraphJava.git
+[submodule "tools/nodejs_api"]
+	path = tools/nodejs_api
+	url = https://github.com/cntSafety/RiaGraphNodejs.git
+[submodule "tools/python_api"]
+	path = tools/python_api
+	url = https://github.com/cntSafety/RiaGraphPython.git
+[submodule "tools/rust_api"]
+	path = tools/rust_api
+	url = https://github.com/cntSafety/RiaGraphRust.git
+[submodule "tools/wasm"]
+	path = tools/wasm
+	url = https://github.com/cntSafety/RiaGraphWasm.git

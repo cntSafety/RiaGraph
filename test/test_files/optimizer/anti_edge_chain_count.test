@@ -1,0 +1,91 @@
+-DATASET CSV empty
+--
+
+# COUNT_ANTI_EDGE_CHAIN (the LSQB q9 count rewrite: two chain hops, an anti-edge between the outer
+# nodes, then a suffix of directed hops) computes T - S - A. Expected values were computed outside
+# the engine, by enumerating the paths in Python. The build before the planner series answers every
+# query below correctly; the series as imported from upstream did not.
+
+-CASE AntiEdgeChainCompleteDigraphNoSelfLoops
+# Every pair of nodes is adjacent, so the only chain tuples that pass NOT EXISTS are the ones with n0 = n2.
+# Without id(n0) <> id(n2) those must be counted (the rewrite used to drop them).
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P);
+---- ok
+-STATEMENT UNWIND range(0, 3) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT MATCH (a:P), (b:P) WHERE a.id <> b.id CREATE (a)-[:K]->(b);
+---- ok
+-LOG CompleteDigraphNoSelfLoopsSuffix1Neq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} AND id(a) <> id(c) RETURN count(*)
+---- 1
+0
+-LOG CompleteDigraphNoSelfLoopsSuffix1Noneq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} RETURN count(*)
+---- 1
+36
+-LOG CompleteDigraphNoSelfLoopsSuffix2Neq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P)-[:K]->(f:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} AND id(a) <> id(c) RETURN count(*)
+---- 1
+0
+-LOG CompleteDigraphNoSelfLoopsSuffix2Noneq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P)-[:K]->(f:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} RETURN count(*)
+---- 1
+108
+
+-CASE AntiEdgeChainCompleteDigraphWithSelfLoops
+# Every pair, n0 = n2 included, has an anti-edge row (a self-loop for n0 = n2), so nothing passes.
+# The rewrite used to subtract the n0 = n2 tuples twice and return a negative count.
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P);
+---- ok
+-STATEMENT UNWIND range(0, 2) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT MATCH (a:P), (b:P) WHERE true CREATE (a)-[:K]->(b);
+---- ok
+-LOG CompleteDigraphWithSelfLoopsSuffix1Neq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} AND id(a) <> id(c) RETURN count(*)
+---- 1
+0
+-LOG CompleteDigraphWithSelfLoopsSuffix1Noneq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} RETURN count(*)
+---- 1
+0
+-LOG CompleteDigraphWithSelfLoopsSuffix2Neq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P)-[:K]->(f:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} AND id(a) <> id(c) RETURN count(*)
+---- 1
+0
+-LOG CompleteDigraphWithSelfLoopsSuffix2Noneq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P)-[:K]->(f:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} RETURN count(*)
+---- 1
+0
+
+-CASE AntiEdgeChainModularGraphWithSelfLoops
+# A 100-node graph with 19 self-loops. A chain tuple with n0 = n2 = p where p has a self-loop is
+# removed by the anti-edge predicate; the n0 <> n2 correction must not remove it a second time.
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P);
+---- ok
+-STATEMENT UNWIND range(0, 99) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT MATCH (a:P), (b:P) WHERE (a.id * 7 + b.id * 3) % 11 < 2 CREATE (a)-[:K]->(b);
+---- ok
+-LOG ModularGraphWithSelfLoopsSuffix1Neq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} AND id(a) <> id(c) RETURN count(*)
+---- 1
+401841
+-LOG ModularGraphWithSelfLoopsSuffix1Noneq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} RETURN count(*)
+---- 1
+404757
+-LOG ModularGraphWithSelfLoopsSuffix2Neq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P)-[:K]->(f:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} AND id(a) <> id(c) RETURN count(*)
+---- 1
+7304013
+-LOG ModularGraphWithSelfLoopsSuffix2Noneq
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(e:P)-[:K]->(f:P) WHERE NOT EXISTS {MATCH (a)-[:K]-(c)} RETURN count(*)
+---- 1
+7356501

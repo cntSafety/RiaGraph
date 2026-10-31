@@ -1,0 +1,335 @@
+# Self-contained Node.js bindings for embedding applications (RiaCore).
+#
+# Each platform gets one directory with everything `require()` needs — the JS
+# wrapper, riagjs.node, package.json, LICENSE and BUILD_INFO.json — packed as
+# riagraph-nodejs-<version>-<platform>.tar.gz. OpenSSL is linked statically and
+# the Linux build has a glibc 2.28 floor (manylinux_2_28, -static-libstdc++), so
+# the binding loads on a stock system with no other files next to it.
+#
+# workflow_dispatch with a release tag, or pushing a `nodejs-v*` tag, attaches
+# the archives and SHA256SUMS to a GitHub release (a prerelease unless asked
+# otherwise). Without a tag the archives are only kept as workflow artifacts.
+name: Node.js binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release to create, e.g. nodejs-v0.22.0-1 (empty: build only)"
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: "Mark the release as a prerelease"
+        required: false
+        default: true
+        type: boolean
+  push:
+    tags: ["nodejs-v*"]
+  # A change to this workflow builds all platforms (without releasing).
+  pull_request:
+    paths: [".github/workflows/nodejs-binaries.yml"]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+  OPENSSL_VERSION: "3.5.4"
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            os: ubuntu-22.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+          - platform: darwin-arm64
+            os: macos-15
+          - platform: win32-x64
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the Node.js binding
+        shell: bash
+        run: |
+          git config --global --add safe.directory '*'
+          git config --global url."https://x-access-token:${{ secrets.GH_TOKEN_RIAGRAPH }}@github.com/".insteadOf "https://github.com/"
+          git submodule update --init tools/nodejs_api
+
+      # ---- toolchains -------------------------------------------------------
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled powertools
+          dnf install -y cmake ninja-build python3 git ccache gcc-toolset-13 perl-IPC-Cmd perl-Pod-Html perl-Time-Piece xz
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable long paths (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          git config --system core.longpaths true
+
+      # ---- static OpenSSL 3 ---------------------------------------------------
+
+      - name: Cache OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        id: openssl-cache-linux
+        uses: actions/cache@v4
+        with:
+          path: /opt/openssl-static
+          key: openssl-static-${{ env.OPENSSL_VERSION }}-manylinux_2_28-gcc13
+
+      - name: Build static OpenSSL (Linux)
+        if: runner.os == 'Linux' && steps.openssl-cache-linux.outputs.cache-hit != 'true'
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          curl -fsSL -o /tmp/openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          mkdir -p /tmp/openssl && tar -xzf /tmp/openssl.tar.gz -C /tmp/openssl --strip-components=1
+          cd /tmp/openssl
+          ./Configure linux-x86_64 no-shared no-tests no-docs -fPIC --prefix=/opt/openssl-static --libdir=lib
+          make -j"$(nproc)"
+          make install_sw
+          cp LICENSE.txt /opt/openssl-static/LICENSE.txt
+
+      - name: Use static OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: echo "OPENSSL_ROOT_DIR=/opt/openssl-static" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-archives
+          key: vcpkg-openssl-x64-windows-static-md-${{ env.OPENSSL_VERSION }}
+
+      - name: Build static OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-archives
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl:x64-windows-static-md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          "OPENSSL_ROOT_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ---- build ------------------------------------------------------------
+
+      - name: Install the binding's build dependencies
+        shell: bash
+        working-directory: tools/nodejs_api
+        run: npm install --include=dev --no-audit --no-fund
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          export CC=gcc CXX=g++ LDFLAGS="-static-libstdc++ -static-libgcc"
+          export EXTRA_CMAKE_FLAGS="-DBUILD_SHELL=FALSE -DBUILD_SHARED_RIAG=FALSE -DBUILD_SINGLE_FILE_HEADER=FALSE -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
+          make GEN=Ninja nodejs NUM_THREADS="$(nproc)"
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
+        run: |
+          export EXTRA_CMAKE_FLAGS="-DBUILD_SHELL=FALSE -DBUILD_SHARED_RIAG=FALSE -DBUILD_SINGLE_FILE_HEADER=FALSE -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
+          make GEN=Ninja nodejs NUM_THREADS="$(sysctl -n hw.ncpu)"
+
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          powershell.exe -Command "Add-MpPreference -ExclusionPath '${{ github.workspace }}'"
+          set "EXTRA_CMAKE_FLAGS=-DBUILD_SHELL=FALSE -DBUILD_SHARED_RIAG=FALSE -DBUILD_SINGLE_FILE_HEADER=FALSE -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_MSVC_STATIC_RT=FALSE -DOPENSSL_ROOT_DIR=%OPENSSL_ROOT_DIR:\=/%"
+          make GEN=Ninja nodejs
+
+      # ---- package ----------------------------------------------------------
+
+      - name: Assemble the binding directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="dist/riagraph-core"
+          rm -rf dist && mkdir -p "$out"
+          build=tools/nodejs_api/build
+          [ -f "$build/riagjs.node" ] || { echo "riagjs.node was not produced" >&2; exit 1; }
+          cp "$build"/*.js "$build"/*.mjs "$build"/*.d.ts "$build/riagjs.node" "$out"/
+          cp LICENSE "$out/LICENSE"
+          # OpenSSL is linked in: ship its license and record its version.
+          ossl_root="$OPENSSL_ROOT_DIR"
+          if command -v cygpath >/dev/null 2>&1; then ossl_root="$(cygpath -u "$ossl_root")"; fi
+          openssl_version="$(sed -n -E 's/^# *define OPENSSL_VERSION_STR "([^"]+)".*/\1/p' "$ossl_root/include/openssl/opensslv.h" | head -1)"
+          [ -n "$openssl_version" ] || { echo "OpenSSL version not found under $ossl_root" >&2; exit 1; }
+          for license in "$ossl_root/LICENSE.txt" "$ossl_root/share/openssl/copyright"; do
+            if [ -f "$license" ]; then cp "$license" "$out/OPENSSL-LICENSE.txt"; break; fi
+          done
+          [ -f "$out/OPENSSL-LICENSE.txt" ] || { echo "OpenSSL license not found under $ossl_root" >&2; exit 1; }
+          # The third-party libraries compiled into riagjs.node, with their license texts.
+          mkdir -p "$out/third-party-licenses"
+          find third_party -maxdepth 3 -type f \( -iname 'licen[cs]e*' -o -iname 'notice*' -o -iname 'copying*' \) | sort | while read -r file; do
+            lib="$(echo "$file" | cut -d/ -f2)"
+            cp "$file" "$out/third-party-licenses/${lib}-$(basename "$file")"
+          done
+          [ -f third_party/versions.txt ] && cp third_party/versions.txt "$out/third-party-licenses/versions.txt"
+          ls "$out/third-party-licenses"
+          version="$(node -e "process.stdout.write(String(require('./$out/index.js').VERSION))")"
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('tools/nodejs_api/package.json', 'utf8'));
+            delete pkg.scripts; delete pkg.devDependencies;
+            pkg.version = process.argv[1];
+            fs.writeFileSync('$out/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          " "$version"
+          cat > "$out/BUILD_INFO.json" <<JSON
+          {
+            "engine": "riagraph",
+            "repository": "https://github.com/${GITHUB_REPOSITORY}",
+            "branch": "${GITHUB_REF_NAME}",
+            "uncommittedChanges": false,
+            "commit": "${GITHUB_SHA}",
+            "nodejsApiCommit": "$(git -C tools/nodejs_api rev-parse HEAD)",
+            "version": "${version}",
+            "platform": "${{ matrix.platform }}",
+            "node": "$(node -v)",
+            "openssl": "${openssl_version} (static)",
+            "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflowRun": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          }
+          JSON
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          ls -la "$out"
+
+      - name: Check native dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          lib=dist/riagraph-core/riagjs.node
+          readelf -d "$lib" | grep NEEDED
+          if readelf -d "$lib" | grep -E 'NEEDED.*(libssl|libcrypto|libstdc\+\+)'; then
+            echo "riagjs.node must not need OpenSSL or libstdc++ at run time" >&2; exit 1
+          fi
+          newest="$(objdump -T "$lib" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          echo "newest glibc symbol: $newest"
+          [ "$(printf '%s\nGLIBC_2.28\n' "$newest" | sort -V | tail -1)" = "GLIBC_2.28" ] || { echo "needs glibc newer than 2.28" >&2; exit 1; }
+
+      - name: Check native dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          lib=dist/riagraph-core/riagjs.node
+          otool -L "$lib"
+          # The first entry after the file name is the module's own install name.
+          if otool -L "$lib" | tail -n +2 | grep -v -E '^\s+(/usr/lib/|/System/Library/|@rpath/riagjs\.node )'; then
+            echo "riagjs.node links libraries outside the system" >&2; exit 1
+          fi
+          otool -l "$lib" | grep -A3 LC_BUILD_VERSION | grep minos
+
+      - name: Check native dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          dumpbin /dependents dist\riagraph-core\riagjs.node
+          dumpbin /dependents dist\riagraph-core\riagjs.node | findstr /I "libssl libcrypto" && (echo riagjs.node must not need OpenSSL DLLs & exit /b 1) || exit /b 0
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const path = require("path"), fs = require("fs"), os = require("os");
+            const riag = require(path.resolve("dist/riagraph-core"));
+            (async () => {
+              const dir = fs.mkdtempSync(path.join(os.tmpdir(), "riag-smoke-"));
+              const run = async (c, q) => (await c.query(q)).getAll();
+              const db = new riag.Database(path.join(dir, "a"));
+              const c = new riag.Connection(db);
+              await run(c, "CREATE NODE TABLE T(id SERIAL, name STRING, PRIMARY KEY(id))");
+              for (const n of ["a", "b", "c"]) await run(c, `CREATE (:T {name: \x27${n}\x27})`);
+              await run(c, "MATCH (t:T) WHERE t.name = \x27b\x27 DELETE t");
+              const exp = path.join(dir, "export").split(path.sep).join("/");
+              await run(c, `EXPORT DATABASE \x27${exp}\x27 (format=\x27parquet\x27)`);
+              const db2 = new riag.Database(path.join(dir, "b"));
+              const c2 = new riag.Connection(db2);
+              await run(c2, `IMPORT DATABASE \x27${exp}\x27`);
+              await run(c2, "CREATE (:T {name: \x27d\x27})");
+              const rows = await run(c2, "MATCH (t:T) RETURN t.id AS id, t.name AS name ORDER BY id");
+              const got = JSON.stringify(rows);
+              const want = JSON.stringify([{ id: 0, name: "a" }, { id: 2, name: "c" }, { id: 3, name: "d" }]);
+              if (got !== want) throw new Error(`export/import round trip: ${got} != ${want}`);
+              console.log("RiaGraph", riag.VERSION, "loads, queries and round-trips EXPORT/IMPORT DATABASE");
+              process.exit(0);
+            })().catch((e) => { console.error(e); process.exit(1); });
+          '
+
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="riagraph-nodejs-${VERSION}-${{ matrix.platform }}.tar.gz"
+          tar -C dist -czf "$archive" riagraph-core
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: riagraph-nodejs-${{ matrix.platform }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') || startsWith(github.ref, 'refs/tags/nodejs-v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: riagraph-nodejs-*
+          merge-multiple: true
+          path: assets
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          PRERELEASE: ${{ github.event_name != 'workflow_dispatch' || inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          cd assets
+          sha256sum riagraph-nodejs-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          flags=()
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          gh release create "$TAG" riagraph-nodejs-*.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" "${flags[@]}" \
+            --title "Node.js binaries $TAG" \
+            --notes "Self-contained Node.js bindings (OpenSSL linked statically; Linux glibc >= 2.28) built from ${GITHUB_SHA} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."

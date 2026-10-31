@@ -1,0 +1,108 @@
+#include "binder/binder.h"
+#include "catalog/catalog.h"
+#include "catalog/catalog_entry/catalog_entry.h"
+#include "processor/expression_mapper.h"
+#include "storage/storage_manager.h"
+#include "storage/table/node_table.h"
+#include "storage/table/rel_table.h"
+#include "storage/table/table.h"
+#include "storage/wal/wal_replayer.h"
+
+using namespace riag::binder;
+using namespace riag::catalog;
+using namespace riag::common;
+using namespace riag::processor;
+using namespace riag::storage;
+
+namespace riag {
+namespace storage {
+
+void WALReplayer::replayAlterTableEntryRecord(const WALRecord& walRecord) const {
+    auto binder = Binder(&clientContext);
+    auto& alterEntryRecord = walRecord.constCast<AlterTableEntryRecord>();
+    auto catalog = Catalog::Get(clientContext);
+    auto transaction = transaction::Transaction::Get(clientContext);
+    auto storageManager = StorageManager::Get(clientContext);
+    auto ownedAlterInfo = alterEntryRecord.ownedAlterInfo.get();
+    if (ownedAlterInfo->alterType == AlterType::ADD_FROM_TO_CONNECTION ||
+        ownedAlterInfo->alterType == AlterType::DROP_FROM_TO_CONNECTION) {
+        auto& connectionInfo = ownedAlterInfo->extraInfo->cast<BoundExtraAlterFromToConnection>();
+        connectionInfo.fromTableID =
+            getReplayedEntryID(CatalogEntryType::NODE_TABLE_ENTRY, connectionInfo.fromTableID);
+        connectionInfo.toTableID =
+            getReplayedEntryID(CatalogEntryType::NODE_TABLE_ENTRY, connectionInfo.toTableID);
+    }
+    catalog->alterTableEntry(transaction, *ownedAlterInfo);
+    auto& pageAllocator = *PageManager::Get(clientContext);
+    switch (ownedAlterInfo->alterType) {
+    case AlterType::ADD_PROPERTY: {
+        const auto exprBinder = binder.getExpressionBinder();
+        const auto addInfo = ownedAlterInfo->extraInfo->constPtrCast<BoundExtraAddPropertyInfo>();
+        const auto boundDefault =
+            exprBinder->bindExpression(*addInfo->propertyDefinition.defaultExpr);
+        auto exprMapper = ExpressionMapper();
+        const auto defaultValueEvaluator = exprMapper.getEvaluator(boundDefault);
+        defaultValueEvaluator->init(ResultSet(0) /* dummy ResultSet */, &clientContext);
+        const auto entry = catalog->getTableCatalogEntry(transaction, ownedAlterInfo->tableName);
+        const auto& addedProp = entry->getProperty(addInfo->propertyDefinition.getName());
+        TableAddColumnState state{addedProp, *defaultValueEvaluator};
+        DASSERT(StorageManager::Get(clientContext));
+        switch (entry->getTableType()) {
+        case TableType::REL: {
+            for (auto& relEntryInfo : entry->cast<RelGroupCatalogEntry>().getRelEntryInfos()) {
+                storageManager->getTable(relEntryInfo.oid)
+                    ->addColumn(transaction, state, pageAllocator);
+            }
+        } break;
+        case TableType::NODE: {
+            storageManager->getTable(entry->getTableID())
+                ->addColumn(transaction, state, pageAllocator);
+        } break;
+        default: {
+            UNREACHABLE_CODE;
+        }
+        }
+    } break;
+    case AlterType::DROP_PROPERTY: {
+        // Mirror the normal DDL path (Alter::alterTable): dropping a property removes
+        // the column from storage by bumping the table change epoch so the next
+        // checkpoint rewrites the table without the dropped column. Without this,
+        // a WAL-replayed DROP leaves the epoch untouched: a later checkpoint
+        // early-returns for the table while the catalog still vacuums the dropped
+        // column ID, so re-adding the property aliases the stale in-memory column.
+        const auto alteredEntry =
+            catalog->getTableCatalogEntry(transaction, ownedAlterInfo->tableName);
+        switch (alteredEntry->getTableType()) {
+        case TableType::NODE: {
+            storageManager->getTable(alteredEntry->getTableID())->dropColumn();
+        } break;
+        case TableType::REL: {
+            for (auto& innerRelEntry :
+                alteredEntry->cast<RelGroupCatalogEntry>().getRelEntryInfos()) {
+                storageManager->getTable(innerRelEntry.oid)->dropColumn();
+            }
+        } break;
+        default: {
+            UNREACHABLE_CODE;
+        }
+        }
+    } break;
+    case AlterType::ADD_FROM_TO_CONNECTION: {
+        auto extraInfo = ownedAlterInfo->extraInfo->constPtrCast<BoundExtraAlterFromToConnection>();
+        auto relGroupEntry = catalog->getTableCatalogEntry(transaction, ownedAlterInfo->tableName)
+                                 ->ptrCast<RelGroupCatalogEntry>();
+        auto relEntryInfo =
+            relGroupEntry->getRelEntryInfo(extraInfo->fromTableID, extraInfo->toTableID);
+        storageManager->addRelTable(relGroupEntry, *relEntryInfo, &clientContext);
+        if (alterEntryRecord.addedRelTableOID != INVALID_TABLE_ID) {
+            recordReplayedEntryID(CatalogEntryType::REL_GROUP_ENTRY,
+                alterEntryRecord.addedRelTableOID, relEntryInfo->oid);
+        }
+    } break;
+    default:
+        break;
+    }
+}
+
+} // namespace storage
+} // namespace riag

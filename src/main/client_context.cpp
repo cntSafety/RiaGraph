@@ -1,0 +1,961 @@
+#include "main/client_context.h"
+
+#include <algorithm>
+#include <cstdlib>
+
+#include "binder/binder.h"
+#include "binder/expression/parameter_expression.h"
+#include "common/exception/checkpoint.h"
+#include "common/exception/connection.h"
+#include "common/exception/runtime.h"
+#include "common/file_system/virtual_file_system.h"
+#include "common/random_engine.h"
+#include "common/string_utils.h"
+#include "common/task_system/progress_bar.h"
+#include "extension/extension.h"
+#include "extension/extension_manager.h"
+#include "graph/graph_entry_set.h"
+#include "main/attached_database.h"
+#include "main/database.h"
+#include "main/database_manager.h"
+#include "main/db_config.h"
+#include "optimizer/optimizer.h"
+#include "parser/parser.h"
+#include "parser/visitor/standalone_call_rewriter.h"
+#include "parser/visitor/statement_read_write_analyzer.h"
+#include "planner/planner.h"
+#include "processor/operator/sink.h"
+#include "processor/plan_mapper.h"
+#include "processor/processor.h"
+#include "storage/buffer_manager/buffer_manager.h"
+#include "storage/buffer_manager/spiller.h"
+#include "storage/storage_manager.h"
+#include "storage/storage_utils.h"
+#include "transaction/transaction_context.h"
+#include <format>
+#include <processor/warning_context.h>
+
+#if defined(_WIN32)
+#include "common/windows_utils.h"
+#endif
+
+using namespace riag::parser;
+using namespace riag::binder;
+using namespace riag::common;
+using namespace riag::catalog;
+using namespace riag::planner;
+using namespace riag::processor;
+using namespace riag::transaction;
+
+namespace riag {
+namespace main {
+
+namespace {
+// Resets useInternalCatalogEntry on scope exit, including when binding throws.
+// The flag is set while binding internal statements (e.g. extension rewrite funcs)
+// and is consumed by later binds within the same top-level call; it must never
+// leak into the next statement, or later user DDL would be misfiled into the
+// riag-rename:skip-next upstream provenance
+// internal catalog set (see https://github.com/LadybugDB/ladybug/issues/1162).
+struct InternalCatalogFlagGuard {
+    explicit InternalCatalogFlagGuard(ClientContext& context) : context{context} {}
+    ~InternalCatalogFlagGuard() { context.setUseInternalCatalogEntry(false); }
+    InternalCatalogFlagGuard(const InternalCatalogFlagGuard&) = delete;
+    InternalCatalogFlagGuard& operator=(const InternalCatalogFlagGuard&) = delete;
+
+private:
+    ClientContext& context;
+};
+} // namespace
+
+ActiveQuery::ActiveQuery() : interrupted{false} {}
+
+void ActiveQuery::reset() {
+    interrupted = false;
+    queryID.reset();
+    timer = Timer();
+}
+
+ClientContext::ClientContext(Database* database) : localDatabase{database} {
+    transactionContext = std::make_unique<TransactionContext>(*this);
+    randomEngine = std::make_unique<RandomEngine>();
+    remoteDatabase = nullptr;
+    graphEntrySet = std::make_unique<graph::GraphEntrySet>();
+    clientConfig.homeDirectory = getUserHomeDir();
+    clientConfig.fileSearchPath = "";
+    addDBDirToFileSearchPath(database->databasePath);
+    clientConfig.enableSemiMask = ClientConfigDefault::ENABLE_SEMI_MASK;
+    clientConfig.enableZoneMap = ClientConfigDefault::ENABLE_ZONE_MAP;
+    clientConfig.numThreads = database->dbConfig->maxNumThreads;
+    clientConfig.timeoutInMS = ClientConfigDefault::TIMEOUT_IN_MS;
+    clientConfig.varLengthMaxDepth = ClientConfigDefault::VAR_LENGTH_MAX_DEPTH;
+    clientConfig.enableProgressBar = ClientConfigDefault::ENABLE_PROGRESS_BAR;
+    clientConfig.showProgressAfter = ClientConfigDefault::SHOW_PROGRESS_AFTER;
+    clientConfig.recursivePatternSemantic = ClientConfigDefault::RECURSIVE_PATTERN_SEMANTIC;
+    clientConfig.recursivePatternCardinalityScaleFactor =
+        ClientConfigDefault::RECURSIVE_PATTERN_FACTOR;
+    clientConfig.disableMapKeyCheck = ClientConfigDefault::DISABLE_MAP_KEY_CHECK;
+    clientConfig.enablePackedPathExtend = ClientConfigDefault::ENABLE_PACKED_PATH_EXTEND;
+    clientConfig.warningLimit = ClientConfigDefault::WARNING_LIMIT;
+    progressBar = std::make_unique<ProgressBar>(clientConfig.enableProgressBar);
+    warningContext = std::make_unique<WarningContext>(&clientConfig);
+}
+
+ClientContext::~ClientContext() {
+    if (preventTransactionRollbackOnDestruction) {
+        return;
+    }
+    if (auto* transaction = Transaction::Get(*this)) {
+        getDatabase()->transactionManager->rollback(*this, transaction->getID());
+    }
+}
+
+const DBConfig* ClientContext::getDBConfig() const {
+    return getDatabase()->dbConfig.get();
+}
+
+DBConfig* ClientContext::getDBConfigUnsafe() const {
+    return getDatabase()->dbConfig.get();
+}
+
+uint64_t ClientContext::getTimeoutRemainingInMS() const {
+    DASSERT(hasTimeout());
+    const auto elapsed = activeQuery.timer.getElapsedTimeInMS();
+    return elapsed >= clientConfig.timeoutInMS ? 0 : clientConfig.timeoutInMS - elapsed;
+}
+
+void ClientContext::startTimer() {
+    if (hasTimeout()) {
+        activeQuery.timer.start();
+    }
+}
+
+void ClientContext::setQueryTimeOut(uint64_t timeoutInMS) {
+    lock_t lck{mtx};
+    clientConfig.timeoutInMS = timeoutInMS;
+}
+
+uint64_t ClientContext::getQueryTimeOut() const {
+    return clientConfig.timeoutInMS;
+}
+
+void ClientContext::setMaxNumThreadForExec(uint64_t numThreads) {
+    lock_t lck{mtx};
+    if (numThreads == 0) {
+        numThreads = localDatabase->dbConfig->maxNumThreads;
+    }
+    clientConfig.numThreads = numThreads;
+}
+
+uint64_t ClientContext::getMaxNumThreadForExec() const {
+    return clientConfig.numThreads;
+}
+
+Value ClientContext::getCurrentSetting(const std::string& optionName) const {
+    auto lowerCaseOptionName = optionName;
+    StringUtils::toLower(lowerCaseOptionName);
+    // Firstly, try to find in built-in options.
+    const auto option = DBConfig::getOptionByName(lowerCaseOptionName);
+    if (option != nullptr) {
+        return option->getSetting(this);
+    }
+    // Secondly, try to find in current client session.
+    if (extensionOptionValues.contains(lowerCaseOptionName)) {
+        return extensionOptionValues.at(lowerCaseOptionName);
+    }
+    // Lastly, find the default value in db clientConfig.
+    const auto defaultOption = getExtensionOption(lowerCaseOptionName);
+    if (defaultOption != nullptr) {
+        return defaultOption->defaultValue;
+    }
+    throw RuntimeException{"Invalid option name: " + lowerCaseOptionName + "."};
+}
+
+void ClientContext::addScanReplace(function::ScanReplacement scanReplacement) {
+    scanReplacements.push_back(std::move(scanReplacement));
+}
+
+std::unique_ptr<function::ScanReplacementData> ClientContext::tryReplaceByName(
+    const std::string& objectName) const {
+    for (auto& scanReplacement : scanReplacements) {
+        auto replaceHandles = scanReplacement.lookupFunc(objectName);
+        if (replaceHandles.empty()) {
+            continue; // Fail to replace.
+        }
+        return scanReplacement.replaceFunc(std::span(replaceHandles.begin(), replaceHandles.end()));
+    }
+    return {};
+}
+
+std::unique_ptr<function::ScanReplacementData> ClientContext::tryReplaceByHandle(
+    function::scan_replace_handle_t handle) const {
+    auto handleSpan = std::span{&handle, 1};
+    for (auto& scanReplacement : scanReplacements) {
+        auto replaceData = scanReplacement.replaceFunc(handleSpan);
+        if (replaceData == nullptr) {
+            continue; // Fail to replace.
+        }
+        return replaceData;
+    }
+    return nullptr;
+}
+
+void ClientContext::setExtensionOption(std::string name, Value value) {
+    StringUtils::toLower(name);
+    extensionOptionValues.insert_or_assign(name, std::move(value));
+}
+
+const main::ExtensionOption* ClientContext::getExtensionOption(std::string optionName) const {
+    return localDatabase->extensionManager->getExtensionOption(optionName);
+}
+
+std::string ClientContext::getExtensionDir() const {
+    return std::format("{}/.riag/extension/{}/{}/", clientConfig.homeDirectory,
+        RIAG_EXTENSION_VERSION, extension::getPlatform());
+}
+
+std::string ClientContext::getDatabasePath() const {
+    return localDatabase->databasePath;
+}
+
+Database* ClientContext::getDatabase() const {
+    return localDatabase;
+}
+
+AttachedRiaGDatabase* ClientContext::getAttachedDatabase() const {
+    return remoteDatabase;
+}
+
+bool ClientContext::isInMemory() const {
+    if (remoteDatabase != nullptr) {
+        // If we are connected to a remote database, we assume it is not in memory.
+        return false;
+    }
+    return localDatabase->storageManager->isInMemory();
+}
+
+void ClientContext::addDBDirToFileSearchPath(const std::string& dbPath) {
+    // Skip remote paths (e.g. s3://, https://)
+    if (dbPath.find("://") != std::string::npos) {
+        return;
+    }
+    if (dbPath.find_first_of("/\\") == std::string::npos) {
+        return;
+    }
+    const auto expandedPath = storage::StorageUtils::expandPath(this, dbPath);
+    const auto slashPos = expandedPath.find_last_of("/\\");
+    if (slashPos == std::string::npos) {
+        return;
+    }
+    std::string dirPath = expandedPath.substr(0, slashPos);
+    if (dirPath.empty()) {
+        dirPath = expandedPath[slashPos] == '\\' ? "\\" : "/";
+    } else {
+        dirPath = std::filesystem::absolute(dirPath).lexically_normal().string();
+    }
+    // Prepend to fileSearchPath if not already present
+    auto& fileSearchPath = clientConfig.fileSearchPath;
+    if (!fileSearchPath.empty()) {
+        const auto searchPaths = StringUtils::split(fileSearchPath, ",");
+        if (std::find(searchPaths.begin(), searchPaths.end(), dirPath) != searchPaths.end()) {
+            return;
+        }
+        fileSearchPath = std::format("{},{}", dirPath, fileSearchPath);
+    } else {
+        fileSearchPath = dirPath;
+    }
+}
+
+std::string ClientContext::getEnvVariable(const std::string& name) {
+#if defined(_WIN32)
+    auto envValue = WindowsUtils::utf8ToUnicode(name.c_str());
+    wchar_t* result = nullptr;
+    size_t len = 0;
+    if (_wdupenv_s(&result, &len, envValue.c_str()) != 0 || !result) {
+        return std::string();
+    }
+    std::string out = WindowsUtils::unicodeToUTF8(result);
+    free(result);
+    return out;
+#else
+    const char* env = getenv(name.c_str()); // NOLINT(*-mt-unsafe)
+    if (!env) {
+        return std::string();
+    }
+    return env;
+#endif
+}
+
+std::string ClientContext::getUserHomeDir() {
+#if defined(_WIN32)
+    return getEnvVariable("USERPROFILE");
+#else
+    return getEnvVariable("HOME");
+#endif
+}
+
+void ClientContext::setDefaultDatabase(AttachedRiaGDatabase* defaultDatabase_) {
+    remoteDatabase = defaultDatabase_;
+}
+
+bool ClientContext::hasDefaultDatabase() const {
+    return remoteDatabase != nullptr;
+}
+
+void ClientContext::addScalarFunction(std::string name, function::function_set definitions) {
+    TransactionHelper::runFuncInTransaction(
+        *transactionContext,
+        [&]() {
+            localDatabase->catalog->addFunction(Transaction::Get(*this),
+                CatalogEntryType::SCALAR_FUNCTION_ENTRY, std::move(name), std::move(definitions));
+        },
+        false /*readOnlyStatement*/, false /*isTransactionStatement*/,
+        TransactionHelper::TransactionCommitAction::COMMIT_IF_NEW);
+}
+
+void ClientContext::removeScalarFunction(const std::string& name) {
+    TransactionHelper::runFuncInTransaction(
+        *transactionContext,
+        [&]() { localDatabase->catalog->dropFunction(Transaction::Get(*this), name); },
+        false /*readOnlyStatement*/, false /*isTransactionStatement*/,
+        TransactionHelper::TransactionCommitAction::COMMIT_IF_NEW);
+}
+
+void ClientContext::cleanUp() {
+    VirtualFileSystem::GetUnsafe(*this)->cleanUP(this);
+}
+
+void ClientContext::registerQueryStart() {
+    activeQueryCount++;
+}
+
+void ClientContext::registerQueryEnd() {
+    std::lock_guard lck{mtxForClose};
+    DASSERT(activeQueryCount > 0);
+    activeQueryCount--;
+    if (activeQueryCount == 0) {
+        cvForClose.notify_all();
+    }
+}
+
+void ClientContext::waitForNoActiveQuery() {
+    std::unique_lock lck{mtxForClose};
+    cvForClose.wait(lck, [this] { return activeQueryCount.load() == 0; });
+}
+
+std::unique_ptr<PreparedStatement> ClientContext::prepareWithParams(std::string_view query,
+    std::unordered_map<std::string, std::unique_ptr<Value>> inputParams) {
+    std::unique_lock lck{mtx};
+    InternalCatalogFlagGuard flagGuard{*this};
+    auto parsedStatements = std::vector<std::shared_ptr<Statement>>();
+    try {
+        parsedStatements = parseQuery(query);
+    } catch (std::exception& exception) {
+        return PreparedStatement::getPreparedStatementWithError(exception.what());
+    }
+    if (parsedStatements.size() > 1) {
+        return PreparedStatement::getPreparedStatementWithError(
+            "Connection Exception: We do not support prepare multiple statements.");
+    }
+
+    // The binder deals with the parameter values as shared ptrs
+    // Copy the params to a new map that matches the format that the binder expects
+    std::unordered_map<std::string, std::shared_ptr<Value>> inputParamsTmp;
+    for (auto& [key, value] : inputParams) {
+        inputParamsTmp.insert(std::make_pair(key, std::make_shared<Value>(*value)));
+    }
+    auto [preparedStatement, cachedStatement] = prepareNoLock(parsedStatements[0],
+        true /*shouldCommitNewTransaction*/, std::move(inputParamsTmp));
+    preparedStatement->cachedPreparedStatementName =
+        cachedPreparedStatementManager->addStatement(std::move(cachedStatement));
+    preparedStatement->ownerManager = cachedPreparedStatementManager;
+    useInternalCatalogEntry_ = false;
+    return std::move(preparedStatement);
+}
+
+static void bindParametersNoLock(PreparedStatement& preparedStatement,
+    const std::unordered_map<std::string, std::unique_ptr<Value>>& inputParams) {
+    for (auto& key : preparedStatement.getKnownParameters()) {
+        if (inputParams.contains(key)) {
+            // Found input. Update parameter map.
+            preparedStatement.updateParameter(key, inputParams.at(key).get());
+        }
+    }
+    for (auto& key : preparedStatement.getUnknownParameters()) {
+        if (!inputParams.contains(key)) {
+            throw Exception("Parameter " + key + " not found.");
+        }
+        preparedStatement.addParameter(key, inputParams.at(key).get());
+    }
+}
+
+std::unique_ptr<QueryResult> ClientContext::executeWithParams(PreparedStatement* preparedStatement,
+    std::unordered_map<std::string, std::unique_ptr<Value>> inputParams,
+    std::optional<uint64_t> queryID) { // NOLINT(performance-unnecessary-value-param): It doesn't
+    // make sense to pass the map as a const reference.
+    lock_t lck{mtx};
+    InternalCatalogFlagGuard flagGuard{*this};
+    if (!preparedStatement->isSuccess()) {
+        return QueryResult::getQueryResultWithError(preparedStatement->errMsg);
+    }
+    const auto useCachedPlan = preparedStatement->canReuseCachedPlanWith(inputParams);
+    try {
+        bindParametersNoLock(*preparedStatement, inputParams);
+    } catch (std::exception& e) {
+        return QueryResult::getQueryResultWithError(e.what());
+    }
+    auto name = preparedStatement->getName();
+    // LCOV_EXCL_START
+    // The following should never happen. But we still throw just in case.
+    if (!cachedPreparedStatementManager->containsStatement(name)) {
+        return QueryResult::getQueryResultWithError(
+            std::format("Cannot find prepared statement with name {}.", name));
+    }
+    // LCOV_EXCL_STOP
+    auto cachedStatement = cachedPreparedStatementManager->getCachedStatement(name);
+    const bool planStale =
+        cachedStatement->planVersion != localDatabase->getCatalog()->getPlanVersion();
+    // Statements with parameters baked into a plan (e.g. parameter-valued SKIP/LIMIT
+    // frozen to uint64_t) must rebind/replan on every execution instead of reusing any
+    // riag-rename:skip-next upstream provenance
+    // cached plan (https://github.com/LadybugDB/ladybug/issues/985).
+    // Likewise, a catalog change (e.g. ALTER TABLE ADD) or a checkpoint that renumbered column
+    // riag-rename:skip-next upstream provenance
+    // IDs invalidates the bound logical plan (https://github.com/LadybugDB/ladybug/issues/1158).
+    if (useCachedPlan && !cachedStatement->hasBakedParameters && !planStale) {
+        return executeNoLock(preparedStatement, cachedStatement, queryID, {}, true);
+    }
+    // rebind
+    auto [newPreparedStatement, newCachedStatement] =
+        prepareNoLock(cachedStatement->parsedStatement, false /*shouldCommitNewTransaction*/,
+            preparedStatement->parameterMap);
+    useInternalCatalogEntry_ = false;
+    if (newPreparedStatement->isSuccess()) {
+        // Refresh the manager entry after every rebind: bindParametersNoLock has already stored
+        // the new parameter values and types, and the cached plan must match them. Later
+        // executions with the same types reuse it instead of rebinding. This includes the first
+        // execution of a statement prepared without parameter values, as the C API prepares, and
+        // a stale plan after a catalog change or a checkpoint that renumbered column IDs. The
+        // physical-plan cache is cleared; executeNoLock below rebuilds and repopulates it from
+        // the fresh logical plan.
+        preparedStatement->unknownParametersBound = true;
+        cachedStatement->logicalPlan = std::move(newCachedStatement->logicalPlan);
+        cachedStatement->columns = std::move(newCachedStatement->columns);
+        cachedStatement->columnNames = std::move(newCachedStatement->columnNames);
+        cachedStatement->boundParameters = std::move(newCachedStatement->boundParameters);
+        cachedStatement->hasBakedParameters = newCachedStatement->hasBakedParameters;
+        cachedStatement->planVersion = newCachedStatement->planVersion;
+        cachedStatement->physicalPlanCache.reset();
+        cachedStatement->sinkResultSetDescriptors.clear();
+        // The pool holds operator trees cloned from the previous template (bound for the
+        // previous parameter types / catalog version). They reference stale evaluators and
+        // descriptors and must not be served for the rebound plan.
+        {
+            std::lock_guard poolLock{cachedStatement->physicalPlanPoolMutex};
+            cachedStatement->physicalPlanPool.clear();
+        }
+        return executeNoLock(newPreparedStatement.get(), cachedStatement, queryID, {}, true);
+    }
+    return executeNoLock(newPreparedStatement.get(), newCachedStatement.get(), queryID, {}, true);
+}
+
+std::unique_ptr<QueryResult> ClientContext::query(std::string_view query,
+    std::optional<uint64_t> queryID, QueryConfig config) {
+    lock_t lck{mtx};
+    return queryNoLock(query, queryID, config);
+}
+
+std::unique_ptr<QueryResult> ClientContext::queryNoLock(std::string_view query,
+    std::optional<uint64_t> queryID, QueryConfig config) {
+    InternalCatalogFlagGuard flagGuard{*this};
+    auto parsedStatements = std::vector<std::shared_ptr<Statement>>();
+    try {
+        parsedStatements = parseQuery(query);
+    } catch (std::exception& exception) {
+        return QueryResult::getQueryResultWithError(exception.what());
+    }
+    std::unique_ptr<QueryResult> queryResult;
+    QueryResult* lastResult = nullptr;
+    double internalCompilingTime = 0.0, internalExecutionTime = 0.0;
+    for (const auto& statement : parsedStatements) {
+        auto [preparedStatement, cachedStatement] =
+            prepareNoLock(statement, false /*shouldCommitNewTransaction*/);
+        auto currentQueryResult =
+            executeNoLock(preparedStatement.get(), cachedStatement.get(), queryID, config, false);
+        if (!currentQueryResult->isSuccess()) {
+            if (!lastResult) {
+                queryResult = std::move(currentQueryResult);
+            } else {
+                queryResult->addNextResult(std::move(currentQueryResult));
+            }
+            break;
+        }
+        auto currentQuerySummary = currentQueryResult->getQuerySummary();
+        if (statement->isInternal()) {
+            // The result of internal statements should be invisible to end users. Skip chaining the
+            // result of internal statements to the final result to end users.
+            internalCompilingTime += currentQuerySummary->getCompilingTime();
+            internalExecutionTime += currentQuerySummary->getExecutionTime();
+            continue;
+        }
+        currentQuerySummary->incrementCompilingTime(internalCompilingTime);
+        currentQuerySummary->incrementExecutionTime(internalExecutionTime);
+        if (!lastResult) {
+            // first result of the query
+            queryResult = std::move(currentQueryResult);
+            lastResult = queryResult.get();
+        } else {
+            auto current = currentQueryResult.get();
+            lastResult->addNextResult(std::move(currentQueryResult));
+            lastResult = current;
+        }
+    }
+    useInternalCatalogEntry_ = false;
+    return queryResult;
+}
+
+std::vector<std::shared_ptr<Statement>> ClientContext::parseQuery(std::string_view query) {
+    if (query.empty()) {
+        throw ConnectionException("Query is empty.");
+    }
+    std::vector<std::shared_ptr<Statement>> statements;
+    auto parserTimer = TimeMetric(true /*enable*/);
+    parserTimer.start();
+    auto parsedStatements = Parser::parseQuery(query, localDatabase->getTransformerExtensions());
+    parserTimer.stop();
+    const auto avgParsingTime = parserTimer.getElapsedTimeMS() / parsedStatements.size() / 1.0;
+    StandaloneCallRewriter standaloneCallAnalyzer{this, parsedStatements.size() == 1};
+    for (auto i = 0u; i < parsedStatements.size(); i++) {
+        auto rewriteQuery = standaloneCallAnalyzer.getRewriteQuery(*parsedStatements[i]);
+        if (rewriteQuery.empty()) {
+            parsedStatements[i]->setParsingTime(avgParsingTime);
+            statements.push_back(std::move(parsedStatements[i]));
+        } else {
+            parserTimer.start();
+            auto rewrittenStatements =
+                Parser::parseQuery(rewriteQuery, localDatabase->getTransformerExtensions());
+            parserTimer.stop();
+            const auto avgRewriteParsingTime =
+                parserTimer.getElapsedTimeMS() / rewrittenStatements.size() / 1.0;
+            DASSERT(rewrittenStatements.size() >= 1);
+            for (auto j = 0u; j < rewrittenStatements.size() - 1; j++) {
+                rewrittenStatements[j]->setParsingTime(avgParsingTime + avgRewriteParsingTime);
+                rewrittenStatements[j]->setToInternal();
+                statements.push_back(std::move(rewrittenStatements[j]));
+            }
+            auto lastRewrittenStatement = rewrittenStatements.back();
+            lastRewrittenStatement->setParsingTime(avgParsingTime + avgRewriteParsingTime);
+            statements.push_back(std::move(lastRewrittenStatement));
+        }
+    }
+    return statements;
+}
+
+void ClientContext::validateTransaction(bool readOnly, bool requireTransaction) const {
+    if (!canExecuteWriteQuery() && !readOnly) {
+        throw ConnectionException("Cannot execute write operations in a read-only database!");
+    }
+    if (requireTransaction && transactionContext->hasActiveTransaction()) {
+        DASSERT(!transactionContext->isAutoTransaction());
+        transactionContext->validateManualTransaction(readOnly);
+    }
+}
+
+namespace {
+
+// Operator-agnostic bake check: true if any bound parameter had its value frozen into a
+// plan. Marks are set by plan-time baking helpers (e.g.
+// ExpressionUtil::evaluateAsSkipLimit) during bind/optimize/map, so this covers baking
+// operators present and future without enumerating operator types. The mark is monotonic
+// on the bound expression object, so a rescan also picks up marks left by a previous
+// physical mapping.
+bool hasBakedParameters(
+    const std::vector<std::shared_ptr<binder::ParameterExpression>>& boundParameters) {
+    return std::any_of(boundParameters.begin(), boundParameters.end(),
+        [](const auto& param) { return param->wasBakedIntoPlan(); });
+}
+
+} // namespace
+
+ClientContext::PrepareResult ClientContext::prepareNoLock(
+    std::shared_ptr<Statement> parsedStatement, bool shouldCommitNewTransaction,
+    std::unordered_map<std::string, std::shared_ptr<Value>> inputParams) {
+    auto preparedStatement = std::make_unique<PreparedStatement>();
+    auto cachedStatement = std::make_unique<CachedPreparedStatement>();
+    cachedStatement->parsedStatement = parsedStatement;
+    cachedStatement->useInternalCatalogEntry = useInternalCatalogEntry_;
+    auto prepareTimer = TimeMetric(true /* enable */);
+    prepareTimer.start();
+    try {
+        preparedStatement->preparedSummary.statementType = parsedStatement->getStatementType();
+        auto readWriteAnalyzer = StatementReadWriteAnalyzer(this);
+        TransactionHelper::runFuncInTransaction(
+            *transactionContext, [&]() -> void { readWriteAnalyzer.visit(*parsedStatement); },
+            true /* readOnly */, false /* */,
+            TransactionHelper::TransactionCommitAction::COMMIT_IF_NEW);
+        preparedStatement->readOnly = readWriteAnalyzer.isReadOnly();
+        validateTransaction(preparedStatement->readOnly, parsedStatement->requireTransaction());
+        TransactionHelper::runFuncInTransaction(
+            *transactionContext,
+            [&]() -> void {
+                auto binder = Binder(this, localDatabase->getBinderExtensions());
+                auto expressionBinder = binder.getExpressionBinder();
+                for (auto& [name, value] : inputParams) {
+                    expressionBinder->addParameter(name, value);
+                }
+                const auto boundStatement = binder.bind(*parsedStatement);
+                preparedStatement->unknownParameters = expressionBinder->getUnknownParameters();
+                preparedStatement->parameterMap = expressionBinder->getKnownParameters();
+                cachedStatement->columns = boundStatement->getStatementResult()->getColumns();
+                cachedStatement->columnNames =
+                    boundStatement->getStatementResult()->getColumnNames();
+                auto planner = Planner(this);
+                auto bestPlan = planner.planStatement(*boundStatement);
+                optimizer::Optimizer::optimize(&bestPlan, this, planner.getCardinalityEstimator());
+                cachedStatement->logicalPlan = std::make_unique<LogicalPlan>(std::move(bestPlan));
+                cachedStatement->boundParameters = expressionBinder->getBoundParameters();
+                cachedStatement->hasBakedParameters =
+                    hasBakedParameters(cachedStatement->boundParameters);
+            },
+            preparedStatement->isReadOnly(),
+            preparedStatement->getStatementType() == StatementType::TRANSACTION,
+            TransactionHelper::getAction(shouldCommitNewTransaction,
+                false /*shouldCommitAutoTransaction*/));
+    } catch (std::exception& exception) {
+        preparedStatement->success = false;
+        preparedStatement->errMsg = exception.what();
+    }
+    cachedStatement->planVersion = localDatabase->getCatalog()->getPlanVersion();
+    prepareTimer.stop();
+    preparedStatement->preparedSummary.compilingTime =
+        parsedStatement->getParsingTime() + prepareTimer.getElapsedTimeMS();
+    return {std::move(preparedStatement), std::move(cachedStatement)};
+}
+
+namespace {
+
+// Walks an operator tree in preorder, snapshotting (slow path) or re-attaching (fast path)
+// the ResultSetDescriptor of every pipeline-head sink. Operator::copy() does not propagate
+// descriptors: only the root of a cloned plan would otherwise get one re-attached, leaving
+// sub-pipeline tasks without a descriptor and unable to build their ResultSet.
+void collectSinkDescriptors(const processor::PhysicalOperator* op,
+    std::vector<std::unique_ptr<processor::ResultSetDescriptor>>& sinks) {
+    if (const auto* sink = dynamic_cast<const processor::Sink*>(op)) {
+        sinks.push_back(sink->getDescriptor() == nullptr ? nullptr : sink->getDescriptor()->copy());
+    } else {
+        sinks.push_back(nullptr);
+    }
+    for (common::idx_t i = 0; i < op->getNumChildren(); ++i) {
+        collectSinkDescriptors(op->getChild(i), sinks);
+    }
+}
+
+void attachSinkDescriptors(processor::PhysicalOperator* op,
+    const std::vector<std::unique_ptr<processor::ResultSetDescriptor>>& sinks, common::idx_t& pos) {
+    if (auto* sink = dynamic_cast<processor::Sink*>(op)) {
+        auto& desc = sinks[pos];
+        if (desc != nullptr && sink->getDescriptor() == nullptr) {
+            // Only attach when missing: pooled plans reused across executions keep
+            // the descriptors attached on first use.
+            // Invariant: descriptors are content-identical across executions of the same
+            // cached plan. This holds because (a) statements with parameters baked into
+            // the plan never populate the pool (hasBakedParameters gate in executeNoLock),
+            // and (b) any rebind (new parameter types / catalog version bump) clears the
+            // pool in executeWithParams before the new template can be served.
+            sink->setDescriptor(desc->copy());
+        }
+    }
+    ++pos;
+    for (common::idx_t i = 0; i < op->getNumChildren(); ++i) {
+        attachSinkDescriptors(op->getChild(i), sinks, pos);
+    }
+}
+
+// Pooled physical-plan checkout: pop a same-thread reusable plan, else clone the cached
+// template. Either way the returned plan is reset for reuse and carries sink descriptors.
+// Empty per-thread vectors are pruned here so threads that have exited (or returned their
+// plans) do not leave the map growing unboundedly over a long-lived connection.
+// maxPerThread is the live `physical_plan_pool_per_thread` setting; 0 disables pooling.
+std::unique_ptr<processor::PhysicalPlan> checkoutPooledPhysicalPlan(
+    CachedPreparedStatement* cachedStatement, uint64_t maxPerThread) {
+    {
+        std::lock_guard lock{cachedStatement->physicalPlanPoolMutex};
+        if (maxPerThread == 0) {
+            // Pooling disabled: drop any retained plans so memory is released promptly
+            // and later executions cannot serve stale pooled state.
+            cachedStatement->physicalPlanPool.clear();
+        } else {
+            auto it = cachedStatement->physicalPlanPool.find(std::this_thread::get_id());
+            if (it != cachedStatement->physicalPlanPool.end() && !it->second.empty()) {
+                // Eagerly trim entries that exceed a recently lowered limit.
+                while (it->second.size() > maxPerThread) {
+                    it->second.pop_back();
+                }
+                if (!it->second.empty()) {
+                    auto plan = std::move(it->second.back());
+                    it->second.pop_back();
+                    return plan;
+                }
+            }
+            // Opportunistic prune: drop empty per-thread entries left behind by exited
+            // threads or fully checked-out pools. Keeps the map proportional to the number
+            // of threads currently retaining plans.
+            for (auto pit = cachedStatement->physicalPlanPool.begin();
+                 pit != cachedStatement->physicalPlanPool.end();) {
+                if (pit->second.empty()) {
+                    pit = cachedStatement->physicalPlanPool.erase(pit);
+                } else {
+                    ++pit;
+                }
+            }
+        }
+    }
+    return std::make_unique<processor::PhysicalPlan>(
+        cachedStatement->physicalPlanCache->lastOperator->copy());
+}
+
+void recyclePooledPhysicalPlan(CachedPreparedStatement* cachedStatement,
+    std::unique_ptr<processor::PhysicalPlan> plan, uint64_t maxPerThread) {
+    if (maxPerThread == 0) {
+        return;
+    }
+    std::lock_guard lock{cachedStatement->physicalPlanPoolMutex};
+    auto tid = std::this_thread::get_id();
+    auto it = cachedStatement->physicalPlanPool.find(tid);
+    if (it != cachedStatement->physicalPlanPool.end()) {
+        if (it->second.size() < maxPerThread) {
+            it->second.push_back(std::move(plan));
+        }
+        return;
+    }
+    // New thread entry: refuse to grow the map past MAX_THREADS and drop the plan
+    // instead, so short-lived-thread churn cannot accumulate unbounded entries.
+    // Dropping is always safe (falls back to fresh clones); thread affinity is only
+    // a locality hint since pooled plans are interchangeable across threads.
+    if (cachedStatement->physicalPlanPool.size() >=
+        CachedPreparedStatement::PHYSICAL_PLAN_POOL_MAX_THREADS) {
+        return;
+    }
+    auto& pool = cachedStatement->physicalPlanPool[tid];
+    pool.push_back(std::move(plan));
+}
+
+} // namespace
+
+bool ClientContext::isCachedPlanAllowedFor(const PreparedStatement& preparedStatement) const {
+    switch (clientConfig.cachedPreparedStatementScope) {
+    case CachedPreparedStatementScope::READS:
+        return preparedStatement.isReadOnly();
+    case CachedPreparedStatementScope::WRITES:
+        return !preparedStatement.isReadOnly();
+    case CachedPreparedStatementScope::BOTH:
+        return true;
+    case CachedPreparedStatementScope::NONE:
+        return false;
+    default:
+        UNREACHABLE_CODE;
+    }
+}
+
+bool ClientContext::isSubNodeGroupMorselEnabled(bool isWriteStatement) const {
+    switch (clientConfig.subNodeGroupMorselScope) {
+    case SubNodeGroupMorselScope::READS:
+        return !isWriteStatement;
+    case SubNodeGroupMorselScope::WRITES:
+        return isWriteStatement;
+    case SubNodeGroupMorselScope::BOTH:
+        return true;
+    case SubNodeGroupMorselScope::NONE:
+        return false;
+    default:
+        UNREACHABLE_CODE;
+    }
+}
+
+std::unique_ptr<QueryResult> ClientContext::executeNoLock(PreparedStatement* preparedStatement,
+    CachedPreparedStatement* cachedStatement, std::optional<uint64_t> queryID,
+    QueryConfig queryConfig, bool cachePhysicalPlan) {
+    if (!preparedStatement->isSuccess()) {
+        return QueryResult::getQueryResultWithError(preparedStatement->errMsg);
+    }
+    useInternalCatalogEntry_ = cachedStatement->useInternalCatalogEntry;
+    this->resetActiveQuery();
+    this->startTimer();
+    auto executingTimer = TimeMetric(true /* enable */);
+    executingTimer.start();
+    std::unique_ptr<QueryResult> result;
+    try {
+        bool isTransactionStatement =
+            preparedStatement->getStatementType() == StatementType::TRANSACTION;
+        TransactionHelper::runFuncInTransaction(
+            *transactionContext,
+            [&]() -> void {
+                const auto profiler = std::make_unique<Profiler>();
+                profiler->enabled = cachedStatement->logicalPlan->isProfile();
+                if (profiler->enabled) {
+                    profiler->startQueryTimer();
+                }
+                if (!queryID) {
+                    queryID = localDatabase->getNextQueryID();
+                }
+                setActiveQueryID(queryID.value());
+                auto executionContext =
+                    std::make_unique<ExecutionContext>(profiler.get(), this, *queryID);
+                std::unique_ptr<PhysicalPlan> physicalPlan;
+                bool pooledPlan = false;
+                // The `enable_cached_prepared_statement` setting gates both cache reuse and
+                // cache population, so a disabled scope never serves (or fills) the plan cache.
+                // Statements with parameters baked into a plan (e.g. parameter-valued
+                // SKIP/LIMIT frozen to uint64_t) are additionally kept off the fast path: a
+                // cached plan would serve the first execution's frozen values
+                // riag-rename:skip-next upstream provenance
+                // (https://github.com/LadybugDB/ladybug/issues/985).
+                const bool cachedPlanAllowed = cachePhysicalPlan &&
+                                               isCachedPlanAllowedFor(*preparedStatement) &&
+                                               !cachedStatement->hasBakedParameters;
+                if (cachedPlanAllowed && cachedStatement->physicalPlanCache) {
+                    // Fast path: reuse a pooled plan when available, else clone the cached
+                    // operator tree template. Avoids the PlanMapper::mapOperator recursion
+                    // and, on reuse, the per-execution clone entirely. The pool depth is
+                    // the live `physical_plan_pool_per_thread` setting (0 disables reuse).
+                    const auto poolPerThread = getDBConfig()->physicalPlanPoolPerThread;
+                    physicalPlan = checkoutPooledPhysicalPlan(cachedStatement, poolPerThread);
+                    physicalPlan->lastOperator->prepareForReuse(storage::MemoryManager::Get(*this));
+                    // Re-attach the ResultSetDescriptors (not propagated by copy()) of every
+                    // pipeline-head sink, so each sub-task can build its ResultSet.
+                    // Pooled plans keep the descriptors attached on first use, so this is a
+                    // no-op for them.
+                    common::idx_t pos = 0;
+                    attachSinkDescriptors(physicalPlan->lastOperator.get(),
+                        cachedStatement->sinkResultSetDescriptors, pos);
+                    pooledPlan = true;
+                } else {
+                    auto mapper = PlanMapper(executionContext.get());
+                    physicalPlan = mapper.getPhysicalPlan(cachedStatement->logicalPlan.get(),
+                        cachedStatement->columns, queryConfig.resultType, queryConfig.arrowConfig);
+                    // Re-scan after mapping: mapping itself can bake parameters (e.g. the
+                    // physical Limit/Skip/TopK numbers), including for operators that did not
+                    // exist when the prepare-time check ran. A plan baked at map time is still
+                    // correct for this execution (fresh values were just read) but must not be
+                    // cached for reuse.
+                    cachedStatement->hasBakedParameters =
+                        hasBakedParameters(cachedStatement->boundParameters);
+                    if (cachedPlanAllowed && !cachedStatement->hasBakedParameters) {
+                        // Cache the operator tree template for future reuse.
+                        cachedStatement->physicalPlanCache =
+                            std::make_unique<PhysicalPlan>(physicalPlan->lastOperator->copy());
+                        // Snapshot the ResultSetDescriptor of every pipeline-head sink
+                        // (copy() doesn't propagate them; each cloned sink needs one for
+                        // getResultSet).
+                        collectSinkDescriptors(physicalPlan->lastOperator.get(),
+                            cachedStatement->sinkResultSetDescriptors);
+                    }
+                }
+                if (isTransactionStatement) {
+                    result = localDatabase->queryProcessor->execute(physicalPlan.get(),
+                        executionContext.get());
+                } else {
+                    if (preparedStatement->getStatementType() == StatementType::COPY_FROM &&
+                        getDBConfig()->autoCheckpoint) {
+                        // Note: We force checkpoint for COPY_FROM statement unless the user has
+                        // disabled automatic checkpointing.
+                        Transaction::Get(*this)->setForceCheckpoint();
+                    }
+                    result = localDatabase->queryProcessor->execute(physicalPlan.get(),
+                        executionContext.get());
+                }
+                // Recycle fast-path plans for reuse by later executions on this thread.
+                // Mapper-built plans are always fresh (and may carry baked parameters),
+                // so only pooled/template-cloned plans go back. Skipped on exception:
+                // the plan is then destroyed, and the next execution clones afresh.
+                // A zero `physical_plan_pool_per_thread` drops the plan instead.
+                if (pooledPlan) {
+                    recyclePooledPhysicalPlan(cachedStatement, std::move(physicalPlan),
+                        getDBConfig()->physicalPlanPoolPerThread);
+                }
+            },
+            preparedStatement->isReadOnly(), isTransactionStatement,
+            TransactionHelper::getAction(true /*shouldCommitNewTransaction*/,
+                !isTransactionStatement /*shouldCommitAutoTransaction*/));
+    } catch (std::exception& e) {
+        useInternalCatalogEntry_ = false;
+        return handleFailedExecution(queryID, e);
+    }
+    const auto memoryManager = storage::MemoryManager::Get(*this);
+    memoryManager->getBufferManager()->getSpillerOrSkip([](auto& spiller) { spiller.clearFile(); });
+    executingTimer.stop();
+    result->setColumnNames(cachedStatement->getColumnNames());
+    result->setColumnTypes(cachedStatement->getColumnTypes());
+    auto summary = std::make_unique<QuerySummary>(preparedStatement->preparedSummary);
+    summary->setExecutionTime(executingTimer.getElapsedTimeMS());
+    result->setQuerySummary(std::move(summary));
+    return result;
+}
+
+std::unique_ptr<QueryResult> ClientContext::handleFailedExecution(std::optional<uint64_t> queryID,
+    const std::exception& e) const {
+    const auto memoryManager = storage::MemoryManager::Get(*this);
+    memoryManager->getBufferManager()->getSpillerOrSkip([](auto& spiller) { spiller.clearFile(); });
+    if (queryID.has_value()) {
+        progressBar->endProgress(queryID.value());
+    }
+    return QueryResult::getQueryResultWithError(e.what());
+}
+
+ClientContext::TransactionHelper::TransactionCommitAction
+ClientContext::TransactionHelper::getAction(bool commitIfNew, bool commitIfAuto) {
+    if (commitIfNew && commitIfAuto) {
+        return TransactionCommitAction::COMMIT_NEW_OR_AUTO;
+    }
+    if (commitIfNew) {
+        return TransactionCommitAction::COMMIT_IF_NEW;
+    }
+    if (commitIfAuto) {
+        return TransactionCommitAction::COMMIT_IF_AUTO;
+    }
+    return TransactionCommitAction::NOT_COMMIT;
+}
+
+// If there is an active transaction in the context, we execute the function in the current active
+// transaction. If there is no active transaction, we start an auto commit transaction.
+void ClientContext::TransactionHelper::runFuncInTransaction(TransactionContext& context,
+    const std::function<void()>& fun, bool readOnlyStatement, bool isTransactionStatement,
+    TransactionCommitAction action) {
+    DASSERT(context.isAutoTransaction() || context.hasActiveTransaction());
+    const bool requireNewTransaction =
+        context.isAutoTransaction() && !context.hasActiveTransaction() && !isTransactionStatement;
+    if (requireNewTransaction) {
+        context.beginAutoTransaction(readOnlyStatement);
+    }
+    try {
+        fun();
+        if ((requireNewTransaction && commitIfNew(action)) ||
+            (context.isAutoTransaction() && commitIfAuto(action))) {
+            context.commit();
+        }
+    } catch (CheckpointException&) {
+        context.clearTransaction();
+        throw;
+    } catch (std::exception&) {
+        context.rollback();
+        throw;
+    }
+}
+
+bool ClientContext::canExecuteWriteQuery() const {
+    if (getDBConfig()->readOnly) {
+        return false;
+    }
+    // Note: we can only attach a remote riag database in read-only mode and only one
+    // remote riag database can be attached.
+    const auto dbManager = DatabaseManager::Get(*this);
+    for (const auto& attachedDB : dbManager->getAttachedDatabases()) {
+        if (attachedDB->getDBType() == ATTACHED_RIAG_DB_TYPE) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace main
+} // namespace riag

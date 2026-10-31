@@ -1,0 +1,43 @@
+-DATASET CSV empty
+
+--
+
+# RemoveUnnecessaryOrderByOptimizer dropped any ORDER BY under an aggregate without keys,
+# turning an absorbed LIMIT into a plain one. Below a LIMIT or SKIP the order decides which
+# rows reach the aggregate, and collect() returns them in that order, so only COUNT(*) over
+# the cut rows can do without it.
+
+-CASE OrderByLimitBeforeAggregate
+-STATEMENT UNWIND range(1, 10) AS x WITH x ORDER BY x DESC LIMIT 3 RETURN sum(x);
+---- 1
+27
+-STATEMENT UNWIND range(1, 10) AS x WITH x ORDER BY x DESC LIMIT 3 RETURN min(x), max(x), avg(x), count(x);
+---- 1
+8|10|9.000000|3
+-STATEMENT UNWIND range(1, 10) AS x WITH x ORDER BY x DESC SKIP 2 LIMIT 3 RETURN sum(x);
+---- 1
+21
+-STATEMENT UNWIND range(1, 10) AS x WITH x ORDER BY x DESC LIMIT 3 RETURN collect(x);
+---- 1
+[10,9,8]
+-STATEMENT UNWIND range(1, 10) AS x WITH x ORDER BY x DESC LIMIT 3 WITH x WHERE x % 2 = 0 RETURN count(*);
+---- 1
+2
+-STATEMENT UNWIND range(1, 10) AS x WITH x ORDER BY x DESC LIMIT 3 RETURN count(*);
+---- 1
+3
+
+-CASE OrderByLimitBeforeAggregateOnTable
+-STATEMENT CREATE NODE TABLE N(k INT64, PRIMARY KEY(k));
+---- ok
+-STATEMENT COPY N FROM (UNWIND range(1, 1000) AS k RETURN k);
+---- ok
+-STATEMENT MATCH (n:N) WITH n.k AS k ORDER BY k DESC LIMIT 3 RETURN sum(k);
+---- 1
+2997
+-STATEMENT MATCH (n:N) WITH n ORDER BY n.k DESC LIMIT 3 RETURN sum(n.k), collect(n.k);
+---- 1
+2997|[1000,999,998]
+-STATEMENT MATCH (n:N) WITH n ORDER BY n.k LIMIT 5 RETURN count(*);
+---- 1
+5

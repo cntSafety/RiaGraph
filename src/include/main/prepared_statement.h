@@ -1,0 +1,166 @@
+#pragma once
+
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "common/api.h"
+#include "common/types/value/value.h"
+#include "query_summary.h"
+
+namespace riag {
+namespace processor {
+class PhysicalPlan;
+struct ResultSetDescriptor;
+} // namespace processor
+} // namespace riag
+
+namespace riag {
+namespace common {
+class LogicalType;
+}
+namespace parser {
+class Statement;
+}
+namespace binder {
+class Expression;
+class ParameterExpression;
+} // namespace binder
+namespace planner {
+class LogicalPlan;
+}
+
+namespace main {
+
+class CachedPreparedStatementManager;
+
+// Prepared statement cached in client context and NEVER serialized to client side.
+struct CachedPreparedStatement {
+    bool useInternalCatalogEntry = false;
+    std::shared_ptr<parser::Statement> parsedStatement;
+    std::unique_ptr<planner::LogicalPlan> logicalPlan;
+    std::vector<std::shared_ptr<binder::Expression>> columns;
+    std::vector<std::string> columnNames;
+
+    // Cached physical plan for fast re-execution. When canReuseCachedPlanWith returns true,
+    // this operator-tree template is cloned and its sink state is refreshed for each call,
+    // avoiding the PlanMapper::mapOperator recursion entirely.
+    std::unique_ptr<processor::PhysicalPlan> physicalPlanCache;
+    // Cached ResultSetDescriptors of every pipeline-head sink, in preorder position order.
+    // Operator::copy() does not propagate descriptors, and multi-pipeline plans (e.g.
+    // aggregates) clone into several tasks that each need a descriptor to build their
+    // ResultSet, so we snapshot them all from the freshly mapped tree and re-attach them onto
+    // each cloned instance.
+    std::vector<std::unique_ptr<processor::ResultSetDescriptor>> sinkResultSetDescriptors;
+
+    // Every typed parameter bound for this statement. Scanned for parameters whose values
+    // were frozen into a plan at plan-build time (ParameterExpression::wasBakedIntoPlan) —
+    // e.g. SKIP/LIMIT numbers baked to uint64_t by the mapper, or evaluated numbers baked
+    // into operators by optimizers. The scan is operator-agnostic, so future operators that
+    // bake parameter values (through a marking helper) are covered without touching this
+    // riag-rename:skip-next upstream provenance
+    // code (see https://github.com/LadybugDB/ladybug/issues/985).
+    std::vector<std::shared_ptr<binder::ParameterExpression>> boundParameters;
+    // True when a bound parameter was baked into a plan during prepare (bind/optimize), or
+    // during a previous physical mapping. Such statements always rebind/replan on
+    // re-execution and never populate or serve the physical-plan cache, since a cached
+    // plan would keep serving the first execution's frozen values.
+    bool hasBakedParameters = false;
+    // Catalog::getPlanVersion() the logical plan was bound against. If the catalog changed
+    // (e.g. ALTER TABLE ADD) or a checkpoint renumbered column IDs since prepare, the cached
+    // logical/physical plan is stale and must be rebound (see
+    // riag-rename:skip-next upstream provenance
+    // https://github.com/LadybugDB/ladybug/issues/1158).
+    uint64_t planVersion = 0;
+
+    // Pool of cloned physical plans ready for reuse, keyed by executing thread.
+    // Cloning the cached template per execution costs hundreds of small allocations
+    // (operators, evaluators, print infos, schemas); pooled plans are reset via
+    // prepareForReuse() and reused instead. Capped per thread: deeper reentrancy
+    // (nested same-statement execution) falls back to fresh clones. Guarded by
+    // physicalPlanPoolMutex; entries are dropped with the statement.
+    // Thread affinity is a perf hint only: plans are interchangeable across threads.
+    // A stale entry from an exited thread is therefore safe to hand to a new thread
+    // whose std::thread::id happens to compare equal, and empty per-thread vectors
+    // are pruned on checkout so short-lived-thread churn cannot grow the map
+    // unboundedly (see checkoutPooledPhysicalPlan / recyclePooledPhysicalPlan).
+    // Total retained plans are bounded by MAX_POOLED_THREADS * per-thread limit.
+    // The per-thread limit is runtime-configurable via the
+    // `physical_plan_pool_per_thread` setting (DBConfig); 0 disables pooling.
+    // Defaults below mirror the setting's default; the pool code reads the live
+    // setting rather than these constants.
+    static constexpr size_t PHYSICAL_PLAN_POOL_PER_THREAD_DEFAULT = 5;
+    static constexpr size_t PHYSICAL_PLAN_POOL_MAX_THREADS = 32;
+    std::mutex physicalPlanPoolMutex;
+    std::unordered_map<std::thread::id, std::vector<std::unique_ptr<processor::PhysicalPlan>>>
+        physicalPlanPool;
+
+    CachedPreparedStatement();
+    ~CachedPreparedStatement();
+
+    std::vector<std::string> getColumnNames() const;
+    std::vector<common::LogicalType> getColumnTypes() const;
+};
+
+/**
+ * @brief A prepared statement is a parameterized query which can avoid planning the same query for
+ * repeated execution.
+ */
+class PreparedStatement {
+    friend class Connection;
+    friend class ClientContext;
+
+public:
+    RIAG_API ~PreparedStatement();
+    /**
+     * @return the query is prepared successfully or not.
+     */
+    RIAG_API bool isSuccess() const;
+    /**
+     * @return the error message if the query is not prepared successfully.
+     */
+    RIAG_API std::string getErrorMessage() const;
+    /**
+     * @return the prepared statement is read-only or not.
+     */
+    RIAG_API bool isReadOnly() const;
+
+    const std::unordered_set<std::string>& getUnknownParameters() const {
+        return unknownParameters;
+    }
+    bool canReuseCachedPlanWith(
+        const std::unordered_map<std::string, std::unique_ptr<common::Value>>& inputParams) const;
+    std::unordered_set<std::string> getKnownParameters();
+    void updateParameter(const std::string& name, common::Value* value);
+    void addParameter(const std::string& name, common::Value* value);
+    RIAG_API void setParameter(const std::string& name, common::Value value);
+
+    std::string getName() const { return cachedPreparedStatementName; }
+
+    common::StatementType getStatementType() const;
+
+    static std::unique_ptr<PreparedStatement> getPreparedStatementWithError(
+        const std::string& errorMessage);
+
+private:
+    bool success = true;
+    bool readOnly = true;
+    std::string errMsg;
+    PreparedSummary preparedSummary;
+    std::string cachedPreparedStatementName;
+    // Weak back-reference to the manager this statement was registered with (via
+    // ClientContext::prepareWithParams). The destructor uses it to unregister itself so the
+    // cached plan is freed promptly. Weak so that a statement destroyed after its connection
+    // (possible through the C API) does not access a freed manager.
+    std::weak_ptr<CachedPreparedStatementManager> ownerManager;
+    std::unordered_set<std::string> unknownParameters;
+    // Set once an execution has bound the statement with values for its unknown parameters.
+    bool unknownParametersBound = false;
+    std::unordered_map<std::string, std::shared_ptr<common::Value>> parameterMap;
+};
+
+} // namespace main
+} // namespace riag

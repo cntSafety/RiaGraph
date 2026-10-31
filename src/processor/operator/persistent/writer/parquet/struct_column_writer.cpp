@@ -1,0 +1,120 @@
+#include "processor/operator/persistent/writer/parquet/struct_column_writer.h"
+
+#include "common/constants.h"
+#include "common/vector/value_vector.h"
+
+namespace riag {
+namespace processor {
+
+using namespace riag_parquet::format;
+using namespace riag::common;
+
+std::unique_ptr<ColumnWriterState> StructColumnWriter::initializeWriteState(
+    riag_parquet::format::RowGroup& rowGroup) {
+    auto result = std::make_unique<StructColumnWriterState>(rowGroup, rowGroup.columns.size());
+
+    result->childStates.reserve(childWriters.size());
+    for (auto& child_writer : childWriters) {
+        result->childStates.push_back(child_writer->initializeWriteState(rowGroup));
+    }
+    return result;
+}
+
+bool StructColumnWriter::hasAnalyze() {
+    for (auto& child_writer : childWriters) {
+        if (child_writer->hasAnalyze()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Child writers write a value for every non-null entry of their vector, so the fields of a null
+// struct must be null too, or their slots are written and later values move to other rows. The
+// vectors are read again from the factorized table before each pass, which leaves the fields of a
+// null struct as they were, so every pass sets them. The field vectors share the struct's state
+// (ValueVector::setState), so pos is also the position the child writers read.
+void StructColumnWriter::nullFieldsOfNullStructs(ValueVector* vector, uint64_t count) {
+    auto& childVectors = StructVector::getFieldVectors(vector);
+    for (auto i = 0u; i < count; i++) {
+        auto pos = static_cast<uint32_t>(getVectorPos(vector, i));
+        if (vector->isNull(pos)) {
+            for (auto& childVector : childVectors) {
+                childVector->setNull(pos, true);
+            }
+        }
+    }
+}
+
+void StructColumnWriter::analyze(ColumnWriterState& state_p, ColumnWriterState* /*parent*/,
+    ValueVector* vector, uint64_t count) {
+    auto& state = reinterpret_cast<StructColumnWriterState&>(state_p);
+    nullFieldsOfNullStructs(vector, count);
+    auto& childVectors = StructVector::getFieldVectors(vector);
+    for (auto child_idx = 0u; child_idx < childWriters.size(); child_idx++) {
+        // Need to check again. It might be that just one child needs it but the rest not
+        if (childWriters[child_idx]->hasAnalyze()) {
+            childWriters[child_idx]->analyze(*state.childStates[child_idx], &state_p,
+                childVectors[child_idx].get(), count);
+        }
+    }
+}
+
+void StructColumnWriter::finalizeAnalyze(ColumnWriterState& state_p) {
+    auto& state = reinterpret_cast<StructColumnWriterState&>(state_p);
+    for (auto child_idx = 0u; child_idx < childWriters.size(); child_idx++) {
+        // Need to check again. It might be that just one child needs it but the rest not
+        if (childWriters[child_idx]->hasAnalyze()) {
+            childWriters[child_idx]->finalizeAnalyze(*state.childStates[child_idx]);
+        }
+    }
+}
+
+void StructColumnWriter::prepare(ColumnWriterState& state_p, ColumnWriterState* parent,
+    ValueVector* vector, uint64_t count) {
+    auto& state = reinterpret_cast<StructColumnWriterState&>(state_p);
+    if (parent) {
+        // propagate empty entries from the parent
+        while (state.isEmpty.size() < parent->isEmpty.size()) {
+            state.isEmpty.push_back(parent->isEmpty[state.isEmpty.size()]);
+        }
+    }
+    handleRepeatLevels(state_p, parent);
+    handleDefineLevels(state_p, parent, vector, count, ParquetConstants::PARQUET_DEFINE_VALID,
+        maxDefine - 1);
+    nullFieldsOfNullStructs(vector, count);
+    auto& child_vectors = StructVector::getFieldVectors(vector);
+    for (auto child_idx = 0u; child_idx < childWriters.size(); child_idx++) {
+        childWriters[child_idx]->prepare(*state.childStates[child_idx], &state_p,
+            child_vectors[child_idx].get(), count);
+    }
+}
+
+void StructColumnWriter::beginWrite(ColumnWriterState& state_p) {
+    auto& state = reinterpret_cast<StructColumnWriterState&>(state_p);
+    for (auto child_idx = 0u; child_idx < childWriters.size(); child_idx++) {
+        childWriters[child_idx]->beginWrite(*state.childStates[child_idx]);
+    }
+}
+
+void StructColumnWriter::write(ColumnWriterState& state_p, ValueVector* vector, uint64_t count) {
+    auto& state = reinterpret_cast<StructColumnWriterState&>(state_p);
+    nullFieldsOfNullStructs(vector, count);
+    auto& child_vectors = StructVector::getFieldVectors(vector);
+    for (auto child_idx = 0u; child_idx < childWriters.size(); child_idx++) {
+        childWriters[child_idx]->write(*state.childStates[child_idx],
+            child_vectors[child_idx].get(), count);
+    }
+}
+
+void StructColumnWriter::finalizeWrite(ColumnWriterState& state_p) {
+    auto& state = reinterpret_cast<StructColumnWriterState&>(state_p);
+    for (auto child_idx = 0u; child_idx < childWriters.size(); child_idx++) {
+        // we add the null count of the struct to the null count of the children
+        state.childStates[child_idx]->nullCount += state.nullCount;
+        childWriters[child_idx]->finalizeWrite(*state.childStates[child_idx]);
+    }
+}
+
+} // namespace processor
+} // namespace riag

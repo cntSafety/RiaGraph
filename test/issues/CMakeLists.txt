@@ -1,0 +1,1 @@
+add_riag_test(issues_merge_on_match_set_test issues_merge_on_match_set.cpp)

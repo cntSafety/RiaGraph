@@ -1,0 +1,17 @@
+add_library(riag_processor_operator_scan
+        OBJECT
+        count_anti_edge_chain.cpp
+        count_extend_chain.cpp
+        count_rel_table.cpp
+        grouped_reachable_count.cpp
+        primary_key_scan_node_table.cpp
+        reachable_count.cpp
+        rel_degree_table.cpp
+        scan_multi_rel_tables.cpp
+        scan_node_table.cpp
+        scan_rel_table.cpp
+        scan_table.cpp)
+
+set(ALL_OBJECT_FILES
+        ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:riag_processor_operator_scan>
+        PARENT_SCOPE)

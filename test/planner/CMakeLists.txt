@@ -1,0 +1,1 @@
+add_riag_test(planner_tests cardinality_test.cpp optional_match_strategy_test.cpp)

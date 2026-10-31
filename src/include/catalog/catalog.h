@@ -1,0 +1,331 @@
+#pragma once
+
+#include <atomic>
+
+#include "catalog/catalog_entry/function_catalog_entry.h"
+#include "catalog/catalog_entry/graph_catalog_entry.h"
+#include "catalog/catalog_entry/scalar_macro_catalog_entry.h"
+#include "catalog/catalog_set.h"
+#include "common/cast.h"
+#include "function/function.h"
+#include "storage/storage_manager.h"
+
+namespace riag::main {
+struct DBConfig;
+} // namespace riag::main
+
+namespace riag {
+namespace main {
+class AttachedRiaGDatabase;
+} // namespace main
+
+namespace binder {
+struct BoundAlterInfo;
+struct BoundCreateTableInfo;
+struct BoundCreateSequenceInfo;
+} // namespace binder
+
+namespace common {
+class VirtualFileSystem;
+} // namespace common
+
+namespace function {
+struct ScalarMacroFunction;
+} // namespace function
+
+namespace storage {
+class WAL;
+} // namespace storage
+
+namespace transaction {
+class Transaction;
+} // namespace transaction
+
+namespace catalog {
+class TableCatalogEntry;
+class NodeTableCatalogEntry;
+class RelGroupCatalogEntry;
+class FunctionCatalogEntry;
+class SequenceCatalogEntry;
+class IndexCatalogEntry;
+
+template<typename T>
+concept TableCatalogEntryType =
+    std::is_same_v<T, NodeTableCatalogEntry> || std::is_same_v<T, RelGroupCatalogEntry>;
+
+class RIAG_API Catalog {
+    friend class main::AttachedRiaGDatabase;
+
+public:
+    Catalog();
+    virtual ~Catalog() = default;
+
+    static Catalog* Get(const main::ClientContext& context);
+
+    // ----------------------------- Tables ----------------------------
+
+    // Check if table entry exists.
+    bool containsTable(const transaction::Transaction* transaction, const std::string& tableName,
+        bool useInternal = true) const;
+    bool containsTable(const transaction::Transaction* transaction, common::table_id_t tableID,
+        bool useInternal = true) const;
+    // Get table entry with name.
+    TableCatalogEntry* getTableCatalogEntry(const transaction::Transaction* transaction,
+        const std::string& tableName, bool useInternal = true) const;
+    // Get table entry with id.
+    TableCatalogEntry* getTableCatalogEntry(const transaction::Transaction* transaction,
+        common::table_id_t tableID) const;
+    // Get all node table entries.
+    std::vector<NodeTableCatalogEntry*> getNodeTableEntries(
+        const transaction::Transaction* transaction, bool useInternal = true) const;
+    // Get all rel table entries.
+    std::vector<RelGroupCatalogEntry*> getRelGroupEntries(
+        const transaction::Transaction* transaction, bool useInternal = true) const;
+    // Get all table entries.
+    std::vector<TableCatalogEntry*> getTableEntries(const transaction::Transaction* transaction,
+        bool useInternal = true) const;
+
+    // Create table catalog entry.
+    CatalogEntry* createTableEntry(transaction::Transaction* transaction,
+        const binder::BoundCreateTableInfo& info);
+    // Drop table entry and all indices within the table.
+    void dropTableEntryAndIndex(transaction::Transaction* transaction, const std::string& name);
+    // Drop table entry with id.
+    void dropTableEntry(transaction::Transaction* transaction, common::table_id_t tableID);
+    // Drop table entry.
+    void dropTableEntry(transaction::Transaction* transaction, const TableCatalogEntry* entry);
+    // Alter table entry.
+    void alterTableEntry(transaction::Transaction* transaction, const binder::BoundAlterInfo& info);
+
+    // Add table entry (for extensions).
+    void addTableEntry(std::unique_ptr<TableCatalogEntry> entry);
+
+    // ----------------------------- Sequences ----------------------------
+
+    // Check if sequence entry exists.
+    bool containsSequence(const transaction::Transaction* transaction,
+        const std::string& name) const;
+    // Get sequence entry with name.
+    SequenceCatalogEntry* getSequenceEntry(const transaction::Transaction* transaction,
+        const std::string& sequenceName, bool useInternalSeq = true) const;
+    // Get sequence entry with id.
+    SequenceCatalogEntry* getSequenceEntry(const transaction::Transaction* transaction,
+        common::sequence_id_t sequenceID) const;
+    // Get all sequence entries.
+    std::vector<SequenceCatalogEntry*> getSequenceEntries(
+        const transaction::Transaction* transaction) const;
+
+    // Create sequence entry.
+    common::sequence_id_t createSequence(transaction::Transaction* transaction,
+        const binder::BoundCreateSequenceInfo& info);
+    // Drop sequence entry with name.
+    void dropSequence(transaction::Transaction* transaction, const std::string& name);
+    // Drop sequence entry with id.
+    void dropSequence(transaction::Transaction* transaction, common::sequence_id_t sequenceID);
+
+    // ----------------------------- Types ----------------------------
+
+    // Check if type entry exists.
+    bool containsType(const transaction::Transaction* transaction, const std::string& name) const;
+    // Get type entry with name.
+    common::LogicalType getType(const transaction::Transaction*, const std::string& name) const;
+
+    // Create type entry.
+    void createType(transaction::Transaction* transaction, std::string name,
+        common::LogicalType type);
+
+    // ----------------------------- Indexes ----------------------------
+
+    // Check if index exists for given table and name
+    bool containsIndex(const transaction::Transaction* transaction, common::table_id_t tableID,
+        const std::string& indexName) const;
+    // Check if index exists for given table and property
+    bool containsIndex(const transaction::Transaction* transaction, common::table_id_t tableID,
+        common::property_id_t propertyID) const;
+    // Check if there is any unloaded index for given table and property
+    bool containsUnloadedIndex(const transaction::Transaction* transaction,
+        common::table_id_t tableID, common::property_id_t propertyID) const;
+    // Get index entry with name.
+    IndexCatalogEntry* getIndex(const transaction::Transaction* transaction,
+        common::table_id_t tableID, const std::string& indexName) const;
+    // Get all index entries.
+    std::vector<IndexCatalogEntry*> getIndexEntries(
+        const transaction::Transaction* transaction) const;
+    // Get all index entries for given table
+    std::vector<IndexCatalogEntry*> getIndexEntries(const transaction::Transaction* transaction,
+        common::table_id_t tableID) const;
+
+    // Create index entry.
+    common::oid_t createIndex(transaction::Transaction* transaction,
+        std::unique_ptr<CatalogEntry> indexCatalogEntry, bool skipLoggingToWAL = false);
+    // Drop all index entries within a table.
+    void dropAllIndexes(transaction::Transaction* transaction, common::table_id_t tableID);
+    // Drop index entry with name.
+    void dropIndex(transaction::Transaction* transaction, common::table_id_t tableID,
+        const std::string& indexName) const;
+    void dropIndex(transaction::Transaction* transaction, common::oid_t indexOID);
+
+    // ----------------------------- Functions ----------------------------
+
+    // Check if function exists.
+    bool containsFunction(const transaction::Transaction* transaction, const std::string& name,
+        bool useInternal = false) const;
+    // Get function entry by name.
+    // Note we cannot cast to FunctionEntry here because result could also be a MacroEntry.
+    CatalogEntry* getFunctionEntry(const transaction::Transaction* transaction,
+        const std::string& name, bool useInternal = false) const;
+    // Get all function entries.
+    std::vector<FunctionCatalogEntry*> getFunctionEntries(
+        const transaction::Transaction* transaction) const;
+
+    // Get all macro entries.
+    std::vector<ScalarMacroCatalogEntry*> getMacroEntries(
+        const transaction::Transaction* transaction) const;
+
+    // Add function with name.
+    void addFunction(transaction::Transaction* transaction, CatalogEntryType entryType,
+        std::string name, function::function_set functionSet, bool isInternal = false);
+    // Drop function with name.
+    void dropFunction(transaction::Transaction* transaction, const std::string& name);
+
+    // ----------------------------- Macro ----------------------------
+
+    // Macro names are stored uppercased (see bindCreateMacro). containsMacro and dropMacro
+    // uppercase the given name the same way; the catalog set itself only folds ASCII letters.
+    bool containsMacro(const transaction::Transaction* transaction,
+        const std::string& macroName) const;
+    // Takes the stored (uppercased) name.
+    void addScalarMacroFunction(transaction::Transaction* transaction, std::string name,
+        std::unique_ptr<function::ScalarMacroFunction> macro);
+    ScalarMacroCatalogEntry* getScalarMacroCatalogEntry(const transaction::Transaction* transaction,
+        riag::common::oid_t MacroID) const;
+    void dropMacroEntry(transaction::Transaction* transaction, const riag::common::oid_t macroID);
+    void dropMacroEntry(transaction::Transaction* transaction,
+        const ScalarMacroCatalogEntry* entry);
+    // Takes the stored (uppercased) name.
+    function::ScalarMacroFunction* getScalarMacroFunction(
+        const transaction::Transaction* transaction, const std::string& name) const;
+    std::vector<std::string> getMacroNames(const transaction::Transaction* transaction) const;
+    void dropMacro(transaction::Transaction* transaction, std::string& name);
+
+    // ----------------------------- Graphs ----------------------------
+
+    // Check if graph entry exists.
+    bool containsGraph(const transaction::Transaction* transaction,
+        const std::string& graphName) const;
+    // Get graph entry with name.
+    GraphCatalogEntry* getGraphEntry(const transaction::Transaction* transaction,
+        const std::string& graphName) const;
+    // Get all graph entries.
+    std::vector<GraphCatalogEntry*> getGraphEntries(
+        const transaction::Transaction* transaction) const;
+    // The next graph-entry OID this catalog would assign. Replay compares recorded
+    // GRAPH_ENTRY IDs against the value from before the replay pass: IDs at or above
+    // it were assigned after the last checkpoint and shift during recovery, while IDs
+    // below it belong to persisted entries and stay stable.
+    common::oid_t peekNextGraphOID() const { return graphs->peekNextOID(); }
+
+    // Create graph entry.
+    void createGraph(transaction::Transaction* transaction, std::string name, bool isAnyGraph);
+    // Drop graph entry with name.
+    void dropGraph(transaction::Transaction* transaction, const std::string& name);
+
+    void incrementVersion() { version.fetch_add(1, std::memory_order_relaxed); }
+    uint64_t getVersion() const { return version.load(std::memory_order_relaxed); }
+    // Returns the number of catalog changes committed since the last checkpoint.
+    // Use this for user-visible version numbers (e.g. CALL catalog_version()).
+    uint64_t getVersionSinceCheckpoint() const {
+        return version.load(std::memory_order_relaxed) - lastCheckpointVersion;
+    }
+    bool changedSinceLastCheckpoint() const {
+        return version.load(std::memory_order_relaxed) != lastCheckpointVersion;
+    }
+    void resetVersion() { lastCheckpointVersion = version.load(std::memory_order_relaxed); }
+    void resetVersion(uint64_t checkpointedVersion) { lastCheckpointVersion = checkpointedVersion; }
+    // Bumped when a checkpoint renumbers column IDs: no definition changes, so version stays.
+    void incrementColumnIDsVersion() { columnIDsVersion.fetch_add(1, std::memory_order_relaxed); }
+    // Changes whenever a bound plan may be stale: after a catalog change or a renumbering.
+    // The sum is exact, not a hash: both counters only ever increase (resetVersion touches
+    // lastCheckpointVersion only), so it changes iff either counter does and equality implies
+    // both are unchanged.
+    uint64_t getPlanVersion() const {
+        return getVersion() + columnIDsVersion.load(std::memory_order_relaxed);
+    }
+
+    void setCatalogName(const std::string& name) { catalogName = name; }
+    std::string getCatalogName() const { return catalogName; }
+
+    // Function entries are database-global: built-ins are registered into every
+    // catalog at construction, but extension functions only into the main
+    // catalog. Per-graph catalogs point at the main catalog so function lookup
+    // still resolves extension functions while the session is on a non-main
+    // graph (see Catalog::getFunctionEntry).
+    void setFunctionFallback(Catalog* fallback) { functionFallback = fallback; }
+
+    storage::StorageManager* getStorageManager() const { return storageManager.get(); }
+    void setStorageManager(std::unique_ptr<storage::StorageManager> sm) {
+        storageManager = std::move(sm);
+    }
+
+    void serialize(common::Serializer& ser) const;
+    void serializeSnapshot(common::Serializer& ser, common::transaction_t snapshotTS) const;
+    void deserialize(common::Deserializer& deSer);
+
+    template<class TARGET>
+    TARGET* ptrCast() {
+        return common::dynamic_cast_checked<TARGET*>(this);
+    }
+
+private:
+    void initCatalogSets();
+    void registerBuiltInFunctions();
+    void registerBuiltInTypes();
+
+    CatalogEntry* createNodeTableEntry(transaction::Transaction* transaction,
+        const binder::BoundCreateTableInfo& info);
+    CatalogEntry* createRelGroupEntry(transaction::Transaction* transaction,
+        const binder::BoundCreateTableInfo& info);
+
+    void createSerialSequence(transaction::Transaction* transaction, const TableCatalogEntry* entry,
+        bool isInternal);
+    void dropSerialSequence(transaction::Transaction* transaction, const TableCatalogEntry* entry);
+
+    // Every node table (including partition subgraphs) is backed by a GraphCatalogEntry so that
+    // SHOW_GRAPHS lists it. The subgraph is implied by the table's own WAL create/drop record and
+    // is therefore created with WAL logging skipped; CHECKPOINT serializes it with the `graphs`
+    // catalog set, and WAL replay recreates it through createNodeTableEntry.
+    void createNodeTableSubgraph(transaction::Transaction* transaction,
+        const std::string& tableName);
+    void dropNodeTableSubgraph(transaction::Transaction* transaction, const std::string& tableName);
+
+    template<TableCatalogEntryType T>
+    std::vector<T*> getTableEntries(const transaction::Transaction* transaction, bool useInternal,
+        CatalogEntryType entryType) const;
+
+protected:
+    std::unique_ptr<CatalogSet> tables;
+
+private:
+    std::unique_ptr<CatalogSet> sequences;
+    std::unique_ptr<CatalogSet> functions;
+    std::unique_ptr<CatalogSet> types;
+    std::unique_ptr<CatalogSet> indexes;
+    std::unique_ptr<CatalogSet> macros;
+    std::unique_ptr<CatalogSet> internalTables;
+    std::unique_ptr<CatalogSet> internalSequences;
+    std::unique_ptr<CatalogSet> internalFunctions;
+    std::unique_ptr<CatalogSet> graphs;
+
+    // incremented whenever a change is made to the catalog
+    // reset to lastCheckpointVersion at the end of each checkpoint
+    std::atomic<uint64_t> version;
+    uint64_t lastCheckpointVersion = 0;
+    std::atomic<uint64_t> columnIDsVersion{0};
+    std::string catalogName;
+    std::unique_ptr<storage::StorageManager> storageManager;
+    // Main catalog for function lookup (nullptr for the main catalog itself).
+    Catalog* functionFallback = nullptr;
+};
+
+} // namespace catalog
+} // namespace riag

@@ -1,0 +1,152 @@
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
+#include "common/types/types.h"
+#include "storage/database_header.h"
+#include "storage/page_range.h"
+
+namespace riag {
+namespace transaction {
+class Transaction;
+}
+namespace catalog {
+class Catalog;
+}
+namespace common {
+struct FileInfo;
+class VirtualFileSystem;
+} // namespace common
+namespace testing {
+struct FSMLeakChecker;
+}
+namespace main {
+class AttachedRiaGDatabase;
+class DatabaseManager;
+} // namespace main
+
+namespace storage {
+class StorageManager;
+
+class Checkpointer {
+    friend class main::AttachedRiaGDatabase;
+    friend class main::DatabaseManager;
+    friend struct testing::FSMLeakChecker;
+
+public:
+    explicit Checkpointer(main::ClientContext& clientContext);
+    virtual ~Checkpointer();
+
+    void writeCheckpoint();
+    void beginCheckpoint(common::transaction_t snapshotTS,
+        common::transaction_t retentionHorizon = common::INVALID_TRANSACTION,
+        std::vector<common::transaction_t> openStartTSs = {},
+        common::transaction_t pinningTxnID = common::INVALID_TRANSACTION);
+    // Materialize storage while the write gate remains held. WAL rotation alone does not protect
+    // the version chains and update metadata scanned and reset in this phase.
+    void checkpointStoragePhase();
+    void finishCheckpoint();
+    // Cleanup after the core checkpoint. If the write gate is held, page-manager changes made by
+    // the checkpoint itself can be marked clean.
+    void postCheckpointCleanup(bool canResetPageManagerToCurrent = true);
+    void rollback();
+    void releaseCheckpointLocks() noexcept;
+    bool wasWalRotated() const { return walRotated; }
+
+    void readCheckpoint(bool applyPartitionCheckpointShadows = false,
+        std::optional<common::uuid> legacyCheckpointDatabaseID = std::nullopt,
+        bool checkpointBundle = false);
+
+    static bool canAutoCheckpoint(const main::ClientContext& clientContext,
+        const transaction::Transaction& transaction);
+
+    // Persist each partition child's page manager + database header into its own file (through
+    // its shadow file) and fsync it. Must run BEFORE the main database's commit point so that a
+    // crash either loses all pending child updates (recovery removes their shadow files) or,
+    // once the main header is committed, finds them durable and applies them during recovery.
+    void persistPartitionChildFiles();
+
+protected:
+    virtual bool checkpointStorage();
+    virtual void serializeCatalogAndMetadata(DatabaseHeader& databaseHeader,
+        bool hasStorageChanges);
+    virtual void writeDatabaseHeader(const DatabaseHeader& header);
+    virtual void logCheckpointAndApplyShadowPages(bool walRotated = false);
+    // Runs before the WAL retirement step on every checkpoint, whether or not retirement
+    // is skipped for a pinned horizon.
+    virtual void beforeWALRetirement(bool walRotated);
+    // Runs only when WAL retirement actually executes; skipped alongside retirement while
+    // the horizon pins the WAL.
+    virtual void onWALRetired(bool walRotated);
+    virtual void beforeGraphShadowApply(StorageManager& storageManager);
+    void applyShadowPagesForPartitionChildren();
+    void flushGraphShadowFiles();
+    void applyGraphShadowPages();
+
+private:
+    struct CheckpointTarget {
+        catalog::Catalog* catalog;
+        StorageManager* storageManager;
+    };
+
+    std::vector<CheckpointTarget> collectCheckpointTargets() const;
+
+    static void readCheckpoint(main::ClientContext* context, catalog::Catalog* catalog,
+        StorageManager* storageManager, bool applyPartitionCheckpointShadows = false,
+        std::optional<common::uuid> legacyCheckpointDatabaseID = std::nullopt,
+        bool checkpointBundle = false);
+    void acquireCheckpointLocks();
+
+    PageRange serializeCatalog(const catalog::Catalog& catalog, StorageManager& storageManager);
+    PageRange serializeCatalogSnapshot(const catalog::Catalog& catalog,
+        StorageManager& storageManager);
+    PageRange serializeMetadata(const catalog::Catalog& catalog, StorageManager& storageManager);
+    PageRange serializeMetadataSnapshot(const catalog::Catalog& catalog,
+        StorageManager& storageManager);
+
+protected:
+    main::ClientContext& clientContext;
+    bool isInMemory;
+    StorageManager* mainStorageManager;
+    bool walRotated = false;
+    // Snapshot timestamp captured at drain time for MVCC catalog serialization.
+    common::transaction_t snapshotTS = 0;
+    // Snapshot-horizon floor captured alongside snapshotTS (before the write gate).
+    // Version data committed at or after it is retained for open readers, and WAL
+    // rotation/retirement is skipped while it pins (the WAL keeps the commit records the
+    // pinned snapshot may still need);
+    // INVALID_TRANSACTION when no transaction was open (fast path: wipe and retire as before).
+    common::transaction_t retentionHorizon = common::INVALID_TRANSACTION;
+    // Transaction holding the horizon above, for pin observability. Meaningful only when
+    // the horizon is pinned.
+    common::transaction_t pinningTxnID = common::INVALID_TRANSACTION;
+    // Open-reader start timestamps captured alongside the horizon. CSR groups use the set
+    // (not the scalar) to cover and prune retained pre-checkpoint snapshots.
+    std::vector<common::transaction_t> openStartTSs;
+    // Database header captured during beginCheckpoint for use in finishCheckpoint.
+    DatabaseHeader checkpointHeader{};
+    // Whether storage had changes during checkpointStoragePhase.
+    bool hasStorageChanges = false;
+    // Whether this checkpoint upgrades the durable catalog/header storage layout.
+    bool hasStorageVersionUpgrade = false;
+    // Versions captured at the end of writeCheckpoint() while the write gate is still held.
+    uint64_t catalogVersionAtCheckpoint = 0;
+    uint64_t pageManagerVersionAtCheckpoint = 0;
+    // Per-table changeEpoch watermarks captured under the write gate.
+    std::unordered_map<common::table_id_t, uint64_t> tableEpochWatermarks;
+    std::unordered_map<StorageManager*, bool> storageChangesByManager;
+    std::unordered_map<StorageManager*, bool> walRotatedByManager;
+    std::vector<CheckpointTarget> checkpointTargets;
+    std::unordered_map<StorageManager*, std::unordered_map<common::table_id_t, uint64_t>>
+        tableEpochWatermarksByManager;
+    std::unordered_map<catalog::Catalog*, uint64_t> catalogVersionAtCheckpointByCatalog;
+    std::unordered_map<StorageManager*, uint64_t> pageManagerVersionAtCheckpointByManager;
+    std::unique_ptr<common::FileInfo> checkpointIntentLockFile;
+    std::unique_ptr<common::FileInfo> checkpointApplyLockFile;
+};
+
+} // namespace storage
+} // namespace riag

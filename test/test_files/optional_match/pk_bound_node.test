@@ -1,0 +1,66 @@
+-DATASET CSV empty
+
+--
+
+# A node bound by a primary-key equality before an OPTIONAL MATCH keeps its property values
+# when the OPTIONAL MATCH finds nothing. The unnested plan re-scans the correlated node with
+# its properties on the build side of the LEFT hash join; the join used to take those
+# (NULL-padded on a miss) copies instead of the probe side's, so every property of the bound
+# node read back as NULL. Found by RiaCore's dual-engine comparison against ladybug.  # riag-rename:skip upstream provenance
+-CASE OptionalMatchKeepsPrimaryKeyBoundNodeProperties
+-STATEMENT CREATE NODE TABLE NS(name STRING, s STRING, t STRING, i INT64, PRIMARY KEY(name));
+---- ok
+-STATEMENT CREATE NODE TABLE MM(name STRING, PRIMARY KEY(name));
+---- ok
+-STATEMENT CREATE REL TABLE DEF(FROM NS TO MM);
+---- ok
+-STATEMENT CREATE (:NS {name: 'unlinked', s: '', t: 'abc', i: 0}),
+                  (:NS {name: 'linked', s: '', t: 'abc', i: 7}),
+                  (:MM {name: 'M'});
+---- ok
+-STATEMENT MATCH (a:NS {name: 'linked'}), (m:MM) CREATE (a)-[:DEF]->(m);
+---- ok
+
+-LOG NoMatchKeepsEveryProperty
+-STATEMENT MATCH (ns:NS {name: 'unlinked'}) OPTIONAL MATCH (ns)-[:DEF]->(mm:MM)
+           RETURN ns.name, ns.s IS NULL, size(ns.s), ns.t, ns.i, mm.name IS NULL;
+---- 1
+unlinked|False|0|abc|0|True
+
+-LOG NoMatchViaParameterlessFilterForm
+-STATEMENT MATCH (ns:NS) WHERE ns.name = 'unlinked' OPTIONAL MATCH (ns)-[:DEF]->(mm:MM)
+           RETURN ns.name, ns.t, ns.i;
+---- 1
+unlinked|abc|0
+
+-LOG NoMatchKeepsValueProjectedBeforeOptional
+-STATEMENT MATCH (ns:NS {name: 'unlinked'}) WITH ns, ns.t AS t
+           OPTIONAL MATCH (ns)-[:DEF]->(mm:MM)
+           RETURN t, ns.t;
+---- 1
+abc|abc
+
+-LOG CoalesceSeesTheBoundValue
+-STATEMENT MATCH (ns:NS {name: 'unlinked'}) OPTIONAL MATCH (ns)-[:DEF]->(mm:MM)
+           RETURN coalesce(mm.name, ns.s, 'fallback') = '';
+---- 1
+True
+
+-LOG MatchIsUnchanged
+-STATEMENT MATCH (ns:NS {name: 'linked'}) OPTIONAL MATCH (ns)-[:DEF]->(mm:MM)
+           RETURN ns.name, ns.t, ns.i, mm.name;
+---- 1
+linked|abc|7|M
+
+-LOG CountOverOptionalKeepsBoundNode
+-STATEMENT MATCH (ns:NS {name: 'unlinked'}) OPTIONAL MATCH (ns)-[d:DEF]->(:MM)
+           WITH ns, count(d) AS links
+           RETURN ns.name, ns.i, links;
+---- 1
+unlinked|0|0
+
+-LOG BoundAsOptionalTargetKeepsProperties
+-STATEMENT MATCH (mm:MM {name: 'M'}) OPTIONAL MATCH (ns:NS)-[:DEF]->(mm) WHERE ns.i > 100
+           RETURN mm.name, ns.name IS NULL;
+---- 1
+M|True

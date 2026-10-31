@@ -1,0 +1,44 @@
+#include <utility>
+
+#include "binder/binder.h"
+#include "binder/expression/expression_util.h"
+#include "binder/expression/lambda_expression.h"
+#include "parser/expression/parsed_lambda_expression.h"
+
+using namespace riag::common;
+using namespace riag::parser;
+
+namespace riag {
+namespace binder {
+
+void ExpressionBinder::bindLambdaExpression(const Expression& lambdaInput,
+    Expression& lambdaExpr) const {
+    ExpressionUtil::validateDataType(lambdaInput, LogicalTypeID::LIST);
+    auto& listChildType = ListType::getChildType(lambdaInput.getDataType());
+    auto& boundLambdaExpr = lambdaExpr.cast<LambdaExpression>();
+    auto& parsedLambdaExpr =
+        boundLambdaExpr.getParsedLambdaExpr()->constCast<ParsedLambdaExpression>();
+    auto prevScope = binder->saveScope();
+    for (auto& varName : parsedLambdaExpr.getVarNames()) {
+        binder->createVariable(varName, listChildType);
+    }
+    // The projection does not compute aggregates inside a lambda body, so they keep their
+    // structural names and read the earlier clause's column, as before.
+    auto& config = binder->getExpressionBinder()->config;
+    auto bindingProjectionList = std::exchange(config.bindingProjectionList, false);
+    auto funcExpr =
+        binder->getExpressionBinder()->bindExpression(*parsedLambdaExpr.getFunctionExpr());
+    config.bindingProjectionList = bindingProjectionList;
+    binder->restoreScope(std::move(prevScope));
+    boundLambdaExpr.cast(funcExpr->getDataType().copy());
+    boundLambdaExpr.setFunctionExpr(std::move(funcExpr));
+}
+
+std::shared_ptr<Expression> ExpressionBinder::bindLambdaExpression(
+    const parser::ParsedExpression& parsedExpr) const {
+    auto uniqueName = getUniqueName(parsedExpr.getRawName());
+    return std::make_shared<LambdaExpression>(parsedExpr.copy(), uniqueName);
+}
+
+} // namespace binder
+} // namespace riag

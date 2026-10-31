@@ -1,0 +1,158 @@
+#pragma once
+
+#include <algorithm>
+#include <memory>
+#include <vector>
+
+#include "common/serializer/deserializer.h"
+#include "common/serializer/serializer.h"
+#include "common/types/types.h"
+#include "common/uniq_lock.h"
+#include "common/utils.h"
+
+namespace riag {
+namespace storage {
+class MemoryManager;
+
+template<class T>
+class GroupCollection {
+public:
+    GroupCollection() {}
+
+    common::UniqLock lock() const { return common::UniqLock{mtx}; }
+
+    void deserializeGroups(MemoryManager& memoryManager, common::Deserializer& deSer,
+        const std::vector<common::LogicalType>& columnTypes) {
+        auto lockGuard = lock();
+        uint64_t numGroups = 0;
+        deSer.deserializeValue<uint64_t>(numGroups);
+        groups.clear();
+        groups.reserve(numGroups);
+        for (auto i = 0u; i < numGroups; i++) {
+            groups.push_back(T::deserialize(memoryManager, deSer, columnTypes));
+        }
+    }
+
+    void removeTrailingGroups([[maybe_unused]] const common::UniqLock& lock,
+        common::idx_t numGroupsToRemove) {
+        DASSERT(lock.isLocked());
+        DASSERT(numGroupsToRemove <= groups.size());
+        groups.erase(groups.end() - numGroupsToRemove, groups.end());
+    }
+
+    void serializeGroups(common::Serializer& ser) {
+        auto lockGuard = lock();
+        ser.serializeValue<uint64_t>(groups.size());
+        for (auto& group : groups) {
+            group->serialize(ser);
+        }
+    }
+
+    void appendGroup(const common::UniqLock& lock, std::unique_ptr<T> group) {
+        DASSERT(group);
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        groups.push_back(std::shared_ptr<T>(std::move(group)));
+    }
+    // Note: the bounds checks below are unconditional, not DASSERT. An out-of-range group index
+    // riag-rename:skip-next upstream provenance
+    // reaching here is a caller-side invariant violation (see LadybugDB/ladybug#611, where a
+    // stale csr index sentinel produced one), and an out-of-bounds `std::vector` read is
+    // undefined behaviour rather than something the caller can recover from. Failing loudly in
+    // release builds too keeps such a bug a diagnosable error instead of a wild pointer.
+    // The index is taken as a `node_group_idx_t` (64-bit) rather than an `idx_t` (32-bit) so the
+    // check sees the value the caller computed: a 32-bit parameter silently truncates, which is
+    // how a bad chunk index arrived here as exactly UINT32_MAX in that report, and which could
+    // just as easily alias a bad index onto a valid one.
+    T* getGroup(const common::UniqLock& lock, common::node_group_idx_t groupIdx) const {
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        ASSERT(groupIdx < groups.size());
+        return groups[groupIdx].get();
+    }
+    T* getGroupNoLock(common::node_group_idx_t groupIdx) const {
+        ASSERT(groupIdx < groups.size());
+        return groups[groupIdx].get();
+    }
+    void replaceGroup(const common::UniqLock& lock, common::idx_t groupIdx,
+        std::unique_ptr<T> group) {
+        DASSERT(group);
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        if (groupIdx >= groups.size()) {
+            groups.resize(groupIdx + 1);
+        }
+        groups[groupIdx] = std::move(group);
+    }
+
+    void resize(const common::UniqLock& lock, common::idx_t newSize) {
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        if (newSize <= groups.size()) {
+            return;
+        }
+        groups.resize(newSize);
+    }
+
+    bool isEmpty(const common::UniqLock& lock) const {
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        return groups.empty();
+    }
+    common::idx_t getNumGroups(const common::UniqLock& lock) const {
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        return groups.size();
+    }
+    common::idx_t getNumGroupsNoLock() const { return groups.size(); }
+
+    const std::vector<std::shared_ptr<T>>& getAllGroups(const common::UniqLock& lock) const {
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        return groups;
+    }
+    T* getFirstGroup(const common::UniqLock& lock) const {
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        if (groups.empty()) {
+            return nullptr;
+        }
+        return groups.front().get();
+    }
+    T* getFirstGroupNoLock() const {
+        if (groups.empty()) {
+            return nullptr;
+        }
+        return groups.front().get();
+    }
+    T* getLastGroup(const common::UniqLock& lock) const {
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        if (groups.empty()) {
+            return nullptr;
+        }
+        return groups.back().get();
+    }
+
+    void clear(const common::UniqLock& lock) {
+        DASSERT(lock.isLocked());
+        UNUSED(lock);
+        groups.clear();
+    }
+
+    common::idx_t getNumEmptyTrailingGroups(const common::UniqLock& lock) {
+        const auto& groupsVector = getAllGroups(lock);
+        return common::safeIntegerConversion<common::idx_t>(
+            std::find_if(groupsVector.rbegin(), groupsVector.rend(),
+                [](const auto& group) { return group->hasRows(); }) -
+            groupsVector.rbegin());
+    }
+
+private:
+    mutable std::mutex mtx;
+    // shared_ptr so a CSR scan can retain in-memory groups after checkpoint clears them.
+    std::vector<std::shared_ptr<T>> groups;
+};
+
+} // namespace storage
+} // namespace riag

@@ -1,0 +1,127 @@
+-DATASET CSV empty
+-BUFFER_POOL_SIZE 268435456
+--
+
+# Regression test for LadybugDB/ladybug#1117.  # riag-rename:skip upstream provenance
+# The second hop of a chain extends from one bound node at a time. Such a scan reads only the
+# bound node's CSR header entries while it keeps switching node groups, and decodes the whole
+# header once it stays in one node group. N spans three node groups; node i < 3000 has one
+# `spread` rel to a node in node group i % 3, so the second hop switches node groups on every
+# node, and one `local` rel to itself, so the second hop stays in node group 0. Node 263172 is
+# added after the checkpoint: it lies past the persisted CSR header of its node group, and its
+# rels live only in memory.
+
+-CASE CSRHeaderLookupOnNodeGroupSwitch
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE spread(FROM N TO N);
+---- ok
+-STATEMENT CREATE REL TABLE local(FROM N TO N);
+---- ok
+-STATEMENT CREATE REL TABLE next(FROM N TO N, w INT64);
+---- ok
+-STATEMENT COPY N FROM (UNWIND range(0, 263171) AS i RETURN i);
+---- ok
+-STATEMENT COPY spread FROM (UNWIND range(0, 2999) AS i RETURN i, (i % 3) * 131072 + i / 3);
+---- ok
+-STATEMENT COPY local FROM (UNWIND range(0, 2999) AS i RETURN i, i);
+---- ok
+-STATEMENT COPY next FROM (UNWIND range(0, 2999) AS i RETURN i, i + 1, i
+           UNION UNWIND range(0, 2999) AS i WITH (i % 3) * 131072 + i / 3 AS b WHERE b >= 3000
+           RETURN b, b + 1, b);
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-LOG SpreadOneThread
+-STATEMENT CALL threads=1
+---- ok
+-STATEMENT MATCH (a:N)-[:spread]->(b:N)-[e:next]->(c:N) WHERE a.id < 3000
+           RETURN count(*), sum(c.id), sum(e.w);
+---- 1
+3000|394717500|394714500
+-LOG LocalOneThread
+-STATEMENT MATCH (a:N)-[:local]->(b:N)-[e:next]->(c:N) WHERE a.id < 3000
+           RETURN count(*), sum(c.id), sum(e.w);
+---- 1
+3000|4501500|4498500
+-LOG SpreadRows
+-STATEMENT MATCH (a:N)-[:spread]->(b:N)-[:next]->(c:N) WHERE a.id IN [0, 1, 2, 3, 2998, 2999]
+           RETURN a.id, b.id, c.id ORDER BY a.id;
+---- 6
+0|0|1
+1|131072|131073
+2|262144|262145
+3|1|2
+2998|132071|132072
+2999|263143|263144
+-LOG SpreadBackward
+-STATEMENT MATCH (c:N)<-[:next]-(b:N)<-[:spread]-(a:N) WHERE c.id IN [1, 131073, 262145]
+           RETURN c.id, a.id ORDER BY c.id;
+---- 3
+1|0
+131073|1
+262145|2
+-LOG MixedPersistentAndInMemory
+-STATEMENT CREATE (:N {id: 263172});
+---- ok
+-STATEMENT MATCH (a:N {id: 0}), (b:N {id: 263172}) CREATE (a)-[:spread]->(b);
+---- ok
+-STATEMENT MATCH (b:N {id: 263172}), (c:N {id: 5}) CREATE (b)-[:next {w: -1}]->(c);
+---- ok
+-STATEMENT MATCH (b:N {id: 131072}), (c:N {id: 7}) CREATE (b)-[:next {w: -2}]->(c);
+---- ok
+-STATEMENT MATCH (b:N {id: 262144})-[e:next]->(:N) DELETE e;
+---- ok
+-STATEMENT MATCH (a:N)-[:spread]->(b:N)-[e:next]->(c:N) WHERE a.id < 4
+           RETURN a.id, b.id, c.id, e.w ORDER BY a.id, c.id;
+---- 5
+0|0|1|0
+0|263172|5|-1
+1|131072|7|-2
+1|131072|131073|131072
+3|1|2|1
+-LOG SpreadFourThreads
+-STATEMENT CALL threads=4
+---- ok
+-STATEMENT MATCH (a:N)-[:spread]->(b:N)-[e:next]->(c:N) WHERE a.id < 3000
+           RETURN count(*), sum(c.id), sum(e.w);
+---- 1
+3001|394455367|394452353
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT MATCH (a:N)-[:spread]->(b:N)-[e:next]->(c:N) WHERE a.id < 3000
+           RETURN count(*), sum(c.id), sum(e.w);
+---- 1
+3001|394455367|394452353
+
+# One scan state alternates between a single bound node in node group 1, read by a lookup, and
+# many bound nodes in node group 0, read from the decoded header. The decode must not read the
+# header as the lookup left it: numTotalRows came out as 0 (node 0 has no `next` rel) and the
+# scan of node group 0 returned nothing.
+-CASE CSRHeaderDecodeAfterLookup
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE fan(FROM N TO N);
+---- ok
+-STATEMENT CREATE REL TABLE next(FROM N TO N);
+---- ok
+-STATEMENT COPY N FROM (UNWIND range(0, 131172) AS i RETURN i);
+---- ok
+-STATEMENT COPY fan FROM (UNWIND range(0, 9) AS a
+           UNWIND CASE WHEN a % 2 = 0 THEN [131072 + a] ELSE range(1000 * a, 1000 * a + 19) END AS b
+           RETURN a, b);
+---- ok
+-STATEMENT COPY next FROM (UNWIND range(1, 131171) AS i RETURN i, i + 1);
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT CALL threads=1
+---- ok
+-STATEMENT MATCH (a:N)-[:fan]->(b:N)-[:next]->(c:N) WHERE a.id < 10 RETURN count(*), sum(c.id);
+---- 1
+105|1156435
+-STATEMENT CALL threads=2
+---- ok
+-STATEMENT MATCH (a:N)-[:fan]->(b:N)-[:next]->(c:N) WHERE a.id < 10 RETURN count(*), sum(c.id);
+---- 1
+105|1156435

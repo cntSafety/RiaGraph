@@ -1,0 +1,126 @@
+#include "catalog/catalog_entry/catalog_entry_type.h"
+#include "common/exception/runtime.h"
+#include "storage/local_storage/local_rel_table.h"
+#include "storage/partition_storage_registry.h"
+#include "storage/storage_manager.h"
+#include "storage/table/node_table.h"
+#include "storage/table/rel_table.h"
+#include "storage/wal/wal_replayer.h"
+
+using namespace riag::common;
+using namespace riag::storage;
+
+namespace riag {
+namespace storage {
+
+void WALReplayer::replayTableInsertionRecord(const WALRecord& walRecord) const {
+    const auto& insertionRecord = walRecord.constCast<TableInsertionRecord>();
+    switch (insertionRecord.tableType) {
+    case TableType::NODE: {
+        replayNodeTableInsertRecord(walRecord);
+    } break;
+    case TableType::REL: {
+        replayRelTableInsertRecord(walRecord);
+    } break;
+    default: {
+        throw RuntimeException("Invalid table type for insertion replay in WAL record.");
+    }
+    }
+}
+
+void WALReplayer::replayNodeTableInsertRecord(const WALRecord& walRecord) const {
+    const auto& insertionRecord = walRecord.constCast<TableInsertionRecord>();
+    const auto tableID =
+        getReplayedEntryID(catalog::CatalogEntryType::NODE_TABLE_ENTRY, insertionRecord.tableID);
+    // A torn WAL tail can deserialize to a record with zero vectors. operator[] on an empty
+    // vector is UB (native crash, uncatchable by dry-replay truncation), so reject it here.
+    if (insertionRecord.ownedVectors.empty() || insertionRecord.ownedVectors[0] == nullptr ||
+        insertionRecord.ownedVectors[0]->state == nullptr) {
+        throw RuntimeException(
+            "Corrupted WAL record: table insertion has no vectors; discarding torn tail.");
+    }
+    // Partition children live in their own data files (phase-B); dispatch by table ID.
+    auto& table = storage::PartitionStorageRegistry::resolveNodeTableByID(&clientContext, tableID)
+                      ->cast<NodeTable>();
+    DASSERT(!insertionRecord.ownedVectors.empty());
+    const auto anchorState = insertionRecord.ownedVectors[0]->state;
+    const auto numNodes = anchorState->getSelVector().getSelSize();
+    DASSERT(insertionRecord.numRows == numNodes);
+    for (auto i = 0u; i < insertionRecord.ownedVectors.size(); i++) {
+        insertionRecord.ownedVectors[i]->setState(anchorState);
+    }
+    std::vector<ValueVector*> propertyVectors(insertionRecord.ownedVectors.size());
+    for (auto i = 0u; i < insertionRecord.ownedVectors.size(); i++) {
+        propertyVectors[i] = insertionRecord.ownedVectors[i].get();
+    }
+    DASSERT(table.getPKColumnID() < insertionRecord.ownedVectors.size());
+    auto& pkVector = *insertionRecord.ownedVectors[table.getPKColumnID()];
+    const auto nodeIDVector = std::make_unique<ValueVector>(LogicalType::INTERNAL_ID());
+    nodeIDVector->setState(anchorState);
+    const auto insertState =
+        std::make_unique<NodeTableInsertState>(*nodeIDVector, pkVector, propertyVectors);
+    DASSERT(transaction::Transaction::Get(clientContext) &&
+            transaction::Transaction::Get(clientContext)->isRecovery());
+    table.initInsertState(&clientContext, *insertState);
+    anchorState->getSelVectorUnsafe().setToFiltered(1);
+    for (auto i = 0u; i < numNodes; i++) {
+        anchorState->getSelVectorUnsafe()[0] = i;
+        table.insert(transaction::Transaction::Get(clientContext), *insertState);
+    }
+}
+
+void WALReplayer::replayRelTableInsertRecord(const WALRecord& walRecord) const {
+    const auto& insertionRecord = walRecord.constCast<TableInsertionRecord>();
+    const auto tableID =
+        getReplayedEntryID(catalog::CatalogEntryType::REL_GROUP_ENTRY, insertionRecord.tableID);
+    if (insertionRecord.ownedVectors.empty() || insertionRecord.ownedVectors[0] == nullptr ||
+        insertionRecord.ownedVectors[0]->state == nullptr) {
+        throw RuntimeException(
+            "Corrupted WAL record: rel insertion has no vectors; discarding torn tail.");
+    }
+    auto& table = StorageManager::Get(clientContext)->getTable(tableID)->cast<RelTable>();
+    const auto anchorState = insertionRecord.ownedVectors[0]->state;
+    const auto numRels = anchorState->getSelVector().getSelSize();
+    DASSERT(insertionRecord.numRows == numRels);
+    // Recovered rows must reference the replayed catalog's node-table IDs; when the recovery ID
+    // space shifted, the recorded endpoint IDs are stale and must be translated before insert.
+    for (auto columnID : {LOCAL_BOUND_NODE_ID_COLUMN_ID, LOCAL_NBR_NODE_ID_COLUMN_ID}) {
+        auto& nodeIDVector = *insertionRecord.ownedVectors[columnID];
+        for (auto i = 0u; i < numRels; i++) {
+            const auto pos = anchorState->getSelVector()[i];
+            if (nodeIDVector.isNull(pos)) {
+                continue;
+            }
+            const auto nodeID = nodeIDVector.getValue<nodeID_t>(pos);
+            const auto replayedTableID =
+                getReplayedEntryID(catalog::CatalogEntryType::NODE_TABLE_ENTRY, nodeID.tableID);
+            if (replayedTableID != nodeID.tableID) {
+                nodeIDVector.setValue<nodeID_t>(pos, nodeID_t{nodeID.offset, replayedTableID});
+            }
+        }
+    }
+    anchorState->getSelVectorUnsafe().setToFiltered(1);
+    for (auto i = 0u; i < insertionRecord.ownedVectors.size(); i++) {
+        insertionRecord.ownedVectors[i]->setState(anchorState);
+    }
+    std::vector<ValueVector*> propertyVectors;
+    for (auto i = 0u; i < insertionRecord.ownedVectors.size(); i++) {
+        if (i < LOCAL_REL_ID_COLUMN_ID) {
+            continue;
+        }
+        propertyVectors.push_back(insertionRecord.ownedVectors[i].get());
+    }
+    const auto insertState = std::make_unique<RelTableInsertState>(
+        *insertionRecord.ownedVectors[LOCAL_BOUND_NODE_ID_COLUMN_ID],
+        *insertionRecord.ownedVectors[LOCAL_NBR_NODE_ID_COLUMN_ID], propertyVectors);
+    DASSERT(transaction::Transaction::Get(clientContext) &&
+            transaction::Transaction::Get(clientContext)->isRecovery());
+    for (auto i = 0u; i < numRels; i++) {
+        anchorState->getSelVectorUnsafe()[0] = i;
+        table.initInsertState(&clientContext, *insertState);
+        table.insert(transaction::Transaction::Get(clientContext), *insertState);
+    }
+}
+
+} // namespace storage
+} // namespace riag

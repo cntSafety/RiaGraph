@@ -1,0 +1,61 @@
+-DATASET CSV empty
+
+--
+
+# An extend chain with a filter on the first rel between the two extends: (f)<-[a]-(c)-[b]->(m)
+# WHERE a.rel = ... The second extend flattens the bound node's chunk state (shared with the
+# filter's input) in place, one bound node at a time. It used to hand that state back still
+# flagged flat, so the filter evaluated only the first row of every later input batch and the
+# query silently lost every feature after the first. Found by RiaCore's dual-engine comparison
+# (ladybug vs RiaGraph); the extend-chain plan is chosen since e09efe342.  # riag-rename:skip upstream provenance
+-CASE ExtendChainKeepsRowsWithFilterBetweenExtends
+-STATEMENT CREATE NODE TABLE N(id INT64, kind STRING, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N, rel STRING);
+---- ok
+-STATEMENT UNWIND range(0, 5) AS f CREATE (:N {id: f, kind: 'feature'});
+---- ok
+-STATEMENT UNWIND range(0, 5) AS p CREATE (:N {id: 50 + p, kind: 'parent'});
+---- ok
+-STATEMENT UNWIND range(0, 11) AS c CREATE (:N {id: 100 + c, kind: 'chain'});
+---- ok
+-STATEMENT UNWIND range(0, 23) AS m CREATE (:N {id: 200 + m, kind: 'member'});
+---- ok
+# Each feature's first incoming rel is one the filter rejects.
+-STATEMENT UNWIND range(0, 5) AS f MATCH (p:N {id: 50 + f}), (ff:N {id: f})
+           CREATE (p)-[:R {rel: 'owns_element'}]->(ff);
+---- ok
+-STATEMENT UNWIND range(0, 11) AS c MATCH (ch:N {id: 100 + c}), (f:N {id: c / 2})
+           CREATE (ch)-[:R {rel: 'references_source'}]->(f);
+---- ok
+-STATEMENT UNWIND range(0, 23) AS m MATCH (ch:N {id: 100 + m / 2}), (mm:N {id: 200 + m})
+           CREATE (ch)-[:R {rel: 'chains_feature'}]->(mm);
+---- ok
+
+-LOG FilterBetweenExtends
+-STATEMENT MATCH (f:N {kind: 'feature'})<-[a:R]-(c:N)-[b:R]->(m:N)
+           WHERE a.rel = 'references_source'
+           RETURN count(*);
+---- 1
+36
+
+-LOG FiltersOnBothRels
+-STATEMENT MATCH (f:N {kind: 'feature'})<-[a:R]-(c:N)-[b:R]->(m:N)
+           WHERE a.rel = 'references_source' AND b.rel = 'chains_feature'
+           RETURN f.id, count(*);
+---- 6
+0|4
+1|4
+2|4
+3|4
+4|4
+5|4
+
+-LOG FiltersOnBothRelsAfterCheckpoint
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT MATCH (f:N {kind: 'feature'})<-[a:R]-(c:N)-[b:R]->(m:N)
+           WHERE a.rel = 'references_source' AND b.rel = 'chains_feature'
+           RETURN count(*);
+---- 1
+24

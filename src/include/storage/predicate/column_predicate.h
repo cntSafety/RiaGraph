@@ -1,0 +1,74 @@
+#pragma once
+
+#include "binder/expression/expression.h"
+#include "common/cast.h"
+#include "common/enums/zone_map_check_result.h"
+
+namespace riag {
+namespace common {
+class SelectionVector;
+class ValueVector;
+} // namespace common
+
+namespace storage {
+
+struct MergedColumnChunkStats;
+
+class RIAG_API ColumnPredicate {
+public:
+    ColumnPredicate(std::string columnName, common::ExpressionType expressionType)
+        : columnName{std::move(columnName)}, expressionType(expressionType) {}
+
+    virtual ~ColumnPredicate() = default;
+
+    virtual common::ZoneMapCheckResult checkZoneMap(const MergedColumnChunkStats& stats) const = 0;
+
+    virtual std::string toString();
+
+    virtual std::unique_ptr<ColumnPredicate> copy() const = 0;
+
+    common::ExpressionType getExpressionType() const { return expressionType; }
+
+    template<class TARGET>
+    const TARGET& constCast() const {
+        return common::dynamic_cast_checked<const TARGET&>(*this);
+    }
+
+protected:
+    std::string columnName;
+    common::ExpressionType expressionType;
+};
+
+class RIAG_API ColumnPredicateSet {
+public:
+    ColumnPredicateSet() = default;
+    EXPLICIT_COPY_DEFAULT_MOVE(ColumnPredicateSet);
+
+    void addPredicate(std::unique_ptr<ColumnPredicate> predicate) {
+        predicates.push_back(std::move(predicate));
+    }
+    void tryAddPredicate(const binder::Expression& column, const binder::Expression& predicate);
+    bool isEmpty() const { return predicates.empty(); }
+
+    common::ZoneMapCheckResult checkZoneMap(const MergedColumnChunkStats& stats) const;
+
+    // Drops the selected rows of a scanned vector that fail a predicate.
+    void filter(const common::ValueVector& vector, common::SelectionVector& sel) const;
+
+    std::string toString() const;
+
+private:
+    ColumnPredicateSet(const ColumnPredicateSet& other)
+        : predicates{copyVector(other.predicates)} {}
+
+private:
+    std::vector<std::unique_ptr<ColumnPredicate>> predicates;
+};
+
+struct RIAG_API ColumnPredicateUtil {
+    static std::unique_ptr<ColumnPredicate> tryConvert(const binder::Expression& column,
+        const binder::Expression& predicate);
+};
+
+} // namespace storage
+} // namespace riag

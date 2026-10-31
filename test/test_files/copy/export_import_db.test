@@ -1,0 +1,454 @@
+-DATASET CSV demo-db/csv
+
+--
+
+-CASE ExportImportDatabaseDefault
+-SKIP_WASM
+-STATEMENT create macro addWithDefault(a,b:=3) as a + b;
+---- ok
+-STATEMENT ALTER TABLE User ADD random MAP(STRING, INT64) DEFAULT map(["key1","key2"],[400,250])
+---- ok
+-STATEMENT MATCH (p:User) WHERE p.name = "Adam" return p.random
+---- 1
+{key1=400, key2=250}
+-STATEMENT create sequence seq start 0 increment 10 minvalue 0;
+---- ok
+-STATEMENT return nextval('seq');
+---- 1
+0
+-STATEMENT return nextval('seq');
+---- 1
+10
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case1/demo-db"
+---- 1
+Exported database successfully.
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case1/demo-db"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case1/demo-db"
+---- 1
+Imported database successfully.
+-STATEMENT MATCH (u:User) WHERE u.name = "Adam" SET u.age = 50
+---- ok
+-LOG ReturnAge
+-STATEMENT MATCH (u:User) WHERE u.name="Adam" RETURN u.age
+---- 1
+50
+-STATEMENT return addWithDefault(2);
+---- 1
+5
+-STATEMENT return currval('seq');
+---- 1
+10
+
+-CASE ExportImportDatabaseWithCSVOption
+-SKIP_WASM
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case2/demo-db2" (format="csv", header=true)
+---- 1
+Exported database successfully.
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case2/demo-db2"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case2/demo-db2"
+---- 1
+Imported database successfully.
+-STATEMENT MATCH (u:User) WHERE u.name = "Adam" SET u.age = 50
+---- ok
+-LOG ReturnAge
+-STATEMENT MATCH (u:User) WHERE u.name="Adam" RETURN u.age
+---- 1
+50
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case2/demo-db2" (format="csv", header=true)
+---- error
+Runtime exception: Directory ${RIAG_EXPORT_DB_DIRECTORY}_case2/demo-db2 already exists.
+
+-CASE ExportImportDatabaseWithPARQUET
+-SKIP_WASM
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case3/demo-db3" (format="parquet")
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case3/demo-db3"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case3/demo-db3"
+---- ok
+-STATEMENT MATCH (u:User) WHERE u.name = "Adam" SET u.age = 50
+---- ok
+-LOG ReturnAge
+-STATEMENT MATCH (u:User) WHERE u.name="Adam" RETURN u.age
+---- 1
+50
+
+-CASE ExportImportDatabaseError
+-SKIP_WASM
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db4" (format="npy")
+---- error
+Binder exception: Export database currently only supports csv and parquet files.
+
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db4" (format=false)
+---- error
+Binder exception: The type of format option must be a string.
+
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db4" (format="PARQUET", header=true)
+---- error
+Binder exception: Only export to csv can have options.
+
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db4" (format="CSV", header=true)
+---- ok
+
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db5"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db5"
+---- error
+Binder exception: Directory ${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db5 does not exist.
+
+-REMOVE_FILE "${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db4/schema.cypher"
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db4"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db4"
+---- error(regex)
+^Binder exception: File ${RIAG_EXPORT_DB_DIRECTORY}_case4/demo-db4[/\\]schema.cypher does not exist.$
+
+
+-CASE ExportImportDatabaseRelGroup
+-SKIP_WASM
+-STATEMENT CREATE NODE TABLE A(ID INT64, PRIMARY KEY(ID));
+---- ok
+-STATEMENT CREATE NODE TABLE B(ID INT64, PRIMARY KEY(ID));
+---- ok
+-STATEMENT CREATE NODE TABLE End2(ID INT64, PRIMARY KEY(ID));
+---- ok
+-STATEMENT CREATE REL TABLE REL2(FROM A TO B, FROM B TO End2, num INT64);
+---- ok
+-STATEMENT CREATE REL TABLE REL3(FROM A TO B, FROM B TO End2);
+---- ok
+-STATEMENT CREATE (a:A{ID:0})-[:REL2 {num: 1}]->(b:B{ID:1})-[:REL2 {num: 2}]->(e:End2{ID:2});
+---- ok
+-STATEMENT MATCH (a:A{ID:0}), (b:B{ID:1}) CREATE (a)-[:REL3]->(b);
+---- ok
+-STATEMENT MATCH (a)-[r:REL2]->(b:B)
+           RETURN a.ID;
+---- 1
+0
+-STATEMENT MATCH (a)-[r:REL3]->(b:B)
+           RETURN a.ID, b.ID;
+---- 1
+0|1
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case5/demo-db"
+---- 1
+Exported database successfully.
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case5/demo-db"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case5/demo-db"
+---- 1
+Imported database successfully.
+-STATEMENT MATCH (a)-[r:REL3]->(b:B)
+           RETURN a.ID, b.ID;
+---- 1
+0|1
+-STATEMENT MATCH (u:User) WHERE u.name = "Adam" SET u.age = 50
+---- ok
+-LOG ReturnAge
+-STATEMENT MATCH (u:User) WHERE u.name="Adam" RETURN u.age
+---- 1
+50
+-STATEMENT MATCH (a)-[r:REL2]->(b:B)
+           RETURN a.ID;
+---- 1
+0
+
+-CASE ExportDatabaseWithSerialTable
+-SKIP_WASM
+-STATEMENT CREATE NODE TABLE oneserial(ID serial, PRIMARY KEY(ID));
+---- ok
+-STATEMENT CREATE (o:oneserial)
+---- ok
+-STATEMENT CREATE (o:oneserial)
+---- ok
+-STATEMENT CREATE NODE TABLE twoserial(ID serial, prop STRING, PRIMARY KEY(ID));
+---- ok
+-STATEMENT CREATE (o:twoserial {prop: "Alice"})
+---- ok
+-STATEMENT CREATE (o:twoserial {prop: "Bob"})
+---- ok
+-STATEMENT CREATE (o:twoserial {prop: "Carol"})
+---- ok
+-STATEMENT CREATE (o:twoserial {prop: "Dan"})
+---- ok
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case7/demo-db"
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case7/demo-db"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case7/demo-db"
+---- 1
+Imported database successfully.
+-STATEMENT MATCH (o:twoserial) RETURN o.*;
+---- 4
+0|Alice
+1|Bob
+2|Carol
+3|Dan
+-STATEMENT MATCH (o:oneserial) RETURN o.*;
+---- 2
+0
+1
+-STATEMENT CREATE (o:twoserial {prop: "Dan2"})
+---- ok
+-STATEMENT CREATE (o:oneserial)
+---- ok
+-STATEMENT MATCH (o:twoserial) RETURN o.*;
+---- 5
+0|Alice
+1|Bob
+2|Carol
+3|Dan
+4|Dan2
+-STATEMENT MATCH (o:oneserial) RETURN o.*;
+---- 3
+0
+1
+2
+
+# A sequence nothing was taken from must stay untaken across export/import: the
+# first id after import is still its start value, not one increment later.
+-CASE ExportImportUnusedSequence
+-SKIP_WASM
+-STATEMENT CREATE NODE TABLE unusedserial(ID serial, prop STRING, PRIMARY KEY(ID));
+---- ok
+-STATEMENT CREATE NODE TABLE usedserial(ID serial, prop STRING, PRIMARY KEY(ID));
+---- ok
+-STATEMENT CREATE (o:usedserial {prop: "Alice"})
+---- ok
+-STATEMENT CREATE SEQUENCE unusedstart START 5;
+---- ok
+-STATEMENT CREATE SEQUENCE unusedneg START -3 INCREMENT -2 MINVALUE -100 MAXVALUE -3;
+---- ok
+-STATEMENT CREATE SEQUENCE usedneg START -3 INCREMENT -2 MINVALUE -100 MAXVALUE -3;
+---- ok
+-STATEMENT RETURN nextval('usedneg');
+---- 1
+-3
+-STATEMENT CREATE SEQUENCE rolledback START 7;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT RETURN nextval('rolledback');
+---- 1
+7
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_unused_seq/demo-db" (format="parquet")
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_unused_seq/demo-db"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_unused_seq/demo-db"
+---- ok
+-STATEMENT RETURN currval('unusedserial_ID_serial');
+---- error
+Catalog exception: currval: sequence "unusedserial_ID_serial" is not yet defined. To define the sequence, call nextval first.
+-STATEMENT RETURN currval('rolledback');
+---- error
+Catalog exception: currval: sequence "rolledback" is not yet defined. To define the sequence, call nextval first.
+-STATEMENT CREATE (o:unusedserial {prop: "Bob"})
+---- ok
+-STATEMENT CREATE (o:usedserial {prop: "Carol"})
+---- ok
+-STATEMENT MATCH (o:unusedserial) RETURN o.*;
+---- 1
+0|Bob
+-STATEMENT MATCH (o:usedserial) RETURN o.*;
+---- 2
+0|Alice
+1|Carol
+-STATEMENT RETURN nextval('unusedstart'), nextval('unusedneg'), nextval('usedneg'), nextval('rolledback');
+---- 1
+5|-3|-5|7
+
+-CASE DocExportImportExampleCSV
+-SKIP_WASM
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case8/demo-db" (format="csv", header=true);
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case8/demo-db"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case8/demo-db"
+---- ok
+-STATEMENT MATCH (u:User)-[:Follows]->(f:User) RETURN u.name, f.name;
+---- 4
+Adam|Karissa
+Adam|Zhang
+Karissa|Zhang
+Zhang|Noura
+
+
+-CASE DocExportImportExampleParquet
+-SKIP_WASM
+-STATEMENT Export Database "${RIAG_EXPORT_DB_DIRECTORY}_case9/demo-db" (format="parquet");
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case9/demo-db"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_case9/demo-db"
+---- ok
+-STATEMENT MATCH (u:User)-[:Follows]->(f:User) RETURN u.name, f.name;
+---- 4
+Adam|Karissa
+Adam|Zhang
+Karissa|Zhang
+Zhang|Noura
+
+-CASE ExplainExport
+-SKIP_WASM
+-SKIP_IN_MEM
+-STATEMENT EXPLAIN EXPORT Database "${RIAG_EXPORT_DB_DIRECTORY}_case10/demo-db" (format="parquet");
+---- ok
+-STATEMENT LOAD FROM "${RIAG_EXPORT_DB_DIRECTORY}_case9/demo-db/city.parquet" RETURN *
+---- error
+Binder exception: No file found that matches the pattern: ${RIAG_EXPORT_DB_DIRECTORY}_case9/demo-db/city.parquet.
+
+-CASE ExportDBWithSpecialTableName
+-SKIP_WASM
+-SKIP_IN_MEM
+-STATEMENT CREATE NODE TABLE `0_idx_person` (ID SERIAL, PRIMARY KEY(ID))
+---- ok
+-STATEMENT CREATE NODE TABLE person (ID SERIAL, PRIMARY KEY(ID))
+---- ok
+-STATEMENT CREATE REL TABLE `0_idx_knows` (FROM `0_idx_person` TO  `0_idx_person`)
+---- ok
+-STATEMENT CREATE REL TABLE `0_idx_knows_group` (FROM `0_idx_person` TO  `0_idx_person`, FROM person TO `0_idx_person`)
+---- ok
+-STATEMENT EXPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_char" (format="csv");
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_char"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_char";
+---- ok
+
+-CASE ImportError
+-SKIP_WASM
+-SKIP_IN_MEM
+-STATEMENT IMPORT Database "${RIAG_ROOT_DIRECTORY}/dataset/import_db_error"
+---- error
+Runtime exception: Import database failed: Binder exception: Table org does not exist.
+
+-CASE ExportDBWithSpecialPropertyName
+-SKIP_WASM
+-SKIP_IN_MEM
+-STATEMENT CREATE NODE TABLE `N Table` (ID INT64 PRIMARY KEY, `PROP 1` STRING);
+---- ok
+-STATEMENT CREATE REL TABLE `R Table` (FROM `N Table` TO `N Table`, `PROP 1` STRING);
+---- ok
+-STATEMENT CREATE (a:`N Table` {id:0, `prop 1`: 'A'})-[:`R Table` {`prop 1`: 'Edge'}]->(b: `N Table` {id:1, `prop 1`: 'B'})
+---- ok
+-STATEMENT EXPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_property_name" (format="csv");
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_property_name"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_property_name";
+---- ok
+-STATEMENT MATCH (a:`N Table`)-[e:`R Table`]->(b:`N Table`) RETURN a.*, e.*, b.*;
+---- 1
+0|A|Edge|1|B
+
+-CASE ExportDBSchemaOnly
+-SKIP_WASM
+-SKIP_IN_MEM
+-STATEMENT EXPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_property_name" (SCHEMA_ONLY=true, format='csv');
+---- error
+Binder exception: When 'SCHEMA_ONLY' option is set to true in export database, no other options are allowed.
+-STATEMENT EXPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_property_name" (SCHEMA_ONLY='abc');
+---- error
+Binder exception: The 'SCHEMA_ONLY' option must have a BOOL value.
+-STATEMENT EXPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_property_name" (SCHEMA_ONLY=false, format='csv');
+---- ok
+-STATEMENT CREATE NODE TABLE `N Table` (ID INT64 PRIMARY KEY, `PROP 1` STRING);
+---- ok
+-STATEMENT CREATE REL TABLE `R Table` (FROM `N Table` TO `N Table`, `PROP 1` STRING);
+---- ok
+-STATEMENT CREATE (a:`N Table` {id:0, `prop 1`: 'A'})-[:`R Table` {`prop 1`: 'Edge'}]->(b: `N Table` {id:1, `prop 1`: 'B'})
+---- ok
+-STATEMENT EXPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_property_name1" (SCHEMA_ONLY=true);
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_property_name1"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/special_property_name1";
+---- ok
+-STATEMENT MATCH (a:`N Table`)-[e:`R Table`]->(b:`N Table`) RETURN a.*, e.*, b.*;
+---- 0
+
+-CASE ExportEmptyDBSchemaOnly
+-SKIP_WASM
+-SKIP_IN_MEM
+-STATEMENT EXPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/empty-db-schema-only" (SCHEMA_ONLY=true);
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/empty-db-schema-only"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_special/empty-db-schema-only";
+---- ok
+-STATEMENT MATCH (a) return a
+---- 0
+-STATEMENT MATCH (a)-[e]->(b) return e
+---- 0
+
+-CASE ExportDBWithQuotedDelim
+-SKIP_WASM
+-SKIP_IN_MEM
+-STATEMENT create node table Forum (id INT64, title STRING, creationDate INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT COPY Forum from "${RIAG_ROOT_DIRECTORY}/dataset/ldbc-sf01/Forum.csv";
+---- ok
+-STATEMENT EXPORT DATABASE '${RIAG_EXPORT_DB_DIRECTORY}_quoted_delim/delim-test'(format="csv", header=true);
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_quoted_delim/delim-test"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_quoted_delim/delim-test";
+---- ok
+
+-CASE ExportImportDBWithMultilineString
+-SKIP_WASM
+-SKIP_IN_MEM
+-STATEMENT CREATE NODE TABLE `mixed-newlines`(A STRING, B STRING, PRIMARY KEY(A));
+---- ok
+-STATEMENT COPY `mixed-newlines` FROM "${RIAG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/mixed-newlines.csv" (PARALLEL=FALSE);
+---- ok
+-STATEMENT EXPORT DATABASE '${RIAG_EXPORT_DB_DIRECTORY}_special/_multilinestring'(format="csv")
+---- ok
+-IMPORT_DATABASE '${RIAG_EXPORT_DB_DIRECTORY}_special/_multilinestring'
+-STATEMENT IMPORT DATABASE '${RIAG_EXPORT_DB_DIRECTORY}_special/_multilinestring';
+---- ok
+
+-CASE ExportDBWithOptions
+-STATEMENT CREATE NODE TABLE csvoptions(name STRING PRIMARY KEY, age UINT8);
+---- ok
+-STATEMENT CREATE (:csvoptions { name: 'First Last', age: 27 });
+---- ok
+-STATEMENT EXPORT DATABASE '${RIAG_EXPORT_DB_DIRECTORY}_options/with_options' (format="csv", quote="'", delimiter=";", escape="\\");
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_options/with_options"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_options/with_options";
+---- ok
+-STATEMENT MATCH (u:csvoptions) return u.*
+---- 1
+First Last|27
+
+-CASE ExportImportDBWithColumnDefaults
+-STATEMENT CREATE NODE TABLE with_defaults(id INT64, status STRING DEFAULT 'active', score INT64 DEFAULT 100, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE (:with_defaults { id: 1 });
+---- ok
+-STATEMENT MATCH (n:with_defaults) RETURN n.id, n.status, n.score;
+---- 1
+1|active|100
+-STATEMENT EXPORT DATABASE '${RIAG_EXPORT_DB_DIRECTORY}_defaults/test_defaults';
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_defaults/test_defaults"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_defaults/test_defaults";
+---- ok
+-STATEMENT MATCH (n:with_defaults) RETURN n.id, n.status, n.score;
+---- 1
+1|active|100
+-STATEMENT CREATE (:with_defaults { id: 2 });
+---- ok
+-STATEMENT MATCH (n:with_defaults) RETURN n.id, n.status, n.score ORDER BY n.id;
+---- 2
+1|active|100
+2|active|100
+
+-CASE ExportImportDBWithNegativeAndRelDefaults
+-STATEMENT CREATE NODE TABLE neg_defaults(id INT64, a INT64 DEFAULT -5, b DOUBLE DEFAULT -2.5, s STRING DEFAULT 'x', PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE RDEF(FROM neg_defaults TO neg_defaults, w INT64 DEFAULT 6, r DOUBLE DEFAULT -1.25);
+---- ok
+-STATEMENT ALTER TABLE neg_defaults ADD c INT64 DEFAULT 7;
+---- ok
+-STATEMENT EXPORT DATABASE '${RIAG_EXPORT_DB_DIRECTORY}_defaults/test_neg_rel';
+---- ok
+-IMPORT_DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_defaults/test_neg_rel"
+-STATEMENT IMPORT DATABASE "${RIAG_EXPORT_DB_DIRECTORY}_defaults/test_neg_rel";
+---- ok
+-STATEMENT CREATE (:neg_defaults {id: 1});
+---- ok
+-STATEMENT MATCH (t:neg_defaults {id: 1}) CREATE (t)-[:RDEF]->(t);
+---- ok
+-STATEMENT MATCH (t:neg_defaults)-[r:RDEF]->() RETURN t.a, t.b, t.s, t.c, r.w, r.r;
+---- 1
+-5|-2.500000|x|7|6|-1.250000

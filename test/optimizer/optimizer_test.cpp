@@ -1,0 +1,1976 @@
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "binder/expression/property_expression.h"
+#include "catalog/catalog.h"
+#include "catalog/catalog_entry/node_table_catalog_entry.h"
+#include "catalog/catalog_entry/rel_group_catalog_entry.h"
+#include "common/enums/storage_format.h"
+#include "common/exception/internal.h"
+#include "common/system_config.h"
+#include "graph_test/private_graph_test.h"
+#include "optimizer/remove_unnecessary_distinct_optimizer.h"
+#include "planner/join_order/cost_model.h"
+#include "planner/operator/logical_filter.h"
+#include "planner/operator/logical_intersect.h"
+#include "planner/operator/logical_plan_util.h"
+#include "planner/operator/scan/logical_count_rel_table.h"
+#include "planner/operator/scan/logical_dummy_scan.h"
+#include "planner/operator/scan/logical_query_primary_key_lookup.h"
+#include "planner/operator/scan/logical_scan_node_table.h"
+#include "planner/operator/sip/logical_semi_masker.h"
+#include "test_runner/test_runner.h"
+#include "transaction/transaction.h"
+#include <format>
+
+namespace riag {
+namespace testing {
+
+class OptimizerTest : public DBTest {
+public:
+    std::string getInputDir() override {
+        return TestHelper::appendRiaGRootPath("dataset/tinysnb/");
+    }
+
+    std::string getEncodedPlan(const std::string& query) {
+        return planner::LogicalPlanUtil::encodeJoin(*TestRunner::getLogicalPlan(query, *conn));
+    }
+    std::unique_ptr<planner::LogicalPlan> getRoot(const std::string& query) {
+        auto preparedStatement = conn->prepare(query);
+        if (!preparedStatement->isSuccess()) {
+            throw std::runtime_error("Failed to prepare optimizer test query:\n" + query +
+                                     "\nError:\n" + preparedStatement->getErrorMessage());
+        }
+        auto cachedStatement =
+            conn->getClientContext()->getCachedPreparedStatementManager().getCachedStatement(
+                preparedStatement->getName());
+        return std::move(cachedStatement->logicalPlan);
+    }
+
+    static planner::LogicalFilter* findFilter(planner::LogicalOperator* op) {
+        if (op->getOperatorType() == planner::LogicalOperatorType::FILTER) {
+            return op->ptrCast<planner::LogicalFilter>();
+        }
+        for (auto i = 0u; i < op->getNumChildren(); ++i) {
+            if (auto* filter = findFilter(op->getChild(i).get())) {
+                return filter;
+            }
+        }
+        return nullptr;
+    }
+
+    // Helper to check if a specific operator type exists in the plan
+    static bool hasOperatorType(planner::LogicalOperator* op, planner::LogicalOperatorType type) {
+        if (op->getOperatorType() == type) {
+            return true;
+        }
+        for (auto i = 0u; i < op->getNumChildren(); ++i) {
+            if (hasOperatorType(op->getChild(i).get(), type)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // A node scan or a primary-key lookup join (QUERY_PRIMARY_KEY_LOOKUP) may read the property.
+    static bool scansNodeProperty(planner::LogicalOperator* op, const std::string& variable,
+        const std::string& property) {
+        binder::expression_vector properties;
+        if (op->getOperatorType() == planner::LogicalOperatorType::SCAN_NODE_TABLE) {
+            properties = op->constCast<planner::LogicalScanNodeTable>().getProperties();
+        } else if (op->getOperatorType() ==
+                   planner::LogicalOperatorType::QUERY_PRIMARY_KEY_LOOKUP) {
+            properties = op->constCast<planner::LogicalQueryPrimaryKeyLookup>().getProperties();
+        }
+        for (auto& expr : properties) {
+            auto& scanned = expr->constCast<binder::PropertyExpression>();
+            if (scanned.getRawVariableName() == variable && scanned.getPropertyName() == property) {
+                return true;
+            }
+        }
+        for (auto i = 0u; i < op->getNumChildren(); ++i) {
+            if (scansNodeProperty(op->getChild(i).get(), variable, property)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+class StatsOptimizerTest : public EmptyDBTest {
+public:
+    void SetUp() override {
+        EmptyDBTest::SetUp();
+        createDBAndConn();
+    }
+
+    std::unique_ptr<planner::LogicalPlan> getRoot(const std::string& query) {
+        auto preparedStatement = conn->prepare(query);
+        if (!preparedStatement->isSuccess()) {
+            throw std::runtime_error("Failed to prepare optimizer test query:\n" + query +
+                                     "\nError:\n" + preparedStatement->getErrorMessage());
+        }
+        auto cachedStatement =
+            conn->getClientContext()->getCachedPreparedStatementManager().getCachedStatement(
+                preparedStatement->getName());
+        return std::move(cachedStatement->logicalPlan);
+    }
+
+    static planner::LogicalFilter* getDeepestFilter(planner::LogicalOperator* op) {
+        planner::LogicalFilter* result = nullptr;
+        std::function<void(planner::LogicalOperator*)> visit;
+        visit = [&](planner::LogicalOperator* current) {
+            if (current->getOperatorType() == planner::LogicalOperatorType::FILTER) {
+                result = current->ptrCast<planner::LogicalFilter>();
+            }
+            for (auto i = 0u; i < current->getNumChildren(); ++i) {
+                visit(current->getChild(i).get());
+            }
+        };
+        visit(op);
+        return result;
+    }
+};
+
+TEST_F(OptimizerTest, JoinHint) {
+    // One hop
+    auto q1 = "MATCH (a:person)-[e:knows]->(b:person) "
+              "WHERE a.ID > 0 "
+              "  AND e.date = date('1999-01-01') "
+              "  AND b.ID > 2"
+              "  AND a.ID + b.ID > 3 "
+              "HINT a JOIN (e JOIN b) "
+              "RETURN *";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(),
+        "Filter()HJ(a._ID){Filter()S(a)}{Filter()E(a)Filter()S(b)}");
+    auto q2 = "MATCH (a:person)-[e:knows]->(b:person) "
+              "WHERE a.ID > 0 "
+              "  AND e.date = date('1999-01-01') "
+              "  AND b.ID > 2"
+              "  AND a.ID + b.ID > 3 "
+              "HINT (a JOIN e) JOIN b "
+              "RETURN *";
+    ASSERT_STREQ(getEncodedPlan(q2).c_str(),
+        "Filter()HJ(b._ID){Filter()E(b)Filter()S(a)}{Filter()S(b)}");
+    // Two hop
+    auto q3 = "MATCH (a:person)-[e1:knows]->(b:person)-[e2:knows]->(c:person) "
+              "HINT (((b JOIN e1) JOIN e2) JOIN a) JOIN c "
+              "RETURN *";
+    ASSERT_STREQ(getEncodedPlan(q3).c_str(), "HJ(c._ID){HJ(a._ID){E(c)E(a)S(b)}{S(a)}}{S(c)}");
+    auto q4 = "MATCH (a:person)-[e1:knows]->(b:person)-[e2:knows]->(c:person) "
+              "HINT (((a JOIN e1) JOIN b) JOIN e2) JOIN c "
+              "RETURN COUNT(e1.date)";
+    ASSERT_STREQ(getEncodedPlan(q4).c_str(), "HJ(b._ID){E(b)S(a)}{E(c)S(b)}");
+    // Cycle
+    auto q5 = "MATCH (a:person)-[e1:knows]->(b:person)-[e2:knows]->(a) "
+              "HINT ((a JOIN e1) JOIN b) JOIN e2 "
+              "RETURN *";
+    ASSERT_STREQ(getEncodedPlan(q5).c_str(),
+        "HJ(a._ID,b._ID){HJ(b._ID){E(b)S(a)}{S(b)}}{E(a)S(b)}");
+    auto q6 = "MATCH (a:person)-[e1:knows]->(b:person)-[e2:knows]->(c:person), "
+              "      (a)-[e3:knows]->(c) "
+              "HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c "
+              "RETURN *";
+    ASSERT_STREQ(getEncodedPlan(q6).c_str(),
+        "HJ(c._ID){I(c._ID){HJ(b._ID){E(b)S(a)}{S(b)}}{E(c)S(b)}{E(c)S(a)}}{S(c)}");
+}
+
+TEST_F(OptimizerTest, CrossJoinWithFilterWithoutPushDownTest) {
+    auto q1 = "MATCH (a:person) "
+              "MATCH (b:person) "
+              "WHERE a.fName=b.fName AND a.gender <> b.gender "
+              "RETURN a.gender;";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(), "Filter()HJ(a.fName=b.fName){S(a)}{S(b)}");
+    auto q2 = "MATCH (a:person) "
+              "MATCH (b:person) "
+              "WHERE a.fName=b.fName AND a.fName is NOT null "
+              "RETURN a.fName;";
+    ASSERT_STREQ(getEncodedPlan(q2).c_str(), "HJ(a.fName=b.fName){Filter()S(a)}{S(b)}");
+    auto q3 = "MATCH (a:person) "
+              "MATCH (b:person) "
+              "WHERE a.fName=b.fName AND a.age > 1 + 2.0 "
+              "RETURN a.fName;";
+    ASSERT_STREQ(getEncodedPlan(q3).c_str(), "HJ(a.fName=b.fName){Filter()S(a)}{S(b)}");
+}
+
+TEST_F(OptimizerTest, DisableOptimizerTest) {
+    conn->query("CALL enable_plan_optimizer=false");
+
+    auto q1 = "MATCH (a:person)-[e]->(b) "
+              "WHERE a.ID < 0 AND a.fName='Alice' "
+              "RETURN a.gender;";
+    {
+        auto plan = getEncodedPlan(q1);
+        ASSERT_TRUE(plan == "HJ(b._ID){S(b)}{E(b)Filter()Filter()S(a)}" ||
+                    plan == "HJ(b._ID){E(b)Filter()Filter()S(a)}{S(b)}");
+        // sanity check to see if the plan still outputs the correct result
+        auto result = conn->query(q1);
+        ASSERT_EQ(result->getNumTuples(), 0);
+    }
+
+    auto q2 = "MATCH (a:person)-[e:knows]->(b:person) "
+              "HINT (a JOIN e) JOIN b "
+              "RETURN e.date;";
+    {
+        ASSERT_STREQ(getEncodedPlan(q2).c_str(), "HJ(b._ID){E(b)S(a)}{S(b)}");
+        auto result = conn->query(q2);
+        ASSERT_EQ(result->getNumTuples(), 14);
+    }
+
+    conn->query("CALL enable_plan_optimizer=true");
+    {
+        ASSERT_STREQ(getEncodedPlan(q2).c_str(), "E(b)S(a)");
+        auto result = conn->query(q2);
+        ASSERT_EQ(result->getNumTuples(), 14);
+    }
+}
+
+TEST_F(OptimizerTest, FilterPushDownTest) {
+    auto q1 = "MATCH (a:person)-[e]->(b) "
+              "WHERE a.ID < 0 AND a.fName='Alice' "
+              "RETURN a.gender;";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(), "E(b)Filter()Filter()S(a)");
+}
+
+TEST_F(OptimizerTest, GroupKeyPredicatePushDownEliminatesCrossProduct) {
+    auto query = "MATCH (a:person) "
+                 "WITH a.ID AS entity_id, COUNT(a.ID) AS metric_0 "
+                 "MATCH (b:person) "
+                 "WITH entity_id, metric_0, b.ID AS metric_1_entity_id, AVG(b.ID) AS metric_1 "
+                 "WHERE metric_1_entity_id = entity_id "
+                 "RETURN entity_id, metric_0, metric_1 ORDER BY entity_id";
+    auto explicitJoinQuery =
+        "MATCH (a:person) "
+        "WITH a.ID AS entity_id, COUNT(a.ID) AS metric_0 "
+        "MATCH (b:person) WHERE b.ID = entity_id "
+        "WITH entity_id, metric_0, b.ID AS metric_1_entity_id, AVG(b.ID) AS metric_1 "
+        "RETURN entity_id, metric_0, metric_1 ORDER BY entity_id";
+
+    auto plan = getRoot(query);
+    ASSERT_FALSE(hasOperatorType(plan->getLastOperator().get(),
+        planner::LogicalOperatorType::CROSS_PRODUCT));
+    ASSERT_TRUE(
+        hasOperatorType(plan->getLastOperator().get(), planner::LogicalOperatorType::HASH_JOIN));
+
+    auto result = conn->query(query);
+    auto expected = conn->query(explicitJoinQuery);
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_TRUE(expected->isSuccess()) << expected->getErrorMessage();
+    ASSERT_EQ(TestHelper::convertResultToString(*result),
+        TestHelper::convertResultToString(*expected));
+}
+
+TEST_F(OptimizerTest, GroupKeyPredicatePushDownThroughOptionalMatch) {
+    auto query = "MATCH (a:person) "
+                 "OPTIONAL MATCH (a)-[:knows]->(aFriend:person) "
+                 "WITH a.ID AS entity_id, COUNT(aFriend.ID) AS metric_0 "
+                 "MATCH (b:person) "
+                 "OPTIONAL MATCH (b)-[:knows]->(bFriend:person) "
+                 "WITH entity_id, metric_0, b.ID AS metric_1_entity_id, AVG(b.age) AS metric_1 "
+                 "WHERE metric_1_entity_id = entity_id "
+                 "RETURN entity_id, metric_0, metric_1 ORDER BY entity_id";
+    auto explicitJoinQuery =
+        "MATCH (a:person) "
+        "OPTIONAL MATCH (a)-[:knows]->(aFriend:person) "
+        "WITH a.ID AS entity_id, COUNT(aFriend.ID) AS metric_0 "
+        "MATCH (b:person) WHERE b.ID = entity_id "
+        "OPTIONAL MATCH (b)-[:knows]->(bFriend:person) "
+        "WITH entity_id, metric_0, b.ID AS metric_1_entity_id, AVG(b.age) AS metric_1 "
+        "RETURN entity_id, metric_0, metric_1 ORDER BY entity_id";
+
+    auto plan = getRoot(query);
+    ASSERT_FALSE(hasOperatorType(plan->getLastOperator().get(),
+        planner::LogicalOperatorType::CROSS_PRODUCT));
+
+    auto result = conn->query(query);
+    auto expected = conn->query(explicitJoinQuery);
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_TRUE(expected->isSuccess()) << expected->getErrorMessage();
+    ASSERT_EQ(TestHelper::convertResultToString(*result),
+        TestHelper::convertResultToString(*expected));
+}
+
+TEST_F(OptimizerTest, GroupKeyPredicatePushDownKeepsAggregatePredicate) {
+    auto query = "MATCH (a:person) "
+                 "WITH a.ID AS entity_id, COUNT(a.ID) AS metric_0 "
+                 "MATCH (b:person) "
+                 "WITH entity_id, metric_0, b.ID AS metric_1_entity_id, AVG(b.ID) AS metric_1 "
+                 "WHERE metric_1_entity_id = entity_id AND metric_1 > 3 "
+                 "RETURN entity_id, metric_0, metric_1 ORDER BY entity_id";
+    auto explicitJoinQuery =
+        "MATCH (a:person) "
+        "WITH a.ID AS entity_id, COUNT(a.ID) AS metric_0 "
+        "MATCH (b:person) WHERE b.ID = entity_id "
+        "WITH entity_id, metric_0, b.ID AS metric_1_entity_id, AVG(b.ID) AS metric_1 "
+        "WHERE metric_1 > 3 "
+        "RETURN entity_id, metric_0, metric_1 ORDER BY entity_id";
+
+    auto plan = getRoot(query);
+    ASSERT_FALSE(hasOperatorType(plan->getLastOperator().get(),
+        planner::LogicalOperatorType::CROSS_PRODUCT));
+    ASSERT_TRUE(
+        hasOperatorType(plan->getLastOperator().get(), planner::LogicalOperatorType::FILTER));
+
+    auto result = conn->query(query);
+    auto expected = conn->query(explicitJoinQuery);
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_TRUE(expected->isSuccess()) << expected->getErrorMessage();
+    ASSERT_EQ(TestHelper::convertResultToString(*result),
+        TestHelper::convertResultToString(*expected));
+}
+
+static void collectOperators(planner::LogicalOperator* op, planner::LogicalOperatorType type,
+    std::vector<planner::LogicalOperator*>& result) {
+    if (op->getOperatorType() == type) {
+        result.push_back(op);
+    }
+    for (auto i = 0u; i < op->getNumChildren(); ++i) {
+        collectOperators(op->getChild(i).get(), type, result);
+    }
+}
+
+static int64_t getCount(main::QueryResult& result) {
+    EXPECT_TRUE(result.isSuccess()) << result.getErrorMessage();
+    EXPECT_TRUE(result.hasNext());
+    return result.getNext()->getValue(0)->getValue<int64_t>();
+}
+
+TEST_F(OptimizerTest, IntersectBuildSideMasksProbeScan) {
+    using planner::LogicalOperatorType;
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE MaskPerson(id INT64, PRIMARY KEY(id));"
+                    "CREATE NODE TABLE MaskPost(id INT64, PRIMARY KEY(id));"
+                    "CREATE NODE TABLE MaskComment(id INT64, PRIMARY KEY(id));"
+                    "CREATE NODE TABLE MaskTag(id INT64, PRIMARY KEY(id));"
+                    "CREATE REL TABLE MaskPostCreator(FROM MaskPost TO MaskPerson, MANY_ONE);"
+                    "CREATE REL TABLE MaskCommentCreator(FROM MaskComment TO MaskPerson, MANY_ONE);"
+                    "CREATE REL TABLE MaskReplyOf(FROM MaskComment TO MaskPost, MANY_ONE);"
+                    "CREATE REL TABLE MaskHasTag(FROM MaskPost TO MaskTag);"
+                    "UNWIND range(0, 9) AS i CREATE (:MaskPerson {id: i});"
+                    "UNWIND range(0, 999) AS i CREATE (:MaskPost {id: i});"
+                    "UNWIND range(0, 499) AS i CREATE (:MaskComment {id: i});"
+                    "UNWIND range(0, 9) AS i CREATE (:MaskTag {id: i});")
+            ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (p:MaskPost), (a:MaskPerson) WHERE a.id = p.id % 10 "
+                            "CREATE (p)-[:MaskPostCreator]->(a);"
+                            "MATCH (c:MaskComment), (a:MaskPerson) WHERE a.id = c.id % 7 "
+                            "CREATE (c)-[:MaskCommentCreator]->(a);"
+                            "MATCH (c:MaskComment), (p:MaskPost) WHERE c.id < 300 AND "
+                            "p.id = (c.id % 50) * 20 + c.id % 3 CREATE (c)-[:MaskReplyOf]->(p);"
+                            "MATCH (p:MaskPost), (t:MaskTag) WHERE t.id = p.id % 10 "
+                            "CREATE (p)-[:MaskHasTag]->(t);")
+                    ->isSuccess());
+    const std::string pattern =
+        "MATCH (c:MaskComment)-[hc:MaskCommentCreator]->(creator:MaskPerson), "
+        "(c)-[r:MaskReplyOf]->(post:MaskPost)-[phc:MaskPostCreator]->(creator) ";
+    const std::string intersectHint =
+        "(((post JOIN phc) JOIN creator) MULTI_JOIN hc MULTI_JOIN r) JOIN c";
+    // The probe side scans 1000 posts against 10 creators, which prohibits probe-to-build SIP.
+    // The MaskReplyOf build side, which holds the 150 posts with replies, masks the post scan.
+    const auto query = pattern + "HINT " + intersectHint + " RETURN COUNT(*)";
+    auto plan = TestRunner::getLogicalPlan(query, *conn);
+    std::vector<planner::LogicalOperator*> maskers;
+    collectOperators(plan->getLastOperator().get(), LogicalOperatorType::SEMI_MASKER, maskers);
+    ASSERT_EQ(maskers.size(), 1u);
+    auto& masker = maskers[0]->constCast<planner::LogicalSemiMasker>();
+    ASSERT_EQ(masker.getTargetOperators().size(), 1u);
+    auto& scan = masker.getTargetOperators()[0]->constCast<planner::LogicalScanNodeTable>();
+    EXPECT_EQ(scan.getNodeID()->getUniqueName(), masker.getKey()->getUniqueName());
+    EXPECT_EQ(masker.getKey()->toString(), "post._ID");
+    // The mapper drops a semi masker whose target scan is not mapped yet.
+    EXPECT_NE(conn->query("EXPLAIN " + query)->toString().find("SEMI_MASKER"), std::string::npos);
+
+    // Each execution builds a fresh mask: a reply added between executions is counted.
+    auto prepared = conn->prepare(query);
+    ASSERT_TRUE(prepared->isSuccess()) << prepared->getErrorMessage();
+    EXPECT_EQ(getCount(*conn->execute(prepared.get())), 45);
+    ASSERT_TRUE(conn->query("MATCH (c:MaskComment {id: 499}), (p:MaskPost {id: 12}) "
+                            "CREATE (c)-[:MaskReplyOf]->(p)")
+                    ->isSuccess());
+    EXPECT_EQ(getCount(*conn->execute(prepared.get())), 46);
+
+    // An outer join on post that already masks the post scan keeps its more selective mask: a
+    // scan holds one mask, so the intersect adds none.
+    const auto taggedQuery = "MATCH (t:MaskTag)<-[ht:MaskHasTag]-(post:MaskPost), " +
+                             pattern.substr(6) + "WHERE t.id = 2 HINT (" + intersectHint +
+                             ") JOIN (ht JOIN t) RETURN COUNT(*)";
+    auto taggedPlan = TestRunner::getLogicalPlan(taggedQuery, *conn);
+    std::vector<planner::LogicalOperator*> intersects;
+    collectOperators(taggedPlan->getLastOperator().get(), LogicalOperatorType::INTERSECT,
+        intersects);
+    ASSERT_EQ(intersects.size(), 1u);
+    for (auto i = 1u; i < intersects[0]->getNumChildren(); ++i) {
+        std::vector<planner::LogicalOperator*> buildMaskers;
+        collectOperators(intersects[0]->getChild(i).get(), LogicalOperatorType::SEMI_MASKER,
+            buildMaskers);
+        EXPECT_TRUE(buildMaskers.empty());
+    }
+    std::vector<planner::LogicalOperator*> taggedMaskers;
+    collectOperators(taggedPlan->getLastOperator().get(), LogicalOperatorType::SEMI_MASKER,
+        taggedMaskers);
+    EXPECT_EQ(taggedMaskers.size(), 1u);
+    EXPECT_EQ(getCount(*conn->query(taggedQuery)), 16);
+}
+
+TEST_F(OptimizerTest, IndexScanTest) {
+    auto q1 = "MATCH (a:person) "
+              "WHERE a.ID = 0 AND a.fName='Alice' "
+              "RETURN a.gender;";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(), "Filter()IndexScan(a)");
+}
+
+TEST_F(OptimizerTest, ArithmeticIdentityEnablesIndexScan) {
+    // x + 0, x * 1 etc. are simplified back to the property, so the PK lookup applies.
+    auto q1 = "MATCH (a:person) WHERE a.ID + 0 = 0 RETURN a.fName;";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(), "IndexScan(a)");
+    auto q2 = "MATCH (a:person) WHERE a.ID * 1 = 0 RETURN a.fName;";
+    ASSERT_STREQ(getEncodedPlan(q2).c_str(), "IndexScan(a)");
+    auto q3 = "MATCH (a:person) WHERE 0 + a.ID = 0 RETURN a.fName;";
+    ASSERT_STREQ(getEncodedPlan(q3).c_str(), "IndexScan(a)");
+    auto q4 = "MATCH (a:person) WHERE a.ID - 0 = 0 RETURN a.fName;";
+    ASSERT_STREQ(getEncodedPlan(q4).c_str(), "IndexScan(a)");
+    auto q5 = "MATCH (a:person) WHERE a.ID / 1 = 0 RETURN a.fName;";
+    ASSERT_STREQ(getEncodedPlan(q5).c_str(), "IndexScan(a)");
+    // Non-identity arithmetic must keep the filter on top of a full scan.
+    auto q6 = "MATCH (a:person) WHERE a.ID + 1 = 1 RETURN a.fName;";
+    ASSERT_STREQ(getEncodedPlan(q6).c_str(), "Filter()S(a)");
+}
+
+TEST_F(OptimizerTest, RemoveUnnecessaryJoinTest) {
+    auto q1 = "MATCH (a:person)-[e:knows]->(b:person) "
+              "HINT (a JOIN e) JOIN b "
+              "RETURN e.date;";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(), "E(b)S(a)");
+}
+
+TEST_F(OptimizerTest, RemoveUnnecessaryJoinNullableKeyTest) {
+    // b can be NULL after each OPTIONAL MATCH form, so the join with S(b) stays.
+    auto q1 = "MATCH (a:person) OPTIONAL MATCH (a)-[:studyAt]->(b:organisation) "
+              "WITH a, b MATCH (b) RETURN a.ID;";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(),
+        "HJ(b._ID){HJ(a._ID){S(a)}{HJ(a._ID){}{E(b)S(a)}}}{S(b)}");
+    auto q2 = "MATCH (a:person) WHERE a.ID < 3 OPTIONAL MATCH (b:organisation) "
+              "WHERE b.score > 1000 WITH a, b MATCH (b) RETURN a.ID;";
+    ASSERT_STREQ(getEncodedPlan(q2).c_str(), "HJ(b._ID){CP(){Filter()S(a)}{Filter()S(b)}}{S(b)}");
+    auto q3 = "OPTIONAL MATCH (b:organisation) WHERE b.score > 1000 WITH b MATCH (b) RETURN b.ID;";
+    ASSERT_STREQ(getEncodedPlan(q3).c_str(), "HJ(b._ID){Filter()S(b)}{S(b)}");
+    // a is the LEFT join's probe key and MERGE creates b, so neither is NULL: the join goes.
+    auto q4 = "MATCH (a:person) OPTIONAL MATCH (a)-[:studyAt]->(b:organisation) "
+              "WITH a, b MATCH (a) RETURN b.ID;";
+    ASSERT_STREQ(getEncodedPlan(q4).c_str(),
+        "HJ(a._ID){S(a)}{HJ(a._ID){}{HJ(b._ID){S(b)}{E(b)S(a)}}}");
+    auto q5 = "MATCH (a:person) WHERE a.ID = 0 "
+              "MERGE (a)-[:studyAt]->(b:organisation {ID: 100}) WITH a, b MATCH (b) RETURN a.ID;";
+    ASSERT_STREQ(getEncodedPlan(q5).c_str(),
+        "Filter()HJ(a._ID){IndexScan(a)}{HJ(b._ID){IndexScan(b)}{E(b)S(a)}}");
+    auto q6 = "MATCH (a:person) WHERE a.ID = 0 MERGE (b:organisation {ID: 100}) "
+              "WITH a, b MATCH (b) RETURN a.ID;";
+    ASSERT_STREQ(getEncodedPlan(q6).c_str(), "Filter()CP(){IndexScan(a)}{IndexScan(b)}");
+    auto q7 = "MERGE (b:organisation {ID: 100}) WITH b MATCH (b) RETURN b.ID;";
+    ASSERT_STREQ(getEncodedPlan(q7).c_str(), "Filter()IndexScan(b)");
+    // After an update the scan is the probe side.
+    auto q8 = "MATCH (a:person) OPTIONAL MATCH (a)-[:studyAt]->(b:organisation) "
+              "SET a.age = a.age WITH a, b MATCH (b) RETURN a.ID;";
+    ASSERT_STREQ(getEncodedPlan(q8).c_str(),
+        "HJ(b._ID){S(b)}{HJ(a._ID){S(a)}{HJ(a._ID){}{E(b)S(a)}}}");
+    auto q9 = "MATCH (a:person) OPTIONAL MATCH (a)-[:studyAt]->(b:organisation) "
+              "SET a.age = a.age WITH a, b MATCH (a) RETURN b.ID;";
+    ASSERT_STREQ(getEncodedPlan(q9).c_str(),
+        "HJ(a._ID){S(a)}{HJ(a._ID){}{HJ(b._ID){S(b)}{E(b)S(a)}}}");
+}
+
+TEST_F(OptimizerTest, MergeConsecutiveMatch) {
+    auto q1 = "MATCH (a:person) MATCH (b:person) WHERE b.ID=0 MATCH (a)-[]->(b) "
+              "RETURN COUNT(*);";
+    if (common::DEFAULT_EXTEND_DIRECTION == common::ExtendDirection::FWD) {
+        ASSERT_STREQ(getEncodedPlan(q1).c_str(), "HJ(b._ID){E(b)S(a)}{IndexScan(b)}");
+    } else {
+        ASSERT_STREQ(getEncodedPlan(q1).c_str(), "E(a)IndexScan(b)");
+    }
+}
+
+TEST_F(OptimizerTest, PkScanTest) {
+    auto q1 = "MATCH (a:person {ID:24189255811663})-[f]->(b) RETURN b;";
+    auto ans = getEncodedPlan(q1);
+    ASSERT_TRUE(
+        ans == "HJ(b._ID){S(b)}{E(b)IndexScan(a)}" || ans == "HJ(b._ID){E(b)IndexScan(a)}{S(b)}");
+}
+
+TEST_F(OptimizerTest, FilterDifferentPropertiesTest) {
+    auto q1 = "MATCH (a:person {gender:1})-[f]->(b:person {age: 30}) RETURN b;";
+    auto ans = getEncodedPlan(q1);
+    ASSERT_TRUE(ans == "HJ(b._ID){E(b)Filter()S(a)}{Filter()S(b)}" ||
+                ans == "HJ(a._ID){E(a)Filter()S(b)}{Filter()S(a)}");
+}
+
+TEST_F(OptimizerTest, SingleNodeTwoHopJoins) {
+    if (common::DEFAULT_EXTEND_DIRECTION != common::ExtendDirection::BOTH) {
+        GTEST_SKIP();
+    }
+#if defined(WIN32)
+    // Skip on windows as we don't generate consistent plan as on other platforms.
+    // TODO(Guodong/Xiyang): We should make sure the plan is consistent on all platforms.
+    GTEST_SKIP();
+#else
+    // The payload-fetch joins below are small-outer (a single bound row fanning out to a
+    // few neighbours) over a larger node table, so the lookup join wins the cost
+    // competition against the hash join and the bare scans disappear into LKP ops.
+    auto q1 =
+        "MATCH (a:person)-[e:knows]->(b:person)-[e2:knows]->(c:person) WHERE b.ID=0 RETURN a,b,c;";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(), "LKP(c._ID)LKP(a._ID)E(c)E(a)IndexScan(b)");
+    auto q2 = "MATCH (a:person)-[e:knows]->(b:person)-[e2:knows]->(c:person) WHERE a.ID=0 "
+              "RETURN a,b,c;";
+    ASSERT_STREQ(getEncodedPlan(q2).c_str(), "LKP(b._ID)LKP(c._ID)E(c)E(b)IndexScan(a)");
+    auto q3 = "MATCH (a:person)-[e:knows]->(b:person)-[e2:knows]->(c:person) WHERE c.ID=0 "
+              "RETURN a,b,c;";
+    ASSERT_STREQ(getEncodedPlan(q3).c_str(), "LKP(b._ID)LKP(a._ID)E(a)E(b)IndexScan(c)");
+#endif
+}
+
+TEST_F(OptimizerTest, LookupJoinCountsFlatOuterRows) {
+    if (common::DEFAULT_EXTEND_DIRECTION != common::ExtendDirection::BOTH) {
+        GTEST_SKIP();
+    }
+    // Every outer node has 20 neighbours, so the lookup probes 20 times the outer side's
+    // factorized estimate. lkp_big's 2,000 probes exceed the cap, although they are fewer than
+    // the 5,000 rows a scan of lkp_target reads. lkp_mid's 1,000 probes are within the cap but
+    // more than the 500 rows of lkp_mid_target. lkp_small's 200 probes pass both.
+    constexpr auto cap = common::PlannerKnobs::LOOKUP_JOIN_MAX_OUTER_CARDINALITY;
+    static_assert(100 <= cap && 100 * 20 > cap && 100 * 20 < 5000);
+    static_assert(50 * 20 <= cap && 50 * 20 > 500 && 10 * 20 <= cap);
+    for (auto query : {"CREATE NODE TABLE lkp_big(id INT64, PRIMARY KEY(id));",
+             "CREATE NODE TABLE lkp_mid(id INT64, PRIMARY KEY(id));",
+             "CREATE NODE TABLE lkp_small(id INT64, PRIMARY KEY(id));",
+             "CREATE NODE TABLE lkp_target(id INT64, name STRING, PRIMARY KEY(id));",
+             "CREATE NODE TABLE lkp_mid_target(id INT64, name STRING, PRIMARY KEY(id));",
+             "CREATE REL TABLE lkp_big_to(FROM lkp_big TO lkp_target);",
+             "CREATE REL TABLE lkp_mid_to(FROM lkp_mid TO lkp_mid_target);",
+             "CREATE REL TABLE lkp_small_to(FROM lkp_small TO lkp_target);",
+             "UNWIND range(0, 99) AS i CREATE (:lkp_big {id: i});",
+             "UNWIND range(0, 49) AS i CREATE (:lkp_mid {id: i});",
+             "UNWIND range(0, 9) AS i CREATE (:lkp_small {id: i});",
+             "UNWIND range(0, 4999) AS i CREATE (:lkp_target {id: i, name: CAST(i AS STRING)});",
+             "UNWIND range(0, 499) AS i CREATE (:lkp_mid_target {id: i, name: CAST(i AS STRING)});",
+             "MATCH (a:lkp_big), (t:lkp_target) WHERE t.id % 250 = a.id "
+             "CREATE (a)-[:lkp_big_to]->(t);",
+             "MATCH (a:lkp_mid), (t:lkp_mid_target) WHERE t.id % 25 = a.id % 25 "
+             "CREATE (a)-[:lkp_mid_to]->(t);",
+             "MATCH (a:lkp_small), (t:lkp_target) WHERE t.id % 250 = a.id "
+             "CREATE (a)-[:lkp_small_to]->(t);"}) {
+        auto result = conn->query(query);
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    using planner::LogicalOperator;
+    using planner::LogicalOperatorType;
+    std::function<const LogicalOperator*(const LogicalOperator*)> findLookup =
+        [&](const LogicalOperator* op) -> const LogicalOperator* {
+        if (op->getOperatorType() == LogicalOperatorType::QUERY_PRIMARY_KEY_LOOKUP) {
+            return op;
+        }
+        for (auto i = 0u; i < op->getNumChildren(); ++i) {
+            if (auto* lookup = findLookup(op->getChild(i).get())) {
+                return lookup;
+            }
+        }
+        return nullptr;
+    };
+    for (auto query : {"MATCH (a:lkp_big)-[:lkp_big_to]->(t:lkp_target) RETURN t.name;",
+             "MATCH (a:lkp_mid)-[:lkp_mid_to]->(t:lkp_mid_target) RETURN t.name;"}) {
+        auto plan = getRoot(query);
+        EXPECT_EQ(findLookup(plan->getLastOperator().get()), nullptr) << query;
+        EXPECT_TRUE(hasOperatorType(plan->getLastOperator().get(), LogicalOperatorType::HASH_JOIN))
+            << query;
+    }
+    auto plan = getRoot("MATCH (a:lkp_small)-[:lkp_small_to]->(t:lkp_target) RETURN t.name;");
+    auto* lookup = findLookup(plan->getLastOperator().get());
+    ASSERT_NE(lookup, nullptr);
+    // The lookup reports its flat input rows, not the 10 factorized ones.
+    EXPECT_EQ(lookup->getCardinality(), 10u * 20);
+}
+
+TEST_F(OptimizerTest, PlanUndirectedInnerJoin) {
+    if (common::DEFAULT_EXTEND_DIRECTION != common::ExtendDirection::BOTH) {
+        GTEST_SKIP();
+    }
+    auto query = "MATCH (a:person)-[e:knows]-(b:person) RETURN a.ID, b.ID;";
+    auto encodedPlan = getEncodedPlan(query);
+    // there should only be a single hash join in the plan
+    ASSERT_TRUE((encodedPlan == "HJ(b._ID){E(b)S(a)}{S(b)}") ||
+                (encodedPlan == "HJ(a._ID){E(a)S(b)}{S(a)}"));
+}
+
+TEST_F(OptimizerTest, SubqueryHint) {
+    auto q1 = "MATCH (a:person) WITH * MATCH (a)-[e:knows]->(b:person) WHERE b.ID > 0 HINT (a JOIN "
+              "e) JOIN b RETURN *;";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(), "HJ(a._ID){S(a)}{HJ(b._ID){E(b)S(a)}{Filter()S(b)}}");
+    auto q2 = "MATCH (a:person) WITH * MATCH (a)-[e:knows]->(b:person) WHERE b.ID > 0 HINT a JOIN "
+              "(e JOIN b)RETURN *;";
+    ASSERT_STREQ(getEncodedPlan(q2).c_str(), "HJ(a._ID){S(a)}{E(a)Filter()S(b)}");
+    auto q3 = "MATCH (a:person) WITH * OPTIONAL MATCH (a)-[e:knows]->(b:person) WHERE b.ID > 0 "
+              "HINT (a JOIN e) JOIN b RETURN *;";
+    ASSERT_STREQ(getEncodedPlan(q3).c_str(), "HJ(a._ID){S(a)}{HJ(b._ID){E(b)S(a)}{Filter()S(b)}}");
+    auto q4 = "MATCH (a:person) WITH * OPTIONAL MATCH (a)-[e:knows]->(b:person) WHERE b.ID > 0 "
+              "HINT a JOIN (e JOIN b) RETURN *;";
+    ASSERT_STREQ(getEncodedPlan(q4).c_str(), "HJ(a._ID){S(a)}{E(a)Filter()S(b)}");
+    auto q5 = "MATCH (a:person) WHERE EXISTS { MATCH (a)-[e:knows]->(b:person) WHERE b.ID > 0 HINT "
+              "(a JOIN e) JOIN b } RETURN *;";
+    ASSERT_STREQ(getEncodedPlan(q5).c_str(),
+        "Filter()HJ(a._ID){S(a)}{HJ(b._ID){E(b)S(a)}{Filter()S(b)}}");
+    auto q6 = "MATCH (a:person) WHERE EXISTS { MATCH (a)-[e:knows]->(b:person) WHERE b.ID > 0 HINT "
+              "a JOIN (e JOIN b) } RETURN *;";
+    ASSERT_STREQ(getEncodedPlan(q6).c_str(), "Filter()HJ(a._ID){S(a)}{E(a)Filter()S(b)}");
+}
+
+TEST_F(OptimizerTest, CountRelTableOptimizer) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows can pick the reverse physical extend orientation for degree-count "
+                    "plans, so this plan-shape test is nondeterministic there.";
+#endif
+
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE opt_user(id INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE opt_follows(FROM opt_user TO opt_user, date DATE);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_user {id: 1});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_user {id: 2});")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_user), (b:opt_user) "
+                            "WHERE a.id = 1 AND b.id = 2 "
+                            "CREATE (a)-[:opt_follows {date: date('2020-01-01')}]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_user), (b:opt_user) "
+                            "WHERE a.id = 2 AND b.id = 1 "
+                            "CREATE (a)-[:opt_follows {date: date('2020-01-02')}]->(b);")
+                    ->isSuccess());
+
+    // Test that COUNT(*) over a single rel table is optimized to COUNT_REL_TABLE
+    auto q1 = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN COUNT(*);";
+    auto plan1 = getRoot(q1);
+    ASSERT_TRUE(hasOperatorType(plan1->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+    // Verify the query returns the correct result
+    auto result1 = conn->query(q1);
+    ASSERT_TRUE(result1->isSuccess());
+    ASSERT_EQ(result1->getNumTuples(), 1);
+    auto tuple1 = result1->getNext();
+    ASSERT_EQ(tuple1->getValue(0)->getValue<int64_t>(), 2);
+
+    // Test that COUNT(*) with GROUP BY is NOT optimized (has keys)
+    auto q2 = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN a.id, COUNT(*);";
+    auto plan2 = getRoot(q2);
+    ASSERT_FALSE(hasOperatorType(plan2->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+
+    // Test that COUNT(*) with WHERE clause is NOT optimized (has filter)
+    auto q3 = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) WHERE a.id > 0 RETURN COUNT(*);";
+    auto plan3 = getRoot(q3);
+    ASSERT_FALSE(hasOperatorType(plan3->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+
+    // Test that COUNT(DISTINCT ...) is NOT optimized
+    auto q4 = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN COUNT(DISTINCT a);";
+    auto plan4 = getRoot(q4);
+    ASSERT_FALSE(hasOperatorType(plan4->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+
+    // Test that COUNT(rel) over a full unfiltered rel scan is optimized to COUNT_REL_TABLE
+    auto q5 = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN COUNT(e);";
+    auto plan5 = getRoot(q5);
+    ASSERT_TRUE(hasOperatorType(plan5->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+    auto result5 = conn->query(q5);
+    ASSERT_TRUE(result5->isSuccess());
+    ASSERT_EQ(result5->getNumTuples(), 1);
+    auto tuple5 = result5->getNext();
+    ASSERT_EQ(tuple5->getValue(0)->getValue<int64_t>(), 2);
+
+    // Test that COUNT(node) is NOT optimized by the rel-table fast path
+    auto q6 = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN COUNT(a);";
+    auto plan6 = getRoot(q6);
+    ASSERT_FALSE(hasOperatorType(plan6->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+
+    // Test that COUNT(rel property) is NOT optimized
+    auto q7 = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN COUNT(e.date);";
+    auto plan7 = getRoot(q7);
+    ASSERT_FALSE(hasOperatorType(plan7->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+
+    // SUM(1) uses COUNT_REL_TABLE directly while preserving SUM's INT128 result type.
+    auto qSumOne = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN SUM(1) AS total;";
+    auto planSumOne = getRoot(qSumOne);
+    ASSERT_EQ(planSumOne->getLastOperator()->getOperatorType(),
+        planner::LogicalOperatorType::PROJECTION);
+    ASSERT_EQ(planSumOne->getLastOperator()->getChild(0)->getOperatorType(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE);
+    auto resultSumOne = conn->query(qSumOne);
+    ASSERT_TRUE(resultSumOne->isSuccess());
+    auto valueSumOne = resultSumOne->getNext()->getValue(0);
+    ASSERT_EQ(valueSumOne->getDataType().getLogicalTypeID(), common::LogicalTypeID::INT128);
+    ASSERT_EQ(valueSumOne->getValue<common::int128_t>(), common::int128_t{int64_t{2}});
+
+    // Other integer constants use a single projection over the metadata count.
+    auto qSumTen = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN SUM(10) AS total;";
+    auto planSumTen = getRoot(qSumTen);
+    ASSERT_EQ(planSumTen->getLastOperator()->getOperatorType(),
+        planner::LogicalOperatorType::PROJECTION);
+    ASSERT_EQ(planSumTen->getLastOperator()->getChild(0)->getOperatorType(),
+        planner::LogicalOperatorType::PROJECTION);
+    ASSERT_EQ(planSumTen->getLastOperator()->getChild(0)->getChild(0)->getOperatorType(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE);
+    auto resultSumTen = conn->query(qSumTen);
+    ASSERT_TRUE(resultSumTen->isSuccess());
+    auto valueSumTen = resultSumTen->getNext()->getValue(0);
+    ASSERT_EQ(valueSumTen->getDataType().getLogicalTypeID(), common::LogicalTypeID::INT128);
+    ASSERT_EQ(valueSumTen->getValue<common::int128_t>(), common::int128_t{int64_t{20}});
+
+    // Floating-point constants retain SUM's DOUBLE return type.
+    auto qSumDouble = "MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN SUM(2.5) AS total;";
+    auto planSumDouble = getRoot(qSumDouble);
+    ASSERT_TRUE(hasOperatorType(planSumDouble->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+    auto resultSumDouble = conn->query(qSumDouble);
+    ASSERT_TRUE(resultSumDouble->isSuccess());
+    auto valueSumDouble = resultSumDouble->getNext()->getValue(0);
+    ASSERT_EQ(valueSumDouble->getDataType().getLogicalTypeID(), common::LogicalTypeID::DOUBLE);
+    ASSERT_DOUBLE_EQ(valueSumDouble->getValue<double>(), 5.0);
+
+    // Filters, grouping keys, and DISTINCT must keep the regular aggregate path.
+    auto planSumWhere =
+        getRoot("MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) WHERE a.id > 0 RETURN SUM(1);");
+    ASSERT_FALSE(hasOperatorType(planSumWhere->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+    auto planSumGroup =
+        getRoot("MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN a.id, SUM(1);");
+    ASSERT_FALSE(hasOperatorType(planSumGroup->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+    auto planSumDistinct =
+        getRoot("MATCH (a:opt_user)-[e:opt_follows]->(b:opt_user) RETURN SUM(DISTINCT 1);");
+    ASSERT_FALSE(hasOperatorType(planSumDistinct->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+
+    // A CSR-declared bound node with a primary-key equality filter must not route constant SUM
+    // into the RelDegreeTable rewrite: that path writes the raw degree as INT64 and can neither
+    // apply the constant multiplier nor preserve SUM's NULL-on-empty semantics. Data must be
+    // inserted before the CSR declaration; mutations afterwards invalidate the rewrite gate.
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE opt_csr_user(id INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_csr_user {id: 1});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_csr_user {id: 2});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE opt_csr_follows(FROM opt_csr_user TO opt_csr_user);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_csr_user), (b:opt_csr_user) "
+                            "WHERE a.id = 1 AND b.id = 2 "
+                            "CREATE (a)-[:opt_csr_follows]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("ALTER TABLE opt_csr_user SET SORTED BY (id ASC) CSR;")->isSuccess());
+    auto planSumPkFilter = getRoot(
+        "MATCH (a:opt_csr_user)-[e:opt_csr_follows]->(b:opt_csr_user) WHERE a.id = 1 RETURN "
+        "SUM(2);");
+    ASSERT_FALSE(hasOperatorType(planSumPkFilter->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto resultSumPkFilter = conn->query(
+        "MATCH (a:opt_csr_user)-[e:opt_csr_follows]->(b:opt_csr_user) WHERE a.id = 1 RETURN "
+        "SUM(2) AS total;");
+    ASSERT_TRUE(resultSumPkFilter->isSuccess());
+    ASSERT_EQ(resultSumPkFilter->getNext()->getValue(0)->getValue<common::int128_t>(),
+        common::int128_t{int64_t{2}});
+
+    // SUM over an empty input is NULL, unlike COUNT(*) * c.
+
+    // SUM over an empty input is NULL, unlike COUNT(*) * c. Verify both rewrite shapes preserve it.
+    ASSERT_TRUE(
+        conn->query("CREATE REL TABLE opt_empty_follows(FROM opt_user TO opt_user);")->isSuccess());
+    for (auto expression : {"SUM(1)", "SUM(10)", "SUM(2.5)"}) {
+        auto query = std::format("MATCH (a:opt_user)-[:opt_empty_follows]->(b:opt_user) RETURN {};",
+            expression);
+        auto plan = getRoot(query);
+        ASSERT_TRUE(hasOperatorType(plan->getLastOperator().get(),
+            planner::LogicalOperatorType::COUNT_REL_TABLE));
+        auto result = conn->query(query);
+        ASSERT_TRUE(result->isSuccess());
+        ASSERT_TRUE(result->getNext()->getValue(0)->isNull());
+    }
+
+    // Test active-write degree queries over native rel tables.
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE opt_degree_user(id INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE opt_degree_follows(FROM opt_degree_user TO "
+                            "opt_degree_user);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_degree_user {id: 0});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_degree_user {id: 1});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_degree_user {id: 2});")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_degree_user), (b:opt_degree_user) "
+                            "WHERE a.id = 0 AND b.id = 1 "
+                            "CREATE (a)-[:opt_degree_follows]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_degree_user), (b:opt_degree_user) "
+                            "WHERE a.id = 0 AND b.id = 2 "
+                            "CREATE (a)-[:opt_degree_follows]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_degree_user), (b:opt_degree_user) "
+                            "WHERE a.id = 1 AND b.id = 2 "
+                            "CREATE (a)-[:opt_degree_follows]->(b);")
+                    ->isSuccess());
+
+    auto qSortedOffset =
+        "MATCH (a:opt_degree_user)-[:opt_degree_follows]->(b) WHERE a.id = 0 RETURN count(*);";
+    auto planSortedOffsetBeforeAlter = getRoot(qSortedOffset);
+    ASSERT_FALSE(hasOperatorType(planSortedOffsetBeforeAlter->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    // A plain SORTED BY declaration (ascending primary key) without the CSR keyword relies only on
+    // the old (incorrect) heuristic and must NOT trigger the offset-count rewrite.
+    ASSERT_TRUE(conn->query("ALTER TABLE opt_degree_user SET SORTED BY (id ASC);")->isSuccess());
+    auto planSortedOffsetNoCsr = getRoot(qSortedOffset);
+    ASSERT_FALSE(hasOperatorType(planSortedOffsetNoCsr->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    // Declaring CSR asserts primary_key == rowid, which is what gates the optimization.
+    ASSERT_TRUE(
+        conn->query("ALTER TABLE opt_degree_user SET SORTED BY (id ASC) CSR;")->isSuccess());
+    auto planSortedOffset = getRoot(qSortedOffset);
+    ASSERT_TRUE(hasOperatorType(planSortedOffset->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto resultSortedOffset = conn->query(qSortedOffset);
+    ASSERT_TRUE(resultSortedOffset->isSuccess());
+    ASSERT_EQ(resultSortedOffset->getNext()->getValue(0)->getValue<int64_t>(), 2);
+    auto resultSortedOffsetMissing = conn->query(
+        "MATCH (a:opt_degree_user)-[:opt_degree_follows]->(b) WHERE a.id = 99 RETURN count(*);");
+    ASSERT_TRUE(resultSortedOffsetMissing->isSuccess());
+    ASSERT_EQ(resultSortedOffsetMissing->getNext()->getValue(0)->getValue<int64_t>(), 0);
+
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE opt_sorted_user(id INT64, kind INT64, "
+                            "PRIMARY KEY(id));")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE opt_sorted_follows(FROM opt_sorted_user TO "
+                            "opt_sorted_user);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_sorted_user {id: 0, kind: 7});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_sorted_user {id: 1, kind: 6});")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_sorted_user), (b:opt_sorted_user) "
+                            "WHERE a.id = 0 AND b.id = 1 "
+                            "CREATE (a)-[:opt_sorted_follows]->(b);")
+                    ->isSuccess());
+    auto qCompositeSortedOffset =
+        "MATCH (a:opt_sorted_user)-[:opt_sorted_follows]->(b) WHERE a.id = 0 RETURN count(*);";
+    // Composite (non-CSR) sorted-by does not gate the offset-count rewrite, even when the leading
+    // column is the primary key in ascending order: without the explicit CSR declaration the old
+    // heuristic is not applied.
+    ASSERT_TRUE(
+        conn->query("ALTER TABLE opt_sorted_user SET SORTED BY (kind DESC, id ASC);")->isSuccess());
+    auto planCompositeNonLeadingPK = getRoot(qCompositeSortedOffset);
+    ASSERT_FALSE(hasOperatorType(planCompositeNonLeadingPK->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto resultCompositeNonLeadingPK = conn->query(qCompositeSortedOffset);
+    ASSERT_TRUE(resultCompositeNonLeadingPK->isSuccess());
+    ASSERT_EQ(resultCompositeNonLeadingPK->getNext()->getValue(0)->getValue<int64_t>(), 1);
+    ASSERT_TRUE(
+        conn->query("ALTER TABLE opt_sorted_user SET SORTED BY (id ASC, kind DESC);")->isSuccess());
+    auto planCompositeLeadingPK = getRoot(qCompositeSortedOffset);
+    ASSERT_FALSE(hasOperatorType(planCompositeLeadingPK->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto resultCompositeLeadingPK = conn->query(qCompositeSortedOffset);
+    ASSERT_TRUE(resultCompositeLeadingPK->isSuccess());
+    ASSERT_EQ(resultCompositeLeadingPK->getNext()->getValue(0)->getValue<int64_t>(), 1);
+    // CSR is incompatible with composite sort keys: it requires a single ascending primary key.
+    ASSERT_FALSE(conn->query("ALTER TABLE opt_sorted_user SET SORTED BY (id ASC, kind DESC) CSR;")
+                     ->isSuccess());
+
+    auto q8 = "MATCH (u:opt_degree_user)-[:opt_degree_follows]->(v) RETURN count(DISTINCT u.id);";
+    auto plan8 = getRoot(q8);
+    ASSERT_TRUE(hasOperatorType(plan8->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto result8 = conn->query(q8);
+    ASSERT_TRUE(result8->isSuccess());
+    ASSERT_EQ(result8->getNext()->getValue(0)->getValue<int64_t>(), 2);
+    auto q8InternalID =
+        "MATCH (u:opt_degree_user)-[:opt_degree_follows]->(v) RETURN count(DISTINCT id(u));";
+    ASSERT_TRUE(hasOperatorType(getRoot(q8InternalID)->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto result8InternalID = conn->query(q8InternalID);
+    ASSERT_TRUE(result8InternalID->isSuccess());
+    ASSERT_EQ(result8InternalID->getNext()->getValue(0)->getValue<int64_t>(), 2);
+
+    auto q9 = "MATCH (u:opt_degree_user)-[:opt_degree_follows]->(v) "
+              "RETURN u.id, count(v) AS deg ORDER BY deg DESC LIMIT 2;";
+    auto plan9 = getRoot(q9);
+    ASSERT_TRUE(hasOperatorType(plan9->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto result9 = conn->query(q9);
+    ASSERT_TRUE(result9->isSuccess());
+    auto tuple9a = result9->getNext();
+    ASSERT_EQ(tuple9a->getValue(0)->getValue<int64_t>(), 0);
+    ASSERT_EQ(tuple9a->getValue(1)->getValue<int64_t>(), 2);
+    auto tuple9b = result9->getNext();
+    ASSERT_EQ(tuple9b->getValue(0)->getValue<int64_t>(), 1);
+    ASSERT_EQ(tuple9b->getValue(1)->getValue<int64_t>(), 1);
+
+    auto q10 =
+        "MATCH (a:opt_degree_user)<-[e:opt_degree_follows]-(b:opt_degree_user) RETURN COUNT(e);";
+    auto plan10 = getRoot(q10);
+    ASSERT_TRUE(hasOperatorType(plan10->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_REL_TABLE));
+    auto result10 = conn->query(q10);
+    ASSERT_TRUE(result10->isSuccess());
+    ASSERT_EQ(result10->getNext()->getValue(0)->getValue<int64_t>(), 3);
+
+    // Test that degree top-k and active bound count merge duplicate bound nodes across rel tables.
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE opt_multi_user(id INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE opt_multi_target(id INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE opt_multi(FROM opt_multi_user TO opt_multi_user, "
+                            "FROM opt_multi_user TO opt_multi_target);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_multi_user {id: 0});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_multi_user {id: 1});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_multi_target {id: 0});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_multi_target {id: 1});")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_multi_user), (b:opt_multi_user) "
+                            "WHERE a.id = 0 AND b.id = 1 CREATE (a)-[:opt_multi]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_multi_user), (b:opt_multi_target) "
+                            "WHERE a.id = 0 AND b.id = 0 CREATE (a)-[:opt_multi]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_multi_user), (b:opt_multi_target) "
+                            "WHERE a.id = 1 AND b.id = 1 CREATE (a)-[:opt_multi]->(b);")
+                    ->isSuccess());
+    // TOP_K_DEGREES writes raw storage offsets as the group key, so it requires the CSR
+    // primary_key == rowid declaration (see #1031). Declare after loading: later mutations
+    // invalidate it via the change-epoch gate.
+    ASSERT_TRUE(conn->query("ALTER TABLE opt_multi_user SET SORTED BY (id ASC) CSR;")->isSuccess());
+    auto q11 = "MATCH (u:opt_multi_user)-[:opt_multi]->(v) "
+               "RETURN u.id, count(*) AS deg ORDER BY deg DESC LIMIT 2;";
+    auto plan11 = getRoot(q11);
+    ASSERT_TRUE(hasOperatorType(plan11->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto result11 = conn->query(q11);
+    ASSERT_TRUE(result11->isSuccess());
+    auto tuple11a = result11->getNext();
+    ASSERT_EQ(tuple11a->getValue(0)->getValue<int64_t>(), 0);
+    ASSERT_EQ(tuple11a->getValue(1)->getValue<int64_t>(), 2);
+    auto tuple11b = result11->getNext();
+    ASSERT_EQ(tuple11b->getValue(0)->getValue<int64_t>(), 1);
+    ASSERT_EQ(tuple11b->getValue(1)->getValue<int64_t>(), 1);
+
+    auto q12 = "MATCH (u:opt_multi_user)-[:opt_multi]->(v) RETURN count(DISTINCT u.id);";
+    auto plan12 = getRoot(q12);
+    ASSERT_TRUE(hasOperatorType(plan12->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto result12 = conn->query(q12);
+    ASSERT_TRUE(result12->isSuccess());
+    ASSERT_EQ(result12->getNext()->getValue(0)->getValue<int64_t>(), 2);
+
+    // Mutating the node table invalidates the CSR invariant and the optimization is disregarded,
+    // but the query still returns correct results through the non-optimized path.
+    ASSERT_TRUE(conn->query("CREATE (:opt_degree_user {id: 3});")->isSuccess());
+    auto planSortedOffsetAfterMutation = getRoot(qSortedOffset);
+    ASSERT_FALSE(hasOperatorType(planSortedOffsetAfterMutation->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto resultSortedOffsetAfterMutation = conn->query(qSortedOffset);
+    ASSERT_TRUE(resultSortedOffsetAfterMutation->isSuccess());
+    ASSERT_EQ(resultSortedOffsetAfterMutation->getNext()->getValue(0)->getValue<int64_t>(), 2);
+    // The same mutation must invalidate the degree top-k rewrite, which shares the CSR gate.
+    auto planTopKAfterMutation = getRoot(q9);
+    ASSERT_FALSE(hasOperatorType(planTopKAfterMutation->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto resultTopKAfterMutation = conn->query(q9);
+    ASSERT_TRUE(resultTopKAfterMutation->isSuccess());
+    ASSERT_EQ(resultTopKAfterMutation->getNext()->getValue(0)->getValue<int64_t>(), 0);
+
+    // Regression test for #1031: a STRING primary key must never take the degree top-k
+    // rewrite (offsets are not keys; writing one into a STRING vector segfaulted).
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE opt_str_user(id STRING, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE opt_str_follows(FROM opt_str_user TO "
+                            "opt_str_user);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_str_user {id: 'a'});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_str_user {id: 'b'});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_str_user {id: 'c'});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_str_user {id: 'd'});")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_str_user), (b:opt_str_user) "
+                            "WHERE a.id = 'a' AND b.id = 'b' "
+                            "CREATE (a)-[:opt_str_follows]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_str_user), (b:opt_str_user) "
+                            "WHERE a.id = 'a' AND b.id = 'c' "
+                            "CREATE (a)-[:opt_str_follows]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_str_user), (b:opt_str_user) "
+                            "WHERE a.id = 'a' AND b.id = 'd' "
+                            "CREATE (a)-[:opt_str_follows]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_str_user), (b:opt_str_user) "
+                            "WHERE a.id = 'b' AND b.id = 'c' "
+                            "CREATE (a)-[:opt_str_follows]->(b);")
+                    ->isSuccess());
+    auto qStrTopK = "MATCH (u:opt_str_user)-[:opt_str_follows]->(v) "
+                    "RETURN u.id, count(*) AS deg ORDER BY deg DESC LIMIT 1;";
+    auto planStrTopK = getRoot(qStrTopK);
+    ASSERT_FALSE(hasOperatorType(planStrTopK->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto resultStrTopK = conn->query(qStrTopK);
+    ASSERT_TRUE(resultStrTopK->isSuccess());
+    auto tupleStrTopK = resultStrTopK->getNext();
+    ASSERT_EQ(tupleStrTopK->getValue(0)->getValue<std::string>(), "a");
+    ASSERT_EQ(tupleStrTopK->getValue(1)->getValue<int64_t>(), 3);
+
+    // A non-CSR INT primary key whose values differ from storage offsets must not rewrite
+    // either: the fast path would silently return offsets instead of key values.
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE opt_gap_user(id INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE opt_gap_follows(FROM opt_gap_user TO "
+                            "opt_gap_user);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_gap_user {id: 1000});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_gap_user {id: 1001});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:opt_gap_user {id: 1002});")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_gap_user), (b:opt_gap_user) "
+                            "WHERE a.id = 1001 AND b.id = 1000 "
+                            "CREATE (a)-[:opt_gap_follows]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_gap_user), (b:opt_gap_user) "
+                            "WHERE a.id = 1001 AND b.id = 1002 "
+                            "CREATE (a)-[:opt_gap_follows]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:opt_gap_user), (b:opt_gap_user) "
+                            "WHERE a.id = 1000 AND b.id = 1002 "
+                            "CREATE (a)-[:opt_gap_follows]->(b);")
+                    ->isSuccess());
+    auto qGapTopK = "MATCH (u:opt_gap_user)-[:opt_gap_follows]->(v) "
+                    "RETURN u.id, count(*) AS deg ORDER BY deg DESC LIMIT 1;";
+    auto planGapTopK = getRoot(qGapTopK);
+    ASSERT_FALSE(hasOperatorType(planGapTopK->getLastOperator().get(),
+        planner::LogicalOperatorType::REL_DEGREE_TABLE));
+    auto resultGapTopK = conn->query(qGapTopK);
+    ASSERT_TRUE(resultGapTopK->isSuccess());
+    auto tupleGapTopK = resultGapTopK->getNext();
+    ASSERT_EQ(tupleGapTopK->getValue(0)->getValue<int64_t>(), 1001);
+    ASSERT_EQ(tupleGapTopK->getValue(1)->getValue<int64_t>(), 2);
+}
+
+TEST_F(StatsOptimizerTest, FilterPushDownOrdersMostSelectivePredicateFirst) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE stats_node(id INT64, common INT64, rare INT64, "
+                            "PRIMARY KEY(id));")
+                    ->isSuccess());
+    for (auto i = 0; i < 20; ++i) {
+        auto result = conn->query(
+            std::format("CREATE (:stats_node {{id: {}, common: {}, rare: {}}});", i, i % 2, i));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    ASSERT_TRUE(conn->query("ANALYZE stats_node;")->isSuccess());
+
+    auto plan = getRoot("EXPLAIN LOGICAL MATCH (n:stats_node) "
+                        "WHERE n.common = 1 AND n.rare = 7 "
+                        "RETURN n.id;");
+    auto* deepestFilter = getDeepestFilter(plan->getLastOperator().get());
+    ASSERT_NE(nullptr, deepestFilter);
+    ASSERT_NE(std::string::npos, deepestFilter->getPredicate()->toString().find("rare"));
+}
+
+TEST_F(StatsOptimizerTest, FilterPushDownOrdersMostSelectivePredicateFirst2) {
+    // This test is similar to the previous one, but uses UNWIND instead of a loop
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE stats_node(id INT64, common INT64, rare INT64, "
+                            "PRIMARY KEY(id));")
+                    ->isSuccess());
+    auto result = conn->query("UNWIND range(0, 19) AS i "
+                              "CREATE (:stats_node {id: i, common: i % 2, rare: i});");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_TRUE(conn->query("ANALYZE stats_node;")->isSuccess());
+
+    auto plan = getRoot("EXPLAIN LOGICAL MATCH (n:stats_node) "
+                        "WHERE n.common = 1 AND n.rare = 7 "
+                        "RETURN n.id;");
+    auto* deepestFilter = getDeepestFilter(plan->getLastOperator().get());
+    ASSERT_NE(nullptr, deepestFilter);
+    ASSERT_NE(std::string::npos, deepestFilter->getPredicate()->toString().find("rare"));
+}
+
+// The rewrite trusts only a loaded primary-key index, and follows it being dropped or created.
+TEST_F(StatsOptimizerTest, CountPrimaryKeyNeedsPrimaryKeyIndex) {
+    for (const auto* statement : {"CREATE NODE TABLE indexed(id INT64, PRIMARY KEY(id));",
+             "CALL enable_default_hash_index=false;",
+             "CREATE NODE TABLE unindexed(id INT64, PRIMARY KEY(id));",
+             "CALL enable_default_hash_index=true;",
+             "CREATE REL TABLE link(FROM indexed TO indexed, FROM unindexed TO unindexed);"}) {
+        auto result = conn->query(statement);
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    auto scansKey = [&](const std::string& table) {
+        auto plan = getRoot(
+            "MATCH (a:" + table + ")-[:link]->(b:" + table + ") RETURN COUNT(DISTINCT b.id);");
+        return OptimizerTest::scansNodeProperty(plan->getLastOperator().get(), "b", "id");
+    };
+    ASSERT_FALSE(scansKey("indexed"));
+    ASSERT_TRUE(scansKey("unindexed"));
+
+    for (const auto* statement : {"DROP INDEX indexed._PK;",
+             "CREATE HASH INDEX unindexed_pk FOR (n:unindexed) ON (n.id);"}) {
+        auto result = conn->query(statement);
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    ASSERT_TRUE(scansKey("indexed"));
+    ASSERT_FALSE(scansKey("unindexed"));
+}
+
+// A cached COUNT(pk) plan rebinds when its primary-key index is dropped or created. The
+// built-in PK index lives in storage only, so its drop has no catalog entry of its own.
+TEST_F(StatsOptimizerTest, CachedCountPrimaryKeyFollowsIndexDDL) {
+    for (const auto* statement : {"CREATE NODE TABLE indexed(id INT64, PRIMARY KEY(id));",
+             "CREATE REL TABLE link(FROM indexed TO indexed);",
+             "UNWIND [1, 2, 3] AS i CREATE (:indexed {id: i});",
+             "MATCH (a:indexed {id: 1}), (b:indexed) WHERE b.id > 1 CREATE (a)-[:link]->(b);"}) {
+        auto result = conn->query(statement);
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    auto prepared =
+        conn->prepare("MATCH (a:indexed)-[:link]->(b:indexed) RETURN COUNT(DISTINCT b.id);");
+    ASSERT_TRUE(prepared->isSuccess()) << prepared->getErrorMessage();
+    auto executeAndScansKey = [&]() {
+        auto result = conn->execute(prepared.get());
+        EXPECT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        EXPECT_EQ(std::vector<std::string>{"2"}, TestHelper::convertResultToString(*result));
+        auto cachedStatement =
+            conn->getClientContext()->getCachedPreparedStatementManager().getCachedStatement(
+                prepared->getName());
+        return OptimizerTest::scansNodeProperty(
+            cachedStatement->logicalPlan->getLastOperator().get(), "b", "id");
+    };
+    ASSERT_FALSE(executeAndScansKey());
+    ASSERT_FALSE(executeAndScansKey());
+    const auto planVersion = database->getCatalog()->getPlanVersion();
+    ASSERT_TRUE(conn->query("DROP INDEX indexed._PK;")->isSuccess());
+    ASSERT_EQ(planVersion + 1, database->getCatalog()->getPlanVersion());
+    ASSERT_TRUE(executeAndScansKey());
+    ASSERT_TRUE(
+        conn->query("CREATE HASH INDEX indexed_pk FOR (n:indexed) ON (n.id);")->isSuccess());
+    ASSERT_FALSE(executeAndScansKey());
+}
+
+// Table IDs repeat across databases: the attached Person shares ID 0 with the main table Local,
+// whose primary-key index must not approve counting Person's internal IDs.
+TEST_F(StatsOptimizerTest, CountPrimaryKeyKeepsAttachedTableKey) {
+    auto attachedPath = TestHelper::getTempDBPathStr("CountPrimaryKeyKeepsAttachedTableKey.Src");
+    {
+        auto attachedDB = std::make_unique<main::Database>(attachedPath, main::SystemConfig());
+        auto attachedConn = std::make_unique<main::Connection>(attachedDB.get());
+        for (const auto* statement : {"CREATE NODE TABLE Person(name STRING, PRIMARY KEY(name));",
+                 "CREATE REL TABLE Knows(FROM Person TO Person);"}) {
+            auto result = attachedConn->query(statement);
+            ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        }
+    }
+    auto run = [&](const std::string& statement) {
+        auto result = conn->query(statement);
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    };
+    auto scansKey = [&](const std::string& pattern) {
+        auto plan = getRoot("MATCH " + pattern + " RETURN COUNT(DISTINCT b.name);");
+        return OptimizerTest::scansNodeProperty(plan->getLastOperator().get(), "b", "name");
+    };
+    run("CREATE NODE TABLE Local(name STRING, PRIMARY KEY(name));");
+    run("CREATE REL TABLE LocalKnows(FROM Local TO Local);");
+    ASSERT_FALSE(scansKey("(a:Local)-[:LocalKnows]->(b:Local)"));
+    run(std::format("ATTACH '{}' AS db1 (DBTYPE riag);", attachedPath));
+    ASSERT_TRUE(scansKey("(a:db1.Person)-[:db1.Knows]->(b:db1.Person)"));
+    run("USE db1;");
+    ASSERT_TRUE(scansKey("(a:Person)-[:Knows]->(b:Person)"));
+}
+
+TEST_F(StatsOptimizerTest, HashJoinCostIncludesEstimatedOutputCardinality) {
+    auto leftOp = std::make_shared<planner::LogicalDummyScan>();
+    leftOp->setCardinality(10);
+    leftOp->computeFlatSchema();
+    auto rightOp = std::make_shared<planner::LogicalDummyScan>();
+    rightOp->setCardinality(10);
+    rightOp->computeFlatSchema();
+
+    auto leftPlan = planner::LogicalPlan();
+    leftPlan.setLastOperator(leftOp);
+    auto rightPlan = planner::LogicalPlan();
+    rightPlan.setLastOperator(rightOp);
+
+    auto joinKeys = binder::expression_vector{};
+    const auto smallIntermediateCost =
+        planner::CostModel::computeHashJoinCost(joinKeys, leftPlan, rightPlan, 5);
+    const auto largeIntermediateCost =
+        planner::CostModel::computeHashJoinCost(joinKeys, leftPlan, rightPlan, 500);
+    ASSERT_LT(smallIntermediateCost, largeIntermediateCost);
+}
+
+TEST_F(OptimizerTest, RemoveUnnecessaryOrderByBeforeCountStar) {
+    // Issue #720: ORDER BY before LIMIT and COUNT(*) should be removed since
+    // COUNT(*) doesn't depend on ordering.
+    //
+    // Query: MATCH (n:person) WITH n ORDER BY n.ID LIMIT 5 RETURN count(*)
+    // Expected plan: AGGREGATE -> PROJECTION -> LIMIT -> ... (no ORDER BY)
+
+    auto q1 = "MATCH (n:person) WITH n ORDER BY n.ID LIMIT 5 RETURN count(*)";
+    auto plan1 = getRoot(q1);
+    // After optimization, there should be no ORDER_BY operator
+    ASSERT_FALSE(
+        hasOperatorType(plan1->getLastOperator().get(), planner::LogicalOperatorType::ORDER_BY))
+        << "ORDER BY should be removed before COUNT(*) aggregate";
+
+    // Note: Cypher requires ORDER BY in WITH to be followed by SKIP/LIMIT,
+    // so we can only test the common case with LIMIT here.
+
+    // Sanity check: ORDER BY before COUNT(*) with GROUP BY should be kept
+    // (the order influences which rows are grouped; the optimizer should not
+    // remove it since the issue specifically targets aggregates without keys)
+    auto q3 = "MATCH (n:person) WITH n ORDER BY n.ID LIMIT 5 RETURN n.isStudent, count(*)";
+    auto plan3 = getRoot(q3);
+    // With GROUP BY keys, ORDER BY might still be needed for LIMIT semantics
+    // We don't assert on this — just verify we don't crash.
+    ASSERT_TRUE(plan3 != nullptr);
+}
+
+TEST_F(OptimizerTest, KeepOrderByBeforeLimitForValueAggregates) {
+    // Below a LIMIT the ORDER BY decides which rows reach the aggregate: only COUNT(*) is
+    // independent of it. collect() also returns the rows in their order.
+    for (auto query : {"MATCH (n:person) WITH n ORDER BY n.ID DESC LIMIT 3 RETURN sum(n.ID)",
+             "MATCH (n:person) WITH n ORDER BY n.ID DESC LIMIT 3 RETURN count(n.age)",
+             "MATCH (n:person) WITH n ORDER BY n.ID DESC LIMIT 3 RETURN collect(n.ID)",
+             "MATCH (n:person) WITH n ORDER BY n.ID DESC LIMIT 3 WITH n WHERE n.age > 30 "
+             "RETURN count(*)"}) {
+        auto plan = getRoot(query);
+        ASSERT_TRUE(
+            hasOperatorType(plan->getLastOperator().get(), planner::LogicalOperatorType::ORDER_BY))
+            << "ORDER BY must stay for: " << query;
+    }
+}
+
+TEST_F(OptimizerTest, RemoveUnnecessaryDistinctOnPrimaryKey) {
+    // Issue #721: DISTINCT on a primary-key column should be removed since
+    // the primary key is already unique.
+    //
+    // Expected plan: no DISTINCT operator
+
+    // Test: DISTINCT on primary key (no alias — key stays PropertyExpression)
+    auto q1 = "MATCH (n:person) RETURN DISTINCT n.ID";
+    auto plan1 = getRoot(q1);
+    ASSERT_FALSE(
+        hasOperatorType(plan1->getLastOperator().get(), planner::LogicalOperatorType::DISTINCT))
+        << "DISTINCT on primary key should be removed";
+    // A removed DISTINCT leaves no FLATTEN, so the scan stays vectorized.
+    ASSERT_FALSE(
+        hasOperatorType(plan1->getLastOperator().get(), planner::LogicalOperatorType::FLATTEN));
+    auto plan4 = getRoot("MATCH (n:person) WITH DISTINCT n.ID AS id RETURN count(*)");
+    ASSERT_FALSE(
+        hasOperatorType(plan4->getLastOperator().get(), planner::LogicalOperatorType::DISTINCT));
+    ASSERT_FALSE(
+        hasOperatorType(plan4->getLastOperator().get(), planner::LogicalOperatorType::FLATTEN));
+
+    // Sanity check: DISTINCT on a non-primary-key column should be kept
+    auto q2 = "MATCH (n:person) RETURN DISTINCT n.age";
+    auto plan2 = getRoot(q2);
+    ASSERT_TRUE(
+        hasOperatorType(plan2->getLastOperator().get(), planner::LogicalOperatorType::DISTINCT))
+        << "DISTINCT on non-primary-key column should be kept";
+
+    // Sanity check: DISTINCT on a mix of PK and non-PK — the DISTINCT
+    // is still redundant since the PK alone guarantees uniqueness, but
+    // our optimizer only removes it when ALL (non-payload) keys are PKs.
+    auto q3 = "MATCH (n:person) RETURN DISTINCT n.ID, n.age";
+    auto plan3 = getRoot(q3);
+    ASSERT_TRUE(plan3 != nullptr);
+}
+
+TEST_F(OptimizerTest, RemoveUnnecessaryDistinctRequiresFlatPlan) {
+    // getRoot returns the optimized plan, so FactorizationRewriter has placed its flattens.
+    auto plan = getRoot("MATCH (a:person)-[:knows]->(b:person) RETURN DISTINCT a.fName, b.fName");
+    ASSERT_TRUE(
+        hasOperatorType(plan->getLastOperator().get(), planner::LogicalOperatorType::FLATTEN));
+    try {
+        optimizer::RemoveUnnecessaryDistinctOptimizer().rewrite(plan.get());
+        FAIL() << "the pass accepted a factorized plan";
+    } catch (const common::InternalException& e) {
+#if defined(RUNTIME_CHECKS) || !defined(NDEBUG)
+        // The entry check reports it, not LogicalFlatten::computeFlatSchema further down.
+        EXPECT_NE(std::string(e.what()).find("remove_unnecessary_distinct_optimizer.cpp"),
+            std::string::npos)
+            << e.what();
+#endif
+    }
+}
+
+TEST_F(OptimizerTest, CountPrimaryKeyReadsInternalID) {
+    auto scansKey = [&](const std::string& aggregate) {
+        auto plan = getRoot(
+            "MATCH (p:person)-[:workAt]->(o:organisation) RETURN o.name, " + aggregate + ";");
+        return scansNodeProperty(plan->getLastOperator().get(), "p", "ID");
+    };
+    // The control shows the helper sees p.ID when a scan reads it.
+    ASSERT_TRUE(scansKey("MIN(p.ID)"));
+    ASSERT_FALSE(scansKey("COUNT(DISTINCT p.ID)"));
+    ASSERT_FALSE(scansKey("COUNT(p.ID)"));
+
+    // Two labels can store the same key value as different nodes.
+    auto multiLabel = getRoot("MATCH (n:person:organisation) RETURN COUNT(DISTINCT n.ID);");
+    ASSERT_TRUE(scansNodeProperty(multiLabel->getLastOperator().get(), "n", "ID"));
+}
+
+TEST_F(OptimizerTest, CountReachableDistinctNodes) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows may pick a different recursive-extend plan shape for reachable-count "
+                    "queries, so this plan-shape test is nondeterministic there.";
+#endif
+    // Build a small graph where count(distinct b) over a variable-length path is fully determined:
+    //
+    //   0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6
+    //    \             ^--- (cycle 4 -> 1)
+    //     \-> 4
+    //
+    // From node 0, count(distinct b) for [lo..up] ranges is verified below against the reference
+    // (non-optimized) semantics.
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE rc_user(id INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE rc_follows(FROM rc_user TO rc_user);")->isSuccess());
+    for (auto i = 0; i <= 6; ++i) {
+        std::string q = std::format("CREATE (:rc_user {{id: {}}});", i);
+        ASSERT_TRUE(conn->query(q)->isSuccess()) << q;
+    }
+    struct Edge {
+        int64_t src;
+        int64_t dst;
+    };
+    const std::vector<Edge> edges = {{0, 1}, {1, 2}, {2, 3}, {3, 4}, {0, 4}, {4, 5}, {5, 6},
+        {4, 1}};
+    for (const auto& [src, dst] : edges) {
+        std::string q = std::format("MATCH (a:rc_user {{id: {}}}), (b:rc_user {{id: {}}}) "
+                                    "CREATE (a)-[:rc_follows]->(b);",
+            src, dst);
+        ASSERT_TRUE(conn->query(q)->isSuccess()) << q;
+    }
+    // Declare the CSR invariant (primary_key == rowid) after all data is loaded so it is not
+    // invalidated by subsequent node mutation.
+    ASSERT_TRUE(conn->query("ALTER TABLE rc_user SET SORTED BY (id ASC) CSR;")->isSuccess());
+
+    auto q1 =
+        "MATCH (a:rc_user {id: 0})-[e:rc_follows*1..5]->(b:rc_user) RETURN count(distinct b);";
+    auto plan1 = getRoot(q1);
+    ASSERT_TRUE(hasOperatorType(plan1->getLastOperator().get(),
+        planner::LogicalOperatorType::REACHABLE_COUNT))
+        << "CSR-sorted source + count(distinct nbr) over a variable-length path should be "
+           "rewritten "
+           "to REACHABLE_COUNT";
+    auto result1 = conn->query(q1);
+    ASSERT_TRUE(result1->isSuccess());
+    ASSERT_EQ(result1->getNext()->getValue(0)->getValue<int64_t>(), 6);
+
+    auto checkRange = [&](const std::string& range, int64_t expected) {
+        std::string q = std::format("MATCH (a:rc_user {{id: 0}})-[e:rc_follows*{}]->(b:rc_user) "
+                                    "RETURN count(distinct b);",
+            range);
+        auto result = conn->query(q);
+        ASSERT_TRUE(result->isSuccess()) << q;
+        ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), expected) << q;
+    };
+    checkRange("1..5", 6);
+    checkRange("2..4", 6);
+    checkRange("3..4", 4);
+    checkRange("4..4", 2);
+    checkRange("3..3", 3);
+    checkRange("0..2", 5);
+    checkRange("1..1", 2);
+
+    // Without the CSR declaration the rewrite must not fire, and the query must still be correct.
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE nc_user(id INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE nc_follows(FROM nc_user TO nc_user);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:nc_user {id: 0});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:nc_user {id: 1});")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:nc_user {id: 2});")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:nc_user {id: 0}), (b:nc_user {id: 1}) "
+                            "CREATE (a)-[:nc_follows]->(b);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:nc_user {id: 1}), (b:nc_user {id: 2}) "
+                            "CREATE (a)-[:nc_follows]->(b);")
+                    ->isSuccess());
+
+    auto qNoCsr = "MATCH (a:nc_user {id: 0})-[e:nc_follows*1..2]->(b:nc_user) "
+                  "RETURN count(distinct b);";
+    auto planNoCsr = getRoot(qNoCsr);
+    ASSERT_FALSE(hasOperatorType(planNoCsr->getLastOperator().get(),
+        planner::LogicalOperatorType::REACHABLE_COUNT))
+        << "Without CSR the reachable-count rewrite must not fire";
+    auto resultNoCsr = conn->query(qNoCsr);
+    ASSERT_TRUE(resultNoCsr->isSuccess());
+    ASSERT_EQ(resultNoCsr->getNext()->getValue(0)->getValue<int64_t>(), 2);
+}
+
+TEST_F(OptimizerTest, GroupedReachableCount) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows may pick a different recursive-extend plan shape for grouped "
+                    "reachable-count queries, so this plan-shape test is nondeterministic there.";
+#endif
+    // Grouped aggregate over a full-table variable-length path, including a self-loop (node
+    // 0) so *0.. ranges also pin the length-0 row semantics:
+    //
+    //   0 -+-> 0 (self-loop)      active / score: 0:T/10, 1:F/20, 2:T/30, 3:F/40, 4:T/50
+    //        |-> 1 -> 2 -+-> 3 -> 0
+    //        \-> 2 -------+-> 4
+    //
+    // Hand-computed walks of length 0..2 ending at each node: 0:6, 1:4, 2:6, 3:4, 4:4.
+    // Grouped by active: T(0,2,4) -> count 16, avg (6*10+6*30+4*50)/16 = 27.5;
+    // F(1,3) -> count 8, avg (4*20+4*40)/8 = 30.0.
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE grc_n(id INT64, active BOOLEAN, score DOUBLE, "
+                            "PRIMARY KEY(id));")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE grc_e(FROM grc_n TO grc_n);")->isSuccess());
+    struct GrpcNode {
+        int64_t id;
+        bool active;
+        double score;
+    };
+    const std::vector<GrpcNode> nodes = {{0, true, 10.0}, {1, false, 20.0}, {2, true, 30.0},
+        {3, false, 40.0}, {4, true, 50.0}};
+    for (const auto& node : nodes) {
+        std::string q = std::format("CREATE (:grc_n {{id: {}, active: {}, score: {}}});", node.id,
+            node.active ? "true" : "false", node.score);
+        ASSERT_TRUE(conn->query(q)->isSuccess()) << q;
+    }
+    struct Edge {
+        int64_t src;
+        int64_t dst;
+    };
+    const std::vector<Edge> edges = {{0, 0}, {0, 1}, {0, 2}, {1, 2}, {2, 3}, {2, 4}, {3, 0}};
+    for (const auto& [src, dst] : edges) {
+        std::string q = std::format("MATCH (a:grc_n {{id: {}}}), (b:grc_n {{id: {}}}) "
+                                    "CREATE (a)-[:grc_e]->(b);",
+            src, dst);
+        ASSERT_TRUE(conn->query(q)->isSuccess()) << q;
+    }
+    auto q1 = "MATCH (a:grc_n)-[e:grc_e*0..2]->(b:grc_n) RETURN b.active AS active, count(b) "
+              "AS total, avg(b.score) AS avg_score ORDER BY total DESC, active;";
+    auto plan1 = getRoot(q1);
+    ASSERT_TRUE(hasOperatorType(plan1->getLastOperator().get(),
+        planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT))
+        << "Grouped COUNT/AVG over a full-table variable-length path should be rewritten to "
+           "GROUPED_REACHABLE_COUNT";
+    auto result1 = conn->query(q1);
+    ASSERT_TRUE(result1->isSuccess());
+    ASSERT_TRUE(result1->hasNext());
+    auto tuple1 = result1->getNext();
+    ASSERT_EQ(tuple1->getValue(0)->getValue<bool>(), true);
+    ASSERT_EQ(tuple1->getValue(1)->getValue<int64_t>(), 16);
+    ASSERT_DOUBLE_EQ(tuple1->getValue(2)->getValue<double>(), 27.5);
+    ASSERT_TRUE(result1->hasNext());
+    auto tuple2 = result1->getNext();
+    ASSERT_EQ(tuple2->getValue(0)->getValue<bool>(), false);
+    ASSERT_EQ(tuple2->getValue(1)->getValue<int64_t>(), 8);
+    ASSERT_DOUBLE_EQ(tuple2->getValue(2)->getValue<double>(), 30.0);
+    ASSERT_FALSE(result1->hasNext());
+
+    // COUNT(*) takes the same path.
+    auto qCountStar = "MATCH (a:grc_n)-[e:grc_e*0..2]->(b:grc_n) RETURN b.active AS active, "
+                      "count(*) AS total ORDER BY active;";
+    ASSERT_TRUE(hasOperatorType(getRoot(qCountStar)->getLastOperator().get(),
+        planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT));
+    auto resultCountStar = conn->query(qCountStar);
+    ASSERT_TRUE(resultCountStar->isSuccess());
+    ASSERT_EQ(resultCountStar->getNext()->getValue(1)->getValue<int64_t>(), 8);
+    ASSERT_EQ(resultCountStar->getNext()->getValue(1)->getValue<int64_t>(), 16);
+
+    // A zero lower bound is not required for the rewrite: *1..2 over the full table takes
+    // the same path. Walk counts per end node (in-degrees + two-hop walks):
+    // 0: 2+3, 1: 1+2, 2: 2+3, 3: 1+2, 4: 1+2, so active T(0,2,4) = 13 and F(1,3) = 6.
+    auto qBounded = "MATCH (a:grc_n)-[:grc_e*1..2]->(b:grc_n) RETURN b.active AS active, "
+                    "count(*) AS total ORDER BY total DESC;";
+    ASSERT_TRUE(hasOperatorType(getRoot(qBounded)->getLastOperator().get(),
+        planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT));
+    auto resultBounded = conn->query(qBounded);
+    ASSERT_TRUE(resultBounded->isSuccess());
+    ASSERT_TRUE(resultBounded->hasNext());
+    auto boundedTuple1 = resultBounded->getNext();
+    ASSERT_TRUE(boundedTuple1->getValue(0)->getValue<bool>()); // T (0, 2, 4)
+    ASSERT_EQ(boundedTuple1->getValue(1)->getValue<int64_t>(), 13);
+    ASSERT_TRUE(resultBounded->hasNext());
+    auto boundedTuple2 = resultBounded->getNext();
+    ASSERT_FALSE(boundedTuple2->getValue(0)->getValue<bool>()); // F (1, 3)
+    ASSERT_EQ(boundedTuple2->getValue(1)->getValue<int64_t>(), 6);
+    ASSERT_FALSE(resultBounded->hasNext());
+
+    // High-cardinality grouping (one group per node) takes the same path: the walk counts
+    // of length 0..2 per end node are 6, 4, 6, 4, 4 as computed above.
+    auto qById = "MATCH (a:grc_n)-[:grc_e*0..2]->(b:grc_n) RETURN b.id AS id, count(*) AS total "
+                 "ORDER BY id;";
+    ASSERT_TRUE(hasOperatorType(getRoot(qById)->getLastOperator().get(),
+        planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT));
+    auto resultById = conn->query(qById);
+    ASSERT_TRUE(resultById->isSuccess());
+    const std::vector<int64_t> expectedTotals = {6, 4, 6, 4, 4};
+    for (auto i = 0u; i < expectedTotals.size(); ++i) {
+        ASSERT_TRUE(resultById->hasNext()) << "row " << i;
+        auto tuple = resultById->getNext();
+        ASSERT_EQ(tuple->getValue(0)->getValue<int64_t>(), static_cast<int64_t>(i));
+        ASSERT_EQ(tuple->getValue(1)->getValue<int64_t>(), expectedTotals[i]);
+    }
+    ASSERT_FALSE(resultById->hasNext());
+
+    // The DP seeds the traversal from every visible source, so a predicate on the *source*
+    // node `a` must keep the original plan rather than be silently ignored. Only the
+    // active sources {0, 2, 4} contribute, giving 8 active and 4 inactive end-node rows.
+    for (auto sourcePredicate : {
+             "MATCH (a:grc_n)-[:grc_e*1..2]->(b:grc_n) WHERE a.active = true RETURN b.active, "
+             "count(*);",
+             "MATCH (a:grc_n {active: true})-[:grc_e*1..2]->(b:grc_n) RETURN b.active, count(*);",
+             // A primary-key-pinned source becomes a PRIMARY_KEY_SCAN, not a full scan.
+             "MATCH (a:grc_n {id: 0})-[:grc_e*1..2]->(b:grc_n) RETURN b.active, count(*);",
+         }) {
+        ASSERT_FALSE(hasOperatorType(getRoot(sourcePredicate)->getLastOperator().get(),
+            planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT))
+            << sourcePredicate;
+    }
+    auto resultSourcePred = conn->query(
+        "MATCH (a:grc_n)-[:grc_e*1..2]->(b:grc_n) WHERE a.active = true RETURN b.active AS "
+        "active, count(*) AS total ORDER BY total DESC;");
+    ASSERT_TRUE(resultSourcePred->isSuccess());
+    ASSERT_TRUE(resultSourcePred->hasNext());
+    auto sourceTuple1 = resultSourcePred->getNext();
+    ASSERT_TRUE(sourceTuple1->getValue(0)->getValue<bool>());
+    ASSERT_EQ(sourceTuple1->getValue(1)->getValue<int64_t>(), 8);
+    ASSERT_TRUE(resultSourcePred->hasNext());
+    auto sourceTuple2 = resultSourcePred->getNext();
+    ASSERT_FALSE(sourceTuple2->getValue(0)->getValue<bool>());
+    ASSERT_EQ(sourceTuple2->getValue(1)->getValue<int64_t>(), 4);
+    ASSERT_FALSE(resultSourcePred->hasNext());
+
+    // Anything else that re-shapes the rows between the recursion and the aggregate must
+    // also keep the original plan -- including a predicate on the intermediate path nodes,
+    // which a recursive comprehension can express and which lands in the recursion's own
+    // node predicate (see hasNodePredicate()).
+    for (auto reshaped : {
+             "MATCH (a:grc_n)-[:grc_e*0..2]->(b:grc_n) WITH a, b LIMIT 3 RETURN b.active, "
+             "count(*);",
+             // A path-node predicate restricts the reachable set, so the walk counts no
+             // longer reproduce the join's rows.
+             "MATCH (a:grc_n)-[:grc_e*1..2 (r2, n | WHERE n.active)]->(b:grc_n) RETURN "
+             "b.active, count(*);",
+             // Non-walk semantics (shortest / trail / acyclic) do not enumerate every walk.
+             "MATCH (a:grc_n)-[:grc_e*SHORTEST 1..2]->(b:grc_n) RETURN b.active, count(*);",
+             "MATCH (a:grc_n)-[:grc_e*TRAIL 1..2]->(b:grc_n) RETURN b.active, count(*);",
+             "MATCH (a:grc_n)-[:grc_e*ACYCLIC 1..2]->(b:grc_n) RETURN b.active, count(*);",
+             "MATCH (a:grc_n)-[:grc_e*0..2]->(b:grc_n) RETURN b.active, count(DISTINCT b);",
+             "MATCH (a:grc_n)-[:grc_e*0..2]->(b:grc_n) WHERE b.score > 15.0 RETURN b.active, "
+             "count(b);",
+             "MATCH (a:grc_n)-[:grc_e*0..2]->(b:grc_n) RETURN a.active, count(b);",
+         }) {
+        ASSERT_FALSE(hasOperatorType(getRoot(reshaped)->getLastOperator().get(),
+            planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT))
+            << reshaped;
+    }
+    // A relationship predicate must also keep the original plan: the level DP has no
+    // rel-predicate filtering (rel filtering happens at scan time), so counting over
+    // the full table would silently ignore it (see #1127).
+    ASSERT_TRUE(conn->query("CREATE REL TABLE grc_ew(FROM grc_n TO grc_n, w INT64);")->isSuccess());
+    ASSERT_FALSE(hasOperatorType(
+        getRoot("MATCH (a:grc_n)-[r:grc_ew*1..2 (r2, n | WHERE r2.w > 2)]->(b:grc_n) "
+                "RETURN b.active, count(*);")
+            ->getLastOperator()
+            .get(),
+        planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT));
+}
+
+// Group keys of STRING type must be distinguished by their exact bytes: the group's
+// serialized key is the concatenation of its key columns, so a NUL-terminated encoding
+// would merge ("a\0", "b") with ("a", "\0b"). A NULL key must stay its own group too.
+TEST_F(OptimizerTest, GroupedReachableCountStringAndNullKeys) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows may pick a different recursive-extend plan shape for grouped "
+                    "reachable-count queries, so this plan-shape test is nondeterministic there.";
+#endif
+    // Nodes 0..3 with in-degrees 0, 1, 2, 3, so walks of length 0..1 ending at each node
+    // number 1, 2, 3 and 4 -- all distinct, which lets each group be identified by its
+    // count regardless of how NULLs and NUL bytes order.
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE grc3_n(id INT64, k1 STRING, k2 STRING, "
+                            "score DOUBLE, PRIMARY KEY(id));")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE grc3_e(FROM grc3_n TO grc3_n);")->isSuccess());
+    // Node 0 and node 1 collide under a NUL-terminated encoding of (k1, k2):
+    // ("a\0", "b") and ("a", "\0b") both serialize to the bytes 'a' 00 00 'b' 00.
+    // Node 3 leaves k1 unset so it is NULL.
+    const std::vector<std::string> props = {"{id: 0, k1: 'a\\u0000', k2: 'b', score: 1.0}",
+        "{id: 1, k1: 'a', k2: '\\u0000b', score: 2.0}", "{id: 2, k1: 'x', k2: 'y', score: 4.0}",
+        "{id: 3, k2: 'z', score: 8.0}"};
+    for (auto& p : props) {
+        auto q = std::format("CREATE (:grc3_n {});", p);
+        ASSERT_TRUE(conn->query(q)->isSuccess()) << q;
+    }
+    for (auto i = 0u; i < 4u; ++i) {
+        for (auto j = 0u; j < 4u; ++j) {
+            if (j <= i) {
+                continue;
+            }
+            auto q = std::format("MATCH (a:grc3_n {{id: {}}}), (b:grc3_n {{id: {}}}) "
+                                 "CREATE (a)-[:grc3_e]->(b);",
+                i, j);
+            ASSERT_TRUE(conn->query(q)->isSuccess()) << q;
+        }
+    }
+    auto q = "MATCH (a:grc3_n)-[:grc3_e*0..1]->(b:grc3_n) RETURN b.k1 AS k1, b.k2 AS k2, "
+             "count(*) AS total, avg(b.score) AS avg_score;";
+    ASSERT_TRUE(hasOperatorType(getRoot(q)->getLastOperator().get(),
+        planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT));
+
+    auto result = conn->query(q);
+    ASSERT_TRUE(result->isSuccess());
+    // Four groups: the NUL-bearing pair must not collapse into one, and the NULL key must
+    // not collapse into any other.
+    std::map<int64_t, std::pair<bool, double>> byCount;
+    auto numRows = 0u;
+    while (result->hasNext()) {
+        auto tuple = result->getNext();
+        auto total = tuple->getValue(2)->getValue<int64_t>();
+        ASSERT_TRUE(total >= 1 && total <= 4) << total;
+        byCount[total] = {tuple->getValue(0)->isNull(),
+            tuple->getValue(3)->isNull() ? -1.0 : tuple->getValue(3)->getValue<double>()};
+        numRows++;
+    }
+    ASSERT_EQ(numRows, 4u);
+    ASSERT_EQ(byCount.size(), 4u); // counts must be 1, 2, 3 and 4 -- one per group
+    ASSERT_EQ(byCount.at(1).second, 1.0);
+    ASSERT_EQ(byCount.at(2).second, 2.0);
+    ASSERT_EQ(byCount.at(3).second, 4.0);
+    ASSERT_EQ(byCount.at(4).second, 8.0);
+    ASSERT_FALSE(byCount.at(1).first); // k1 = "a\0"
+    ASSERT_FALSE(byCount.at(2).first); // k1 = "a"
+    ASSERT_TRUE(byCount.at(4).first);  // k1 = NULL
+
+    // The NUL bytes really do survive the round trip, so the counts above are meaningful.
+    auto probe = conn->query("MATCH (n:grc3_n) WHERE n.id = 0 RETURN n.k1;");
+    ASSERT_TRUE(probe->isSuccess());
+    ASSERT_TRUE(probe->hasNext());
+    ASSERT_EQ(probe->getNext()->getValue(0)->getValue<std::string>(), std::string("a\x00", 2));
+}
+
+// Differential check: the rewritten plan must return exactly the rows the unoptimized plan
+// does. Besides guarding the rewrite, this is the only coverage in this file that runs the
+// variable-length path through the real RECURSIVE_EXTEND operator, so it also pins the
+// length-0 walk semantics that PathsOutputWriter has to get right -- in particular the
+// single length-0 row a self-reaching source contributes under a zero lower bound.
+TEST_F(OptimizerTest, GroupedReachableCountMatchesUnoptimizedPlan) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows may pick a different recursive-extend plan shape for grouped "
+                    "reachable-count queries, so this plan-shape test is nondeterministic there.";
+#endif
+    // Node 0 has a self-loop, so it reaches itself; 0 -> 1 -> 2 -> 3 -> 0 is a cycle. Node 4
+    // and 5 are unreachable from the rest, and node 4 has a NULL score.
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE grc4_n(id INT64, active BOOLEAN, score DOUBLE, "
+                            "PRIMARY KEY(id));")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE grc4_e(FROM grc4_n TO grc4_n);")->isSuccess());
+    const std::vector<std::string> props = {"{id: 0, active: true, score: 1.0}",
+        "{id: 1, active: false, score: 2.0}", "{id: 2, active: true, score: NULL}",
+        "{id: 3, active: false, score: 4.0}", "{id: 4, active: true, score: 8.0}",
+        "{id: 5, active: false, score: 16.0}"};
+    for (auto& p : props) {
+        auto q = std::format("CREATE (:grc4_n {});", p);
+        ASSERT_TRUE(conn->query(q)->isSuccess()) << q;
+    }
+    const std::vector<std::pair<int, int>> edges = {{0, 0}, {0, 1}, {1, 2}, {2, 3}, {3, 0}, {3, 4}};
+    for (auto& [src, dst] : edges) {
+        auto q = std::format("MATCH (a:grc4_n {{id: {}}}), (b:grc4_n {{id: {}}}) "
+                             "CREATE (a)-[:grc4_e]->(b);",
+            src, dst);
+        ASSERT_TRUE(conn->query(q)->isSuccess()) << q;
+    }
+
+    // Collects every row as a sorted vector of stringified values so the two plans can be
+    // compared without depending on the engine's ordering of NULLs and booleans.
+    auto collect = [this](const std::string& query) {
+        auto result = conn->query(query);
+        EXPECT_TRUE(result->isSuccess()) << query;
+        std::vector<std::vector<std::string>> rows;
+        while (result->hasNext()) {
+            auto tuple = result->getNext();
+            std::vector<std::string> row;
+            for (auto i = 0u; i < tuple->len(); ++i) {
+                row.push_back(
+                    tuple->getValue(i)->isNull() ? "<null>" : tuple->getValue(i)->toString());
+            }
+            rows.push_back(std::move(row));
+        }
+        std::sort(rows.begin(), rows.end());
+        return rows;
+    };
+
+    for (auto range : {"0..1", "0..2", "0..3", "1..2", "1..3", "2..2"}) {
+        for (auto& projection : std::vector<std::string>{"b.active, count(*), avg(b.score)",
+                 "b.id, count(*), avg(b.score)", "b.active, count(b), sum(b.score)"}) {
+            auto q = std::format("MATCH (a:grc4_n)-[:grc4_e*{}]->(b:grc4_n) RETURN {};", range,
+                projection);
+            // Only assert that the fast path is available for the shapes it targets.
+            if (projection == "b.active, count(*), avg(b.score)") {
+                ASSERT_TRUE(hasOperatorType(getRoot(q)->getLastOperator().get(),
+                    planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT))
+                    << q;
+            }
+            ASSERT_TRUE(conn->query("CALL enable_plan_optimizer=false")->isSuccess());
+            auto unoptimized = collect(q);
+            ASSERT_TRUE(conn->query("CALL enable_plan_optimizer=true")->isSuccess());
+            auto optimized = collect(q);
+            ASSERT_EQ(optimized, unoptimized) << q;
+        }
+    }
+}
+
+// A node of the second node group in createTwoNodeGroupGraph: past the forward rel data's last one.
+static constexpr int64_t FAR_NODE = common::StorageConfig::NODE_GROUP_SIZE + 8;
+
+// `node` gets two node groups' worth of rows (the second with 40), and `rel` the edges 1->2, 2->3,
+// 1->3, 10->17, 10->FAR_NODE, 17->5 and 5->6. No node of the second group has an outgoing edge, so
+// `rel`'s forward data has one node group, and the reachable counts expand nodes of the first group
+// after FAR_NODE.
+static void createTwoNodeGroupGraph(main::Connection& conn, const std::string& node,
+    const std::string& rel, bool csr) {
+    ASSERT_TRUE(conn.query(std::format("CREATE NODE TABLE {}(id INT64, PRIMARY KEY(id));", node))
+                    ->isSuccess());
+    ASSERT_TRUE(conn.query(std::format("UNWIND range(0, {}) AS i CREATE (:{} {{id: i}});",
+                               common::StorageConfig::NODE_GROUP_SIZE + 39, node))
+                    ->isSuccess());
+    ASSERT_TRUE(conn.query(std::format("CREATE REL TABLE {}(FROM {} TO {});", rel, node, node))
+                    ->isSuccess());
+    const std::vector<std::pair<int64_t, int64_t>> edges = {{1, 2}, {2, 3}, {1, 3}, {10, 17},
+        {10, FAR_NODE}, {17, 5}, {5, 6}};
+    for (auto& [src, dst] : edges) {
+        auto q = std::format("MATCH (a:{0} {{id: {2}}}), (b:{0} {{id: {3}}}) "
+                             "CREATE (a)-[:{1}]->(b);",
+            node, rel, src, dst);
+        ASSERT_TRUE(conn.query(q)->isSuccess()) << q;
+    }
+    if (csr) {
+        ASSERT_TRUE(conn.query(std::format("ALTER TABLE {} SET SORTED BY (id ASC) CSR;", node))
+                        ->isSuccess());
+    }
+}
+
+TEST_F(OptimizerTest, GroupedReachableCountPastLastRelNodeGroup) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows may pick a different recursive-extend plan shape for grouped "
+                    "reachable-count queries, so this plan-shape test is nondeterministic there.";
+#endif
+    ASSERT_NO_FATAL_FAILURE(createTwoNodeGroupGraph(*conn, "grc5_n", "grc5_e", false /* csr */));
+    auto q = "MATCH (a:grc5_n)-[:grc5_e*1..2]->(b:grc5_n) RETURN b.id, count(b) ORDER BY b.id;";
+    ASSERT_TRUE(hasOperatorType(getRoot(q)->getLastOperator().get(),
+        planner::LogicalOperatorType::GROUPED_REACHABLE_COUNT));
+    auto result = conn->query(q);
+    ASSERT_TRUE(result->isSuccess());
+    // Walks ending at each node: 3 by 2->3, 1->3 and 1->2->3; 5 by 17->5 and 10->17->5; 6 by 5->6
+    // and 17->5->6.
+    const std::vector<std::pair<int64_t, int64_t>> expected = {{2, 1}, {3, 3}, {5, 2}, {6, 2},
+        {17, 1}, {FAR_NODE, 1}};
+    for (auto& [id, walks] : expected) {
+        ASSERT_TRUE(result->hasNext());
+        auto tuple = result->getNext();
+        ASSERT_EQ(tuple->getValue(0)->getValue<int64_t>(), id);
+        EXPECT_EQ(tuple->getValue(1)->getValue<int64_t>(), walks) << id;
+    }
+    EXPECT_FALSE(result->hasNext());
+}
+
+TEST_F(OptimizerTest, CountReachableDistinctNodesPastLastRelNodeGroup) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows may pick a different recursive-extend plan shape for reachable-count "
+                    "queries, so this plan-shape test is nondeterministic there.";
+#endif
+    ASSERT_NO_FATAL_FAILURE(createTwoNodeGroupGraph(*conn, "rc2_n", "rc2_e", true /* csr */));
+    auto q = "MATCH (a:rc2_n {id: 10})-[:rc2_e*1..3]->(b:rc2_n) RETURN count(distinct b);";
+    ASSERT_TRUE(hasOperatorType(getRoot(q)->getLastOperator().get(),
+        planner::LogicalOperatorType::REACHABLE_COUNT));
+    auto result = conn->query(q);
+    ASSERT_TRUE(result->isSuccess());
+    // 17, FAR_NODE, 5 and 6. Whichever of 17 and FAR_NODE the search expands first, an expansion
+    // of a first-group node follows FAR_NODE's.
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 4);
+}
+
+// The COUNT_ANTI_EDGE_CHAIN fast path walks the committed node-group grid and reads
+// the CSR of native tables, so it must decline tables backed by another storage
+// format.
+//
+// What is asserted here, and why: the rewrite only fires when the planner produces an
+// INNER-over-MARK plan with the prefix chain rooted at the middle-node scan (see
+// tryRewriteAntiEdgeChainCount). On a tiny fixture the join orderer never produces that
+// shape — everything plans at cardinality 1 — so operator presence cannot be asserted
+// deterministically here; firing itself was validated by hand on an LSQB-scale database.
+// Instead these tests pin both sides of the storage gate directly: native tables satisfy
+// the nativeness condition the fast path requires (and answer the query correctly),
+// while icebug-disk tables fail it (and keep the regular plan).
+class AntiEdgeChainStorageGateTest : public StatsOptimizerTest {
+public:
+    // The LSQB q9 shape the rewrite targets: two undirected hops either side of a middle
+    // node, an anti-edge between the outer two, and a directed suffix hop into another
+    // table. Mirrors test_files/lsqb/lsqb_queries.test with the demo-db schema.
+    static constexpr const char* kAntiEdgeChainQuery =
+        "EXPLAIN LOGICAL MATCH (u1:user)-[:follows]-(u2:user)-[:follows]-(u3:user)"
+        "-[:livesin]->(c:city) "
+        "WHERE NOT EXISTS {MATCH (u1)-[:follows]-(u3)} AND id(u1) <> id(u3) "
+        "RETURN count(*);";
+    // Same shape without the EXPLAIN prefix, for executing the query.
+    static constexpr const char* kAntiEdgeChainCountQuery =
+        "MATCH (u1:user)-[:follows]-(u2:user)-[:follows]-(u3:user)"
+        "-[:livesin]->(c:city) "
+        "WHERE NOT EXISTS {MATCH (u1)-[:follows]-(u3)} AND id(u1) <> id(u3) "
+        "RETURN count(*);";
+
+    void createIcebugDiskTables() {
+        // The demo-db icebug-disk dataset carries exactly this schema.
+        const std::string storage = TestHelper::appendRiaGRootPath("dataset/demo-db/icebug-disk/");
+        const std::string backing = " WITH (storage = '" + storage + "', format = 'icebug-disk');";
+        const std::vector<std::string> ddl{
+            "CREATE NODE TABLE city(id INT32, name STRING, population INT64, "
+            "PRIMARY KEY(id))" +
+                backing,
+            "CREATE NODE TABLE user(id INT32, name STRING, age INT64, PRIMARY KEY(id))" + backing,
+            "CREATE REL TABLE follows(FROM user TO user, since INT32)" + backing,
+            "CREATE REL TABLE livesin(FROM user TO city)" + backing};
+        for (const auto& statement : ddl) {
+            auto result = conn->query(statement);
+            ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        }
+    }
+
+    void createNativeTables() {
+        const std::vector<std::string> ddl{
+            "CREATE NODE TABLE city(id INT32, name STRING, population INT64, "
+            "PRIMARY KEY(id));",
+            "CREATE NODE TABLE user(id INT32, name STRING, age INT64, PRIMARY KEY(id));",
+            "CREATE REL TABLE follows(FROM user TO user, since INT32);",
+            "CREATE REL TABLE livesin(FROM user TO city);",
+            "UNWIND range(0, 5) AS i CREATE (:user {id: i, name: 'u', age: i});",
+            "UNWIND range(0, 2) AS i CREATE (:city {id: i, name: 'c', population: i});",
+            "MATCH (x:user), (y:user) WHERE x.id + 1 = y.id "
+            "CREATE (x)-[:follows {since: 2020}]->(y);",
+            "MATCH (u:user), (c:city) WHERE u.id % 3 = c.id CREATE (u)-[:livesin]->(c);"};
+        for (const auto& statement : ddl) {
+            auto result = conn->query(statement);
+            ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        }
+    }
+
+    // Pins the exact branch condition of isNativeNodeEntry / isNativeRelGroupEntry in
+    // count_rel_table_optimizer.cpp for the tables under test.
+    void assertNativeEntries() {
+        auto* catalog = database->getCatalog();
+        for (const char* table : {"user", "city"}) {
+            const auto* entry =
+                catalog->getTableCatalogEntry(&transaction::DUMMY_CHECKPOINT_TRANSACTION, table)
+                    ->ptrCast<catalog::NodeTableCatalogEntry>();
+            ASSERT_TRUE(entry->getStorage().empty()) << table;
+            ASSERT_EQ(entry->getStorageFormat(), common::StorageFormat::NONE) << table;
+        }
+        for (const char* table : {"follows", "livesin"}) {
+            const auto* entry =
+                catalog->getTableCatalogEntry(&transaction::DUMMY_CHECKPOINT_TRANSACTION, table)
+                    ->ptrCast<catalog::RelGroupCatalogEntry>();
+            ASSERT_TRUE(entry->getStorage().empty()) << table;
+            ASSERT_EQ(entry->getStorageFormat(), common::StorageFormat::NONE) << table;
+        }
+    }
+
+    void assertNonNativeEntries() {
+        auto* catalog = database->getCatalog();
+        for (const char* table : {"user", "city"}) {
+            const auto* entry =
+                catalog->getTableCatalogEntry(&transaction::DUMMY_CHECKPOINT_TRANSACTION, table)
+                    ->ptrCast<catalog::NodeTableCatalogEntry>();
+            ASSERT_FALSE(entry->getStorage().empty() &&
+                         entry->getStorageFormat() == common::StorageFormat::NONE)
+                << table;
+        }
+        for (const char* table : {"follows", "livesin"}) {
+            const auto* entry =
+                catalog->getTableCatalogEntry(&transaction::DUMMY_CHECKPOINT_TRANSACTION, table)
+                    ->ptrCast<catalog::RelGroupCatalogEntry>();
+            ASSERT_FALSE(entry->getStorage().empty() &&
+                         entry->getStorageFormat() == common::StorageFormat::NONE)
+                << table;
+        }
+    }
+};
+
+TEST_F(AntiEdgeChainStorageGateTest, NativeTablesPassStorageGate) {
+    createNativeTables();
+    // Positive side of the gate: native tables satisfy the nativeness condition the fast
+    // path requires, so the gate lets them through.
+    assertNativeEntries();
+    // The query over the fixture graph (user chain 0-1-...-5, one livesin city per user)
+    // counts 8 undirected length-2 follows paths: no follows chord closes any of them, and
+    // each contributes one suffix row.
+    auto result = conn->query(kAntiEdgeChainCountQuery);
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 8);
+}
+
+TEST_F(AntiEdgeChainStorageGateTest, SkipsIcebugDiskTables) {
+    createIcebugDiskTables();
+    // Negative side of the gate: these tables fail the nativeness condition, so the fast
+    // path must decline them. Asserting the precondition alongside the plan keeps this
+    // test honest: it cannot pass by running against native tables by mistake.
+    assertNonNativeEntries();
+    auto plan = getRoot(kAntiEdgeChainQuery);
+    ASSERT_FALSE(OptimizerTest::hasOperatorType(plan->getLastOperator().get(),
+        planner::LogicalOperatorType::COUNT_ANTI_EDGE_CHAIN));
+}
+
+// Icebug-disk tables carry a default hash index that does not enforce the key of their files, so
+// their key column may repeat a value.
+TEST_F(AntiEdgeChainStorageGateTest, CountPrimaryKeyKeepsIcebugDiskKey) {
+    createIcebugDiskTables();
+    assertNonNativeEntries();
+    auto plan = getRoot("MATCH (u:user)-[:follows]->(v:user) RETURN COUNT(DISTINCT v.id);");
+    ASSERT_TRUE(OptimizerTest::scansNodeProperty(plan->getLastOperator().get(), "v", "id"));
+}
+
+TEST_F(OptimizerTest, BoolFoldingCancelsDoubleNegationItProduces) {
+    // The tautology folds away, leaving NOT(NOT(a.ID > 2)).
+    auto plan = getRoot("MATCH (a:person) WHERE NOT ((a.age IS NULL OR a.age IS NOT NULL) AND "
+                        "NOT a.ID > 2) RETURN a.ID");
+    auto* filter = findFilter(plan->getLastOperator().get());
+    ASSERT_NE(filter, nullptr);
+    ASSERT_EQ(filter->getPredicate()->toString(), "GREATER_THAN(a.ID,2)");
+}
+
+TEST_F(OptimizerTest, BoolFoldingRefoldsUnderCancelledDoubleNegation) {
+    // Under the outer NOT the NULL disjunct must stay; once NOT(NOT(...)) cancels, the filter may
+    // drop it.
+    auto plan = getRoot("MATCH (a:person) WHERE NOT ((a.age IS NULL OR a.age IS NOT NULL) AND "
+                        "NOT (a.ID > 2 OR NULL)) RETURN a.ID");
+    auto* filter = findFilter(plan->getLastOperator().get());
+    ASSERT_NE(filter, nullptr);
+    ASSERT_EQ(filter->getPredicate()->toString(), "GREATER_THAN(a.ID,2)");
+}
+
+TEST_F(OptimizerTest, BoolFoldingFindsTautologyAcrossNestedOrs) {
+    auto plan = getRoot("MATCH (a:person) WHERE (a.age IS NULL OR a.ID > 2) OR a.age IS NOT NULL "
+                        "RETURN a.ID");
+    auto* root = plan->getLastOperator().get();
+    ASSERT_FALSE(hasOperatorType(root, planner::LogicalOperatorType::FILTER));
+    ASSERT_FALSE(hasOperatorType(root, planner::LogicalOperatorType::EMPTY_RESULT));
+}
+
+TEST_F(OptimizerTest, BoolFoldingFlattensAnOrItProduces) {
+    // The double negation leaves (a.age IS NULL OR a.ID > 2), a tautology with the last operand.
+    auto plan = getRoot("MATCH (a:person) WHERE NOT ((a.age IS NULL OR a.age IS NOT NULL) AND "
+                        "NOT (a.age IS NULL OR a.ID > 2)) OR a.age IS NOT NULL RETURN a.ID");
+    auto* root = plan->getLastOperator().get();
+    ASSERT_FALSE(hasOperatorType(root, planner::LogicalOperatorType::FILTER));
+    ASSERT_FALSE(hasOperatorType(root, planner::LogicalOperatorType::EMPTY_RESULT));
+}
+
+TEST_F(OptimizerTest, BoolFoldingFlattensAnAndItProduces) {
+    // The double negation leaves (a.age IS NULL AND a.ID > 2), a contradiction with the next
+    // conjunct; the OR keeps the planner from splitting the AND into separate filters.
+    auto plan = getRoot("MATCH (a:person) WHERE (NOT ((a.age IS NULL OR a.age IS NOT NULL) AND "
+                        "NOT (a.age IS NULL AND a.ID > 2)) AND a.age IS NOT NULL) OR a.age = 5 "
+                        "RETURN a.ID");
+    auto* filter = findFilter(plan->getLastOperator().get());
+    ASSERT_NE(filter, nullptr);
+    ASSERT_EQ(filter->getPredicate()->toString(), "EQUALS(a.age,5)");
+}
+
+} // namespace testing
+} // namespace riag

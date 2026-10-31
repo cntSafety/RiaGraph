@@ -1,0 +1,1 @@
+add_riag_test(processor_test intersect_kernels_test.cpp factorized_table_test.cpp task_scheduler_test.cpp)

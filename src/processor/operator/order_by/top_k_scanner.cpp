@@ -1,0 +1,28 @@
+#include "processor/operator/order_by/top_k_scanner.h"
+
+namespace riag {
+namespace processor {
+
+void TopKLocalScanState::init(std::vector<DataPos>& outVectorPos, TopKSharedState& sharedState,
+    ResultSet& resultSet) {
+    // Clear for pooled-plan reuse (fresh states start empty).
+    vectorsToScan.clear();
+    for (auto& pos : outVectorPos) {
+        vectorsToScan.push_back(resultSet.getValueVector(pos).get());
+    }
+    payloadScanner = sharedState.buffer->getScanner();
+}
+
+void TopKScan::initLocalStateInternal(riag::processor::ResultSet* resultSet,
+    riag::processor::ExecutionContext* /*context*/) {
+    localState->init(outVectorPos, *sharedState, *resultSet);
+}
+
+bool TopKScan::getNextTuplesInternal(ExecutionContext* /*context*/) {
+    auto numTuplesRead = localState->scan();
+    metrics->numOutputTuple.increase(numTuplesRead);
+    return numTuplesRead != 0;
+}
+
+} // namespace processor
+} // namespace riag

@@ -1,0 +1,32 @@
+#include "catalog/catalog_entry/catalog_entry_type.h"
+#include "storage/storage_manager.h"
+#include "storage/table/rel_table.h"
+#include "storage/wal/wal_replayer.h"
+
+using namespace riag::common;
+using namespace riag::storage;
+
+namespace riag {
+namespace storage {
+
+void WALReplayer::replayRelUpdateRecord(const WALRecord& walRecord) const {
+    const auto& updateRecord = walRecord.constCast<RelUpdateRecord>();
+    const auto tableID =
+        getReplayedEntryID(catalog::CatalogEntryType::REL_GROUP_ENTRY, updateRecord.tableID);
+    auto& table = StorageManager::Get(clientContext)->getTable(tableID)->cast<RelTable>();
+    const auto anchorState = updateRecord.ownedRelIDVector->state;
+    DASSERT(anchorState == updateRecord.ownedSrcNodeIDVector->state &&
+            anchorState == updateRecord.ownedDstNodeIDVector->state &&
+            anchorState == updateRecord.ownedRelIDVector->state &&
+            anchorState == updateRecord.ownedPropertyVector->state);
+    DASSERT(anchorState->getSelVector().getSelSize() == 1);
+    const auto updateState = std::make_unique<RelTableUpdateState>(updateRecord.columnID,
+        *updateRecord.ownedSrcNodeIDVector, *updateRecord.ownedDstNodeIDVector,
+        *updateRecord.ownedRelIDVector, *updateRecord.ownedPropertyVector);
+    DASSERT(transaction::Transaction::Get(clientContext) &&
+            transaction::Transaction::Get(clientContext)->isRecovery());
+    table.update(transaction::Transaction::Get(clientContext), *updateState);
+}
+
+} // namespace storage
+} // namespace riag

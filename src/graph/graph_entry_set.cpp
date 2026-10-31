@@ -1,0 +1,29 @@
+#include "graph/graph_entry_set.h"
+
+#include "common/exception/runtime.h"
+#include "main/client_context.h"
+#include <format>
+
+using namespace riag::common;
+
+namespace riag {
+namespace graph {
+
+void GraphEntrySet::validateGraphNotExist(const std::string& name) const {
+    if (hasGraph(name)) {
+        throw RuntimeException(std::format("Projected graph {} already exists.", name));
+    }
+}
+
+void GraphEntrySet::validateGraphExist(const std::string& name) const {
+    if (!hasGraph(name)) {
+        throw RuntimeException(std::format("Projected graph {} does not exist.", name));
+    }
+}
+
+GraphEntrySet* GraphEntrySet::Get(const main::ClientContext& context) {
+    return context.graphEntrySet.get();
+}
+
+} // namespace graph
+} // namespace riag

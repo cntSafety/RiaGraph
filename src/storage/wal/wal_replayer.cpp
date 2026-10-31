@@ -1,0 +1,1181 @@
+#include "storage/wal/wal_replayer.h"
+
+#include <optional>
+#include <string>
+
+#include "catalog/catalog.h"
+#include "common/constants.h"
+#include "common/exception/checkpoint.h"
+#include "common/exception/internal.h"
+#include "common/exception/io.h"
+#include "common/exception/runtime.h"
+#include "common/file_system/file_info.h"
+#include "common/file_system/file_system.h"
+#include "common/file_system/virtual_file_system.h"
+#include "common/serializer/buffered_file.h"
+#include "common/string_utils.h"
+#include "common/system_message.h"
+#include "common/type_utils.h"
+#include "common/types/types.h"
+#include "main/client_context.h"
+#include "main/database.h"
+#include "main/database_manager.h"
+#include "main/db_config.h"
+#include "storage/checkpointer.h"
+#include "storage/database_header.h"
+#include "storage/file_db_id_utils.h"
+#include "storage/local_storage/local_rel_table.h"
+#include "storage/partition_storage_registry.h"
+#include "storage/storage_manager.h"
+#include "storage/storage_utils.h"
+#include "storage/wal/checksum_reader.h"
+#include "storage/wal/wal.h"
+#include "storage/wal/wal_record.h"
+#include "transaction/transaction_context.h"
+#include "transaction/transaction_manager.h"
+#include <format>
+
+using namespace riag::common;
+using namespace riag::storage;
+using namespace riag::transaction;
+
+namespace riag {
+namespace storage {
+
+static constexpr std::string_view checksumMismatchMessage =
+    "Checksum verification failed, the WAL file is corrupted.";
+static constexpr std::string_view readOnlyCheckpointInProgressMessage =
+    "Cannot open database in read-only mode while checkpoint recovery is pending. If another "
+    "process is checkpointing, retry after it finishes; otherwise reopen in read-write mode to "
+    "complete recovery before reopening read-only.";
+
+static std::string unsupportedCheckpointFormatMessage(uint64_t version) {
+    return std::format("unsupported checkpoint format version {} (this release supports up to {}). "
+                       "Reopen the database with the newer RiaGraph release that wrote it and let "
+                       "recovery finish. Do not delete the WAL or shadow files; they hold "
+                       "committed pages.",
+        version, WAL::CHECKPOINT_BUNDLE_FORMAT_VERSION);
+}
+
+namespace {
+class ReplayOwnerScope {
+public:
+    ReplayOwnerScope(main::DatabaseManager& dbManager, catalog::Catalog* ownerCatalog)
+        : dbManager{dbManager}, previous{dbManager.getReplayOwnerCatalog()} {
+        dbManager.setReplayOwnerCatalog(ownerCatalog);
+    }
+    ~ReplayOwnerScope() { dbManager.setReplayOwnerCatalog(previous); }
+
+    ReplayOwnerScope(const ReplayOwnerScope&) = delete;
+    ReplayOwnerScope& operator=(const ReplayOwnerScope&) = delete;
+
+private:
+    main::DatabaseManager& dbManager;
+    catalog::Catalog* previous;
+};
+} // namespace
+
+static void removePartitionChildShadowFiles(main::ClientContext& clientContext) {
+    auto* dbManager = main::DatabaseManager::Get(clientContext);
+    if (dbManager == nullptr) {
+        return;
+    }
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    std::string removedShadowPath;
+    for (auto* sm : dbManager->getPartitionStorageRegistry()->getAllManagers()) {
+        const auto path = StorageUtils::getShadowFilePath(sm->getDatabasePath());
+        if (vfs->fileOrPathExists(path, &clientContext)) {
+            if (clientContext.getDBConfig()->readOnly) {
+                throw RuntimeException(std::format("{} Pending recovery file: {}.",
+                    readOnlyCheckpointInProgressMessage, path));
+            }
+            vfs->removeFileIfExists(path, &clientContext);
+            removedShadowPath = path;
+        }
+    }
+    if (!removedShadowPath.empty()) {
+        vfs->syncParentDirectory(removedShadowPath);
+    }
+}
+
+static void recoverGraphCheckpoints(main::ClientContext& clientContext,
+    bool mainCheckpointCommitted, bool checkpointBundle,
+    std::optional<uuid> legacyCheckpointDatabaseID = std::nullopt) {
+    auto* databaseManager = main::DatabaseManager::Get(clientContext);
+    if (databaseManager != nullptr) {
+        databaseManager->loadGraphsFromCatalog(MemoryManager::Get(clientContext), &clientContext,
+            mainCheckpointCommitted, checkpointBundle, legacyCheckpointDatabaseID);
+    }
+}
+
+static bool replayPendingGraphWALs(main::ClientContext& clientContext) {
+    auto* databaseManager = main::DatabaseManager::Get(clientContext);
+    if (databaseManager != nullptr) {
+        return databaseManager->replayPendingGraphWALs(&clientContext);
+    }
+    return false;
+}
+
+static void removeGraphCheckpointShadows(main::ClientContext& clientContext) {
+    auto* databaseManager = main::DatabaseManager::Get(clientContext);
+    if (databaseManager == nullptr) {
+        return;
+    }
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    std::string removedShadowPath;
+    for (auto* graph : databaseManager->getGraphs()) {
+        auto* storageManager = graph->getStorageManager();
+        if (storageManager->isReadOnly()) {
+            continue;
+        }
+        const auto shadowFilePath =
+            StorageUtils::getShadowFilePath(storageManager->getDatabasePath());
+        if (vfs->fileOrPathExists(shadowFilePath, &clientContext)) {
+            vfs->removeFileIfExists(shadowFilePath, &clientContext);
+            removedShadowPath = shadowFilePath;
+        }
+    }
+    if (!removedShadowPath.empty()) {
+        vfs->syncParentDirectory(removedShadowPath);
+    }
+}
+
+static uuid readPersistedDatabaseID(StorageManager& storageManager) {
+    const auto header =
+        DatabaseHeader::readDatabaseHeader(*storageManager.getDataFH()->getFileInfo());
+    if (!header.has_value()) {
+        throw InternalException(
+            std::format("Found checkpoint recovery artifacts for database {} but no valid "
+                        "database header. The database is corrupted, please recreate it.",
+                storageManager.getDatabasePath()));
+    }
+    return header->databaseID;
+}
+
+WALReplayer::WALReplayer(main::ClientContext& clientContext) : clientContext{clientContext} {
+    walPath = StorageUtils::getWALFilePath(clientContext.getDatabasePath());
+    checkpointWalPath = StorageUtils::getCheckpointWALFilePath(clientContext.getDatabasePath());
+    shadowFilePath = StorageUtils::getShadowFilePath(clientContext.getDatabasePath());
+}
+
+uuid WALReplayer::readShadowDatabaseID(const std::string& path) const {
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    auto fileInfo = vfs->openFile(path, FileOpenFlags(FileFlags::READ_ONLY), &clientContext);
+    if (fileInfo->getFileSize() < sizeof(ShadowFileHeader)) {
+        throw RuntimeException(
+            std::format("Cannot replay shadow file {}: file is too small.", path));
+    }
+    ShadowFileHeader header;
+    fileInfo->readFromFile(reinterpret_cast<uint8_t*>(&header), sizeof(header), 0);
+    return header.databaseID;
+}
+
+void WALReplayer::throwIfShadowOwnedByAnotherDatabase() const {
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    if (!vfs->fileOrPathExists(shadowFilePath, &clientContext)) {
+        return;
+    }
+    auto* mainStorageManager = clientContext.getDatabase()->getStorageManager();
+    if (mainStorageManager->getDataFH() == nullptr) {
+        // The data file is gone, so there is nothing of this database left to protect.
+        return;
+    }
+    auto fileInfo =
+        vfs->openFile(shadowFilePath, FileOpenFlags(FileFlags::READ_ONLY), &clientContext);
+    if (fileInfo->getFileSize() < sizeof(ShadowFileHeader)) {
+        return;
+    }
+    ShadowFileHeader header;
+    fileInfo->readFromFile(reinterpret_cast<uint8_t*>(&header), sizeof(header), 0);
+    if (header.databaseID.value != ShadowFile::CHECKPOINT_BUNDLE_DATABASE_ID.value) {
+        // Pre-bundle-format shadows are never parent-owned, and their unstamped owner field is
+        // indistinguishable from garbage.
+        return;
+    }
+    const uuid nullID{0};
+    if (header.ownerDatabaseID.value == nullID.value) {
+        return;
+    }
+    const auto ownHeader =
+        DatabaseHeader::readDatabaseHeader(*mainStorageManager->getDataFH()->getFileInfo());
+    const auto ownDatabaseID = ownHeader.has_value() ? ownHeader->databaseID : nullID;
+    if (header.ownerDatabaseID.value == ownDatabaseID.value) {
+        return;
+    }
+    throw RuntimeException(std::format(
+        "Cannot safely open database file {}: its shadow file {} holds a pending checkpoint "
+        "bundle owned by another database. Removing or replaying that bundle here could destroy "
+        "committed data, so the database and its WAL and shadow files are left untouched. Do "
+        "not delete them. Reopen the database that owns the bundle so it can finish recovery, "
+        "then open this database file again.",
+        clientContext.getDatabasePath(), shadowFilePath));
+}
+
+static WALHeader readWALHeader(Deserializer& deserializer) {
+    WALHeader header{};
+    deserializer.deserializeValue(header.databaseID);
+
+    // It is possible to read a value other than 0/1 when deserializing the flag
+    // This causes some weird behaviours with some toolchains so we manually do the conversion here
+    uint8_t enableChecksumsBytes = 0;
+    deserializer.deserializeValue(enableChecksumsBytes);
+    header.enableChecksums = enableChecksumsBytes != 0;
+
+    return header;
+}
+
+static Deserializer initDeserializer(FileInfo& fileInfo, main::ClientContext& clientContext,
+    bool enableChecksums) {
+    if (enableChecksums) {
+        return Deserializer{std::make_unique<ChecksumReader>(fileInfo,
+            *MemoryManager::Get(clientContext), checksumMismatchMessage)};
+    } else {
+        return Deserializer{std::make_unique<BufferedFileReader>(fileInfo)};
+    }
+}
+
+static void checkWALHeader(const WALHeader& header, bool enableChecksums) {
+    if (enableChecksums != header.enableChecksums) {
+        throw RuntimeException(std::format(
+            "The database you are trying to open was serialized with enableChecksums={} but you "
+            "are trying to open it with enableChecksums={}. Please open your database using the "
+            "correct enableChecksums config. If you wish to change this for your database, please "
+            "use the export/import functionality.",
+            TypeUtils::toString(header.enableChecksums), TypeUtils::toString(enableChecksums)));
+    }
+}
+
+static uint64_t getReadOffset(Deserializer& deSer, bool enableChecksums) {
+    if (enableChecksums) {
+        return deSer.getReader()->cast<ChecksumReader>()->getReadOffset();
+    } else {
+        return deSer.getReader()->cast<BufferedFileReader>()->getReadOffset();
+    }
+}
+
+// An attached-graph WAL may have been written by a different session (e.g. a standalone
+// graph session) whose checksum setting differs from the recovering session's, so the
+// checksum flag must come from the WAL's own header. A torn header holds no acknowledged
+// commits, so strict recovery rethrows and non-strict recovery may retire the WAL.
+static std::optional<bool> tryReadWALChecksumFlag(FileInfo& fileInfo,
+    main::ClientContext& clientContext, bool throwOnWalReplayFailure) {
+    try {
+        auto deserializer = initDeserializer(fileInfo, clientContext, false);
+        deserializer.getReader()->onObjectBegin();
+        const auto walHeader = readWALHeader(deserializer);
+        deserializer.getReader()->onObjectEnd();
+        return walHeader.enableChecksums;
+    } catch (...) {
+        if (throwOnWalReplayFailure) {
+            throw;
+        }
+        return std::nullopt;
+    }
+}
+
+static std::unique_ptr<FileInfo> tryAcquireReadOnlyCheckpointLock(
+    main::ClientContext& clientContext, const std::string& lockPath) {
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    if (!vfs->fileOrPathExists(lockPath, &clientContext)) {
+        return nullptr;
+    }
+    try {
+        return vfs->openFile(lockPath, FileOpenFlags(FileFlags::READ_ONLY, FileLockType::READ_LOCK),
+            &clientContext);
+    } catch (const IOException&) {
+        throw RuntimeException(std::string(readOnlyCheckpointInProgressMessage));
+    }
+}
+
+static std::unique_ptr<FileInfo> acquireReadOnlyCheckpointApplyLock(
+    main::ClientContext& clientContext) {
+    if (!StorageManager::Get(clientContext)->isReadOnly()) {
+        return nullptr;
+    }
+    const auto databasePath = clientContext.getDatabasePath();
+    auto intentLock = tryAcquireReadOnlyCheckpointLock(clientContext,
+        StorageUtils::getCheckpointIntentLockFilePath(databasePath));
+    auto applyLock = tryAcquireReadOnlyCheckpointLock(clientContext,
+        StorageUtils::getCheckpointApplyLockFilePath(databasePath));
+    return applyLock;
+}
+
+static void throwIfReadOnlyCheckpointState(main::ClientContext& clientContext, bool hasFrozenWAL,
+    const std::string& shadowFilePath) {
+    if (!StorageManager::Get(clientContext)->isReadOnly()) {
+        return;
+    }
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    if (hasFrozenWAL || vfs->fileOrPathExists(shadowFilePath, &clientContext)) {
+        throw RuntimeException(std::string(readOnlyCheckpointInProgressMessage));
+    }
+}
+
+void WALReplayer::replay(bool throwOnWalReplayFailure, bool enableChecksums) const {
+    cachedOwnerName.clear();
+    cachedOwnerCatalog = nullptr;
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    auto* mainStorageManager = clientContext.getDatabase()->getStorageManager();
+    if (!mainStorageManager->isReadOnly() &&
+        vfs->fileOrPathExists(clientContext.getDatabasePath(), &clientContext)) {
+        mainStorageManager->initDataFileHandle(vfs, &clientContext);
+    }
+    [[maybe_unused]] auto readOnlyCheckpointApplyLock =
+        acquireReadOnlyCheckpointApplyLock(clientContext);
+    Checkpointer checkpointer(clientContext);
+    bool hasFrozenWAL = vfs->fileOrPathExists(checkpointWalPath, &clientContext);
+    bool hasActiveWAL = vfs->fileOrPathExists(walPath, &clientContext);
+    throwIfReadOnlyCheckpointState(clientContext, hasFrozenWAL, shadowFilePath);
+    throwIfShadowOwnedByAnotherDatabase();
+
+    if (!hasFrozenWAL && !hasActiveWAL) {
+        removeFileAndSyncParentDirectory(shadowFilePath);
+        checkpointer.readCheckpoint();
+        removePartitionChildShadowFiles(clientContext);
+        recoverGraphCheckpoints(clientContext, false, false);
+        return;
+    }
+
+    if (hasFrozenWAL) {
+        replayFrozenWAL(checkpointer, throwOnWalReplayFailure, enableChecksums);
+    }
+    if (hasActiveWAL) {
+        replayActiveWAL(checkpointer, throwOnWalReplayFailure, enableChecksums,
+            hasFrozenWAL /* checkpointRead */);
+    }
+}
+
+WALReplayer::GraphRecoveryState WALReplayer::prepareGraphCheckpoint(StorageManager& storageManager,
+    bool checkpointBundle, std::optional<uuid> checkpointDatabaseID) const {
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    const auto& databasePath = storageManager.getDatabasePath();
+    const auto activeWALPath = StorageUtils::getWALFilePath(databasePath);
+    const auto frozenWALPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto graphShadowPath = StorageUtils::getShadowFilePath(databasePath);
+    const bool hasActiveWAL = vfs->fileOrPathExists(activeWALPath, &clientContext);
+    const bool hasFrozenWAL = vfs->fileOrPathExists(frozenWALPath, &clientContext);
+    const bool hasShadow = vfs->fileOrPathExists(graphShadowPath, &clientContext);
+    GraphRecoveryState recoveryState;
+    if (checkpointBundle && !hasShadow) {
+        throw RuntimeException(
+            std::format("Cannot recover committed checkpoint: graph shadow file {} is missing.",
+                graphShadowPath));
+    }
+    if (!hasActiveWAL && !hasFrozenWAL && !hasShadow) {
+        return recoveryState;
+    }
+
+    const auto inspectWAL = [&](const std::string& path,
+                                bool exists) -> std::optional<WALReplayInfo> {
+        if (!exists) {
+            return std::nullopt;
+        }
+        auto flags = FileFlags::READ_ONLY;
+        if (!storageManager.isReadOnly()) {
+            flags |= FileFlags::WRITE;
+        }
+        auto fileInfo = vfs->openFile(path, FileOpenFlags(flags), &clientContext);
+        if (fileInfo->getFileSize() == 0) {
+            return std::nullopt;
+        }
+        if (!storageManager.isReadOnly()) {
+            syncWALFile(*fileInfo);
+        }
+        const auto walEnableChecksums = tryReadWALChecksumFlag(*fileInfo, clientContext,
+            clientContext.getDBConfig()->throwOnWalReplayFailure);
+        if (!walEnableChecksums.has_value()) {
+            // The header is torn, so the WAL holds no acknowledged commits.
+            return std::nullopt;
+        }
+        auto replayInfo = dryReplay(*fileInfo, clientContext.getDBConfig()->throwOnWalReplayFailure,
+            *walEnableChecksums);
+        if (!replayInfo.isLastRecordCheckpoint && replayInfo.offsetDeserialized == 0) {
+            return std::nullopt;
+        }
+        if (replayInfo.checkpointFormatVersion > WAL::CHECKPOINT_BUNDLE_FORMAT_VERSION) {
+            throw RuntimeException(std::format("Cannot recover graph WAL {}: {}", path,
+                unsupportedCheckpointFormatMessage(replayInfo.checkpointFormatVersion)));
+        }
+        const bool legacyCheckpointMarker =
+            replayInfo.isLastRecordCheckpoint && replayInfo.checkpointFormatVersion == 0;
+        if (!legacyCheckpointMarker) {
+            const auto graphDatabaseID = readPersistedDatabaseID(storageManager);
+            if (replayInfo.isLastRecordCheckpoint) {
+                // The version 1 marker decides whether the sentinel-stamped shadow holds
+                // committed pages, so the mismatch must not suggest deleting recovery files.
+                if (replayInfo.walDatabaseID.value != graphDatabaseID.value) {
+                    throw RuntimeException(std::format(
+                        "Cannot recover committed graph checkpoint: WAL {} does not match the "
+                        "Database ID of {}. Do not delete the WAL or shadow files; they hold "
+                        "committed pages. Restore the database file they were written for.",
+                        path, databasePath));
+                }
+            } else {
+                FileDBIDUtils::verifyDatabaseID(*fileInfo, graphDatabaseID,
+                    replayInfo.walDatabaseID);
+            }
+        }
+        return replayInfo;
+    };
+
+    const auto frozenWAL = inspectWAL(frozenWALPath, hasFrozenWAL);
+    const auto activeWAL = inspectWAL(activeWALPath, hasActiveWAL);
+    const auto numCheckpointMarkers =
+        static_cast<uint8_t>(frozenWAL.has_value() && frozenWAL->isLastRecordCheckpoint) +
+        static_cast<uint8_t>(activeWAL.has_value() && activeWAL->isLastRecordCheckpoint);
+    if (numCheckpointMarkers > 1) {
+        throw RuntimeException(std::format(
+            "Cannot recover graph {}: both active and frozen WALs contain checkpoint markers.",
+            databasePath));
+    }
+    if (storageManager.isReadOnly() && (hasShadow || numCheckpointMarkers > 0)) {
+        throw RuntimeException(
+            std::format("{} Pending recovery file: {}.", readOnlyCheckpointInProgressMessage,
+                hasShadow                                                  ? graphShadowPath :
+                frozenWAL.has_value() && frozenWAL->isLastRecordCheckpoint ? frozenWALPath :
+                                                                             activeWALPath));
+    }
+
+    recoveryState.retireFrozenWAL = hasFrozenWAL && (checkpointBundle || !frozenWAL.has_value() ||
+                                                        frozenWAL->isLastRecordCheckpoint);
+    recoveryState.retireActiveWAL = hasActiveWAL && (checkpointBundle || !activeWAL.has_value() ||
+                                                        activeWAL->isLastRecordCheckpoint);
+
+    if (checkpointBundle) {
+        ShadowFile::replayShadowPageRecordsForStorageManager(clientContext, storageManager,
+            checkpointDatabaseID);
+        return recoveryState;
+    }
+
+    const bool graphCheckpointCommitted = numCheckpointMarkers == 1;
+    if (graphCheckpointCommitted) {
+        const auto& graphMarker =
+            frozenWAL.has_value() && frozenWAL->isLastRecordCheckpoint ? *frozenWAL : *activeWAL;
+        if (!hasShadow) {
+            throw RuntimeException(
+                std::format("Cannot recover committed graph checkpoint: shadow file {} is missing.",
+                    graphShadowPath));
+        }
+        auto shadowDatabaseID = checkpointDatabaseID;
+        if (graphMarker.checkpointFormatVersion == 0) {
+            shadowDatabaseID = readShadowDatabaseID(graphShadowPath);
+            if (shadowDatabaseID->value == ShadowFile::CHECKPOINT_BUNDLE_DATABASE_ID.value) {
+                throw RuntimeException(std::format(
+                    "Cannot recover graph checkpoint {}: shadow file {} belongs to a checkpoint "
+                    "bundle that was never committed.",
+                    databasePath, graphShadowPath));
+            }
+        } else {
+            const auto bundleShadowDatabaseID = readShadowDatabaseID(graphShadowPath);
+            if (bundleShadowDatabaseID.value != ShadowFile::CHECKPOINT_BUNDLE_DATABASE_ID.value) {
+                throw RuntimeException(
+                    std::format("Cannot recover graph checkpoint {}: shadow file {} is missing its "
+                                "checkpoint-bundle compatibility guard.",
+                        databasePath, graphShadowPath));
+            }
+            shadowDatabaseID = bundleShadowDatabaseID;
+        }
+        ShadowFile::replayShadowPageRecordsForStorageManager(clientContext, storageManager,
+            shadowDatabaseID);
+        if (frozenWAL.has_value() && frozenWAL->isLastRecordCheckpoint && activeWAL.has_value() &&
+            !activeWAL->isLastRecordCheckpoint) {
+            recoveryState.walReplayRanges.push_back({activeWALPath, activeWAL->offsetDeserialized});
+        } else if (activeWAL.has_value() && activeWAL->isLastRecordCheckpoint &&
+                   frozenWAL.has_value() && !frozenWAL->isLastRecordCheckpoint) {
+            throw RuntimeException(std::format(
+                "Cannot recover graph {}: an active-WAL checkpoint marker conflicts with a "
+                "non-checkpoint frozen WAL.",
+                databasePath));
+        }
+    } else {
+        removeFileAndSyncParentDirectory(graphShadowPath);
+        if (frozenWAL.has_value()) {
+            recoveryState.walReplayRanges.push_back({frozenWALPath, frozenWAL->offsetDeserialized});
+        }
+        if (activeWAL.has_value()) {
+            recoveryState.walReplayRanges.push_back({activeWALPath, activeWAL->offsetDeserialized});
+        }
+    }
+    return recoveryState;
+}
+
+void WALReplayer::replayGraphWAL(StorageManager& storageManager,
+    const GraphRecoveryState& recoveryState) const {
+    // One replayer may drain several pending graph WALs in turn, so no pass may
+    // carry replay state into the next.
+    replayedEntryIDs.clear();
+    failedOwnerNames.clear();
+    cachedOwnerName.clear();
+    cachedOwnerCatalog = nullptr;
+    // A graph's own WAL pass may run after the main pass has already inserted
+    // entries into its catalog, so the floor cannot be captured lazily here:
+    // it must be the persisted ID counter captured when the catalog loaded.
+    graphOIDReplayFloor = recoveryState.persistedGraphOIDFloor;
+    graphOIDReplayFloorValid = true;
+    try {
+        for (const auto& range : recoveryState.walReplayRanges) {
+            auto flags = FileFlags::READ_ONLY;
+            if (!storageManager.isReadOnly()) {
+                flags |= FileFlags::WRITE;
+            }
+            auto fileInfo = VirtualFileSystem::GetUnsafe(clientContext)
+                                ->openFile(range.path, FileOpenFlags(flags), &clientContext);
+            const auto walEnableChecksums = tryReadWALChecksumFlag(*fileInfo, clientContext, true);
+            if (!walEnableChecksums.has_value()) {
+                throw RuntimeException(std::format(
+                    "Cannot replay graph WAL {}: the WAL header could not be read.", range.path));
+            }
+            auto deserializer = initDeserializer(*fileInfo, clientContext, *walEnableChecksums);
+            deserializer.getReader()->onObjectBegin();
+            const auto walHeader = readWALHeader(deserializer);
+            checkWALHeader(walHeader, *walEnableChecksums);
+            FileDBIDUtils::verifyDatabaseID(*fileInfo,
+                storageManager.getOrInitDatabaseID(clientContext), walHeader.databaseID);
+            deserializer.getReader()->onObjectEnd();
+            while (getReadOffset(deserializer, *walEnableChecksums) < range.endOffset) {
+                auto walRecord = WALRecord::deserialize(deserializer, clientContext);
+                replayWALRecord(*walRecord);
+            }
+            truncateWALFile(*fileInfo, range.endOffset);
+        }
+    } catch (...) {
+        auto transactionContext = TransactionContext::Get(clientContext);
+        if (transactionContext->hasActiveTransaction()) {
+            transactionContext->rollback();
+        }
+        throw;
+    }
+}
+
+void WALReplayer::recordReplayedEntryID(catalog::CatalogEntryType entryType,
+    common::oid_t recordedEntryID, common::oid_t replayedEntryID) const {
+    replayedEntryIDs[catalog::Catalog::Get(clientContext)][entryType][recordedEntryID] =
+        replayedEntryID;
+}
+
+common::oid_t WALReplayer::getReplayedEntryID(catalog::CatalogEntryType entryType,
+    common::oid_t recordedEntryID) const {
+    common::oid_t replayedEntryID;
+    if (!tryGetReplayedEntryID(entryType, recordedEntryID, replayedEntryID)) {
+        return recordedEntryID;
+    }
+    return replayedEntryID;
+}
+
+bool WALReplayer::tryGetReplayedEntryID(catalog::CatalogEntryType entryType,
+    common::oid_t recordedEntryID, common::oid_t& replayedEntryID) const {
+    const auto catalogIt = replayedEntryIDs.find(catalog::Catalog::Get(clientContext));
+    if (catalogIt == replayedEntryIDs.end()) {
+        return false;
+    }
+    const auto typeIt = catalogIt->second.find(entryType);
+    if (typeIt == catalogIt->second.end()) {
+        return false;
+    }
+    const auto idIt = typeIt->second.find(recordedEntryID);
+    if (idIt == typeIt->second.end()) {
+        return false;
+    }
+    replayedEntryID = idIt->second;
+    return true;
+}
+
+void WALReplayer::retireGraphCheckpointWALs(StorageManager& storageManager,
+    const GraphRecoveryState& recoveryState) const {
+    if (storageManager.isReadOnly()) {
+        return;
+    }
+    if (recoveryState.retireFrozenWAL) {
+        storageManager.getWAL().retireFrozenWAL();
+    }
+    if (recoveryState.retireActiveWAL) {
+        storageManager.getWAL().retireActiveWAL();
+    }
+}
+
+void WALReplayer::removeGraphCheckpointShadow(StorageManager& storageManager) const {
+    if (storageManager.isReadOnly()) {
+        return;
+    }
+    removeFileAndSyncParentDirectory(
+        StorageUtils::getShadowFilePath(storageManager.getDatabasePath()));
+}
+
+void WALReplayer::replayFrozenWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
+    bool enableChecksums) const {
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    auto fileInfo =
+        vfs->openFile(checkpointWalPath, FileOpenFlags(FileFlags::READ_ONLY | FileFlags::WRITE));
+    if (fileInfo->getFileSize() == 0) {
+        fileInfo.reset();
+        removeWALAndShadowFiles(checkpointWalPath);
+        checkpointer.readCheckpoint();
+        removePartitionChildShadowFiles(clientContext);
+        recoverGraphCheckpoints(clientContext, false, false);
+        return;
+    }
+    syncWALFile(*fileInfo);
+
+    try {
+        const auto replayInfo = dryReplay(*fileInfo, throwOnWalReplayFailure, enableChecksums);
+        const auto offsetDeserialized = replayInfo.offsetDeserialized;
+        if (replayInfo.isLastRecordCheckpoint) {
+            throwIfReadOnlyCheckpointState(clientContext, true /* hasFrozenWAL */, shadowFilePath);
+            replayCommittedCheckpoint(checkpointer, fileInfo, checkpointWalPath, replayInfo);
+        } else {
+            // A missing shadow proves every CHECKPOINT in the file completed (each
+            // cleanup clears it only after the checkpoint is applied and synced), so the
+            // pre-checkpoint prefix is already durable and only the suffix after the
+            // last CHECKPOINT replays. A remaining shadow means some checkpoint may never
+            // have completed: replay the pre-checkpoint prefix exactly as before and
+            // discard everything from the first CHECKPOINT record onward. Check before
+            // deleting below.
+            const bool discardCheckpointPrefix =
+                !VirtualFileSystem::GetUnsafe(clientContext)
+                     ->fileOrPathExists(shadowFilePath, &clientContext);
+            removeFileAndSyncParentDirectory(shadowFilePath);
+            checkpointer.readCheckpoint();
+            removePartitionChildShadowFiles(clientContext);
+            recoverGraphCheckpoints(clientContext, false, false);
+            Deserializer deserializer = initDeserializer(*fileInfo, clientContext, enableChecksums);
+            if (offsetDeserialized > 0) {
+                deserializer.getReader()->onObjectBegin();
+                const auto walHeader = readWALHeader(deserializer);
+                FileDBIDUtils::verifyDatabaseID(*fileInfo,
+                    StorageManager::Get(clientContext)->getOrInitDatabaseID(clientContext),
+                    walHeader.databaseID);
+                deserializer.getReader()->onObjectEnd();
+            }
+            // Without a shadow the prefix is durable (skip it); with one, stop replay at
+            // the first CHECKPOINT record, whose checkpoint may be incomplete. Both
+            // bounds exclude every CHECKPOINT record structurally, so none ever reaches
+            // replayWALRecord, which rejects them.
+            const auto replayEnd =
+                !discardCheckpointPrefix && replayInfo.lastCheckpointOffset != 0 ?
+                    replayInfo.offsetBeforeFirstCheckpoint :
+                    offsetDeserialized;
+            const auto skipBefore = discardCheckpointPrefix ? replayInfo.lastCheckpointOffset : 0;
+            while (getReadOffset(deserializer, enableChecksums) < replayEnd) {
+                DASSERT(!deserializer.finished());
+                auto walRecord = WALRecord::deserialize(deserializer, clientContext);
+                if (getReadOffset(deserializer, enableChecksums) <= skipBefore) {
+                    continue;
+                }
+                replayWALRecord(*walRecord);
+            }
+            replayPendingGraphWALs(clientContext);
+            // Graph checkpoint recovery replays loaded graphs' WALs inline through their own
+            // replayers, whose records can change graph registry membership, so the cached
+            // owner and the failed-owner set must be dropped here even when no drain ran above.
+            failedOwnerNames.clear();
+            cachedOwnerName.clear();
+            cachedOwnerCatalog = nullptr;
+            recoverGraphCheckpoints(clientContext, false, false);
+            if (offsetDeserialized == 0) {
+                // Nothing was committed, so the frozen WAL holds nothing to keep.
+                fileInfo.reset();
+                removeFileAndSyncParentDirectory(checkpointWalPath);
+                return;
+            }
+            // The replayed records now live only in memory and in the frozen WAL, so the frozen
+            // WAL must stay until a checkpoint commits them to the data file. Finish the
+            // interrupted checkpoint now, before the active WAL is replayed: its CHECKPOINT record
+            // goes to the frozen WAL, so a crash at any point either replays the frozen WAL again
+            // or applies the checkpoint, and the active WAL is replayed on top in both cases.
+            // Drop any torn tail first, so the CHECKPOINT record directly follows the last commit.
+            // With a shadowed (possibly incomplete) checkpoint this also drops the
+            // CHECKPOINT record onward, matching the replay bound above.
+            truncateWALFile(*fileInfo, replayEnd);
+            fileInfo.reset();
+            completeInterruptedCheckpoint();
+        }
+    } catch (const std::exception&) {
+        auto transactionContext = TransactionContext::Get(clientContext);
+        if (transactionContext->hasActiveTransaction()) {
+            transactionContext->rollback();
+        }
+        throw;
+    }
+}
+
+void WALReplayer::completeInterruptedCheckpoint() const {
+    // Only the main WAL adopts its frozen file; attached-graph WALs rotate normally.
+    WAL::FrozenWALAdoptionGuard adoption{*WAL::Get(clientContext)};
+    try {
+        TransactionManager::Get(clientContext)->checkpoint(clientContext);
+    } catch (const std::exception& e) {
+        throw CheckpointException(std::format(
+            "Failed while completing an interrupted checkpoint during recovery: {}", e.what()));
+    }
+}
+
+void WALReplayer::replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
+    bool enableChecksums, bool checkpointRead) const {
+    auto fileInfo = openWALFile();
+    if (fileInfo->getFileSize() == 0) {
+        fileInfo.reset();
+        removeWALAndShadowFiles(walPath);
+        if (!checkpointRead) {
+            checkpointer.readCheckpoint();
+        }
+        removePartitionChildShadowFiles(clientContext);
+        recoverGraphCheckpoints(clientContext, false, false);
+        return;
+    }
+    syncWALFile(*fileInfo);
+
+    try {
+        const auto replayInfo = dryReplay(*fileInfo, throwOnWalReplayFailure, enableChecksums);
+        const auto offsetDeserialized = replayInfo.offsetDeserialized;
+        if (replayInfo.isLastRecordCheckpoint) {
+            throwIfReadOnlyCheckpointState(clientContext, true /* hasFrozenWAL */, shadowFilePath);
+            auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+            if (!vfs->fileOrPathExists(shadowFilePath, &clientContext)) {
+                replayPinnedActiveCheckpoint(checkpointer, fileInfo, replayInfo);
+            } else {
+                replayCommittedCheckpoint(checkpointer, fileInfo, walPath, replayInfo);
+            }
+        } else {
+            // A missing shadow proves every CHECKPOINT in the file completed only when the
+            // pinned-checkpoint marker proves it: cleanup clears the shadow only after the
+            // checkpoint is applied and synced, and writes the marker in the same cleanup.
+            // With no shadow and pinned CHECKPOINT records but no marker, the shadow was
+            // lost out of band and the prefix may not be durable: throw instead of silently
+            // deleting committed records. A remaining shadow means some checkpoint may never
+            // have completed: replay the pre-checkpoint prefix exactly as before and
+            // discard everything from the first CHECKPOINT record onward. Check before
+            // deleting below.
+            auto* vfsNoShadow = VirtualFileSystem::GetUnsafe(clientContext);
+            const bool noShadow = !vfsNoShadow->fileOrPathExists(shadowFilePath, &clientContext);
+            if (noShadow && replayInfo.lastCheckpointOffset != 0) {
+                const auto markerPath =
+                    StorageUtils::getPinnedCheckpointMarkerPath(clientContext.getDatabasePath());
+                if (!vfsNoShadow->fileOrPathExists(markerPath, &clientContext)) {
+                    throw RuntimeException(
+                        std::format("Cannot recover WAL {}: it holds CHECKPOINT records but its "
+                                    "shadow file {} is missing "
+                                    "with no pinned-checkpoint marker. Do not delete the WAL or "
+                                    "shadow files; they hold "
+                                    "committed pages. Restore both files they were written for.",
+                            walPath, shadowFilePath));
+                }
+            }
+            const bool discardCheckpointPrefix = noShadow;
+            removeFileAndSyncParentDirectory(shadowFilePath);
+            if (!checkpointRead) {
+                checkpointer.readCheckpoint();
+            }
+            removePartitionChildShadowFiles(clientContext);
+            recoverGraphCheckpoints(clientContext, false, false);
+            Deserializer deserializer = initDeserializer(*fileInfo, clientContext, enableChecksums);
+            if (offsetDeserialized > 0) {
+                deserializer.getReader()->onObjectBegin();
+                const auto walHeader = readWALHeader(deserializer);
+                FileDBIDUtils::verifyDatabaseID(*fileInfo,
+                    StorageManager::Get(clientContext)->getOrInitDatabaseID(clientContext),
+                    walHeader.databaseID);
+                deserializer.getReader()->onObjectEnd();
+            }
+            // Without a shadow the prefix is durable (skip it); with one, stop replay at
+            // the first CHECKPOINT record, whose checkpoint may be incomplete. Both
+            // bounds exclude every CHECKPOINT record structurally, so none ever reaches
+            // replayWALRecord, which rejects them.
+            const auto replayEnd =
+                !discardCheckpointPrefix && replayInfo.lastCheckpointOffset != 0 ?
+                    replayInfo.offsetBeforeFirstCheckpoint :
+                    offsetDeserialized;
+            const auto skipBefore = discardCheckpointPrefix ? replayInfo.lastCheckpointOffset : 0;
+            while (getReadOffset(deserializer, enableChecksums) < replayEnd) {
+                DASSERT(!deserializer.finished());
+                auto walRecord = WALRecord::deserialize(deserializer, clientContext);
+                if (getReadOffset(deserializer, enableChecksums) <= skipBefore) {
+                    continue;
+                }
+                replayWALRecord(*walRecord);
+            }
+            replayPendingGraphWALs(clientContext);
+            // Graph checkpoint recovery replays loaded graphs' WALs inline through their own
+            // replayers, whose records can change graph registry membership, so the cached
+            // owner and the failed-owner set must be dropped here even when no drain ran above.
+            failedOwnerNames.clear();
+            cachedOwnerName.clear();
+            cachedOwnerCatalog = nullptr;
+            recoverGraphCheckpoints(clientContext, false, false);
+            // With a shadowed (possibly incomplete) checkpoint this drops the CHECKPOINT
+            // record onward, matching the replay bound above; otherwise it only drops a
+            // torn tail.
+            truncateWALFile(*fileInfo, replayEnd);
+        }
+    } catch (const std::exception&) {
+        auto transactionContext = TransactionContext::Get(clientContext);
+        if (transactionContext->hasActiveTransaction()) {
+            transactionContext->rollback();
+        }
+        throw;
+    }
+}
+
+void WALReplayer::replayPinnedActiveCheckpoint(Checkpointer& checkpointer,
+    std::unique_ptr<FileInfo>& fileInfo, const WALReplayInfo& replayInfo) const {
+    // A checkpoint taken while a reader pins the WAL skips rotation, so its CHECKPOINT record
+    // lands in the active WAL while cleanup still removes the already-applied shadow file and
+    // writes the pinned-checkpoint marker in the same cleanup. A trailing CHECKPOINT with no
+    // shadow is durable only when that marker exists: without it the shadow was lost out of
+    // band and the prefix may not be durable, so throw instead of silently deleting the WAL.
+    // Only the active-WAL path uses this; a frozen WAL with no shadow keeps throwing in
+    // replayCommittedCheckpoint.
+    if (replayInfo.checkpointFormatVersion > WAL::CHECKPOINT_BUNDLE_FORMAT_VERSION) {
+        throw RuntimeException(std::format("Cannot recover checkpoint WAL {}: {}", walPath,
+            unsupportedCheckpointFormatMessage(replayInfo.checkpointFormatVersion)));
+    }
+    {
+        auto* vfs = VirtualFileSystem::GetUnsafe(clientContext);
+        const auto markerPath =
+            StorageUtils::getPinnedCheckpointMarkerPath(clientContext.getDatabasePath());
+        if (!vfs->fileOrPathExists(shadowFilePath, &clientContext) &&
+            !vfs->fileOrPathExists(markerPath, &clientContext)) {
+            throw RuntimeException(std::format("Cannot recover checkpoint WAL {}: shadow file {} "
+                                               "is missing with no pinned-checkpoint "
+                                               "marker. Do not delete the WAL or shadow files; "
+                                               "they hold committed pages. Restore the "
+                                               "database file they were written for.",
+                walPath, shadowFilePath));
+        }
+    }
+    auto* mainStorageManager = clientContext.getDatabase()->getStorageManager();
+    if (mainStorageManager->getDataFH() == nullptr) {
+        throw RuntimeException(
+            std::format("Cannot recover committed checkpoint: database file {} is missing.",
+                clientContext.getDatabasePath()));
+    }
+    const auto mainDatabaseID = readPersistedDatabaseID(*mainStorageManager);
+    const bool checkpointBundle =
+        replayInfo.checkpointFormatVersion >= 1 &&
+        replayInfo.checkpointFormatVersion <= WAL::CHECKPOINT_BUNDLE_FORMAT_VERSION;
+    if (checkpointBundle && replayInfo.walDatabaseID.value != mainDatabaseID.value) {
+        throw RuntimeException(std::format(
+            "Cannot recover committed checkpoint: WAL {} does not match the Database ID of {}. Do "
+            "not delete the WAL or shadow files; they hold committed pages. Restore the database "
+            "file they were written for.",
+            walPath, clientContext.getDatabasePath()));
+    }
+    std::optional<uuid> checkpointDatabaseID = std::nullopt;
+    if (checkpointBundle) {
+        checkpointDatabaseID = ShadowFile::CHECKPOINT_BUNDLE_DATABASE_ID;
+    }
+    checkpointer.readCheckpoint(true, checkpointDatabaseID, checkpointBundle);
+    recoverGraphCheckpoints(clientContext, true, checkpointBundle, checkpointDatabaseID);
+
+    truncateWALFile(*fileInfo, 0);
+    fileInfo.reset();
+    removeWALAndShadowFiles(walPath);
+    removeFileAndSyncParentDirectory(
+        StorageUtils::getPinnedCheckpointMarkerPath(clientContext.getDatabasePath()));
+    removePartitionChildShadowFiles(clientContext);
+    removeGraphCheckpointShadows(clientContext);
+}
+
+void WALReplayer::replayCommittedCheckpoint(Checkpointer& checkpointer,
+    std::unique_ptr<FileInfo>& fileInfo, const std::string& checkpointWALPath,
+    const WALReplayInfo& replayInfo) const {
+    if (replayInfo.checkpointFormatVersion > WAL::CHECKPOINT_BUNDLE_FORMAT_VERSION) {
+        throw RuntimeException(
+            std::format("Cannot recover checkpoint WAL {}: {}", checkpointWALPath,
+                unsupportedCheckpointFormatMessage(replayInfo.checkpointFormatVersion)));
+    }
+    auto* mainStorageManager = clientContext.getDatabase()->getStorageManager();
+    if (mainStorageManager->getDataFH() == nullptr) {
+        throw RuntimeException(
+            std::format("Cannot recover committed checkpoint: database file {} is missing.",
+                clientContext.getDatabasePath()));
+    }
+    const auto mainDatabaseID = readPersistedDatabaseID(*mainStorageManager);
+    const bool checkpointBundle =
+        replayInfo.checkpointFormatVersion >= 1 &&
+        replayInfo.checkpointFormatVersion <= WAL::CHECKPOINT_BUNDLE_FORMAT_VERSION;
+    if (checkpointBundle && replayInfo.walDatabaseID.value != mainDatabaseID.value) {
+        throw RuntimeException(std::format(
+            "Cannot recover committed checkpoint: WAL {} does not match the Database ID of {}. Do "
+            "not delete the WAL or shadow files; they hold committed pages. Restore the database "
+            "file they were written for.",
+            checkpointWALPath, clientContext.getDatabasePath()));
+    }
+    if (!VirtualFileSystem::GetUnsafe(clientContext)
+             ->fileOrPathExists(shadowFilePath, &clientContext)) {
+        throw RuntimeException(std::format(
+            "Cannot recover committed checkpoint: shadow file {} is missing.", shadowFilePath));
+    }
+    const auto mainShadowDatabaseID = readShadowDatabaseID(shadowFilePath);
+    std::optional<uuid> checkpointDatabaseID = mainShadowDatabaseID;
+    if (checkpointBundle &&
+        mainShadowDatabaseID.value != ShadowFile::CHECKPOINT_BUNDLE_DATABASE_ID.value) {
+        throw RuntimeException(std::format(
+            "Cannot recover checkpoint WAL {}: shadow file {} is missing its checkpoint-bundle "
+            "compatibility guard.",
+            checkpointWALPath, shadowFilePath));
+    }
+    ShadowFile::replayShadowPageRecordsForStorageManager(clientContext, *mainStorageManager,
+        checkpointDatabaseID);
+    checkpointer.readCheckpoint(true, checkpointDatabaseID, checkpointBundle);
+    recoverGraphCheckpoints(clientContext, true, checkpointBundle, checkpointDatabaseID);
+
+    truncateWALFile(*fileInfo, 0);
+    fileInfo.reset();
+    removeWALAndShadowFiles(checkpointWALPath);
+    removePartitionChildShadowFiles(clientContext);
+    removeGraphCheckpointShadows(clientContext);
+}
+
+WALReplayer::WALReplayInfo WALReplayer::dryReplay(FileInfo& fileInfo, bool throwOnWalReplayFailure,
+    bool enableChecksums) const {
+    WALReplayInfo replayInfo;
+    try {
+        Deserializer deserializer = initDeserializer(fileInfo, clientContext, enableChecksums);
+
+        deserializer.getReader()->onObjectBegin();
+        const auto walHeader = readWALHeader(deserializer);
+        checkWALHeader(walHeader, enableChecksums);
+        replayInfo.walDatabaseID = walHeader.databaseID;
+        deserializer.getReader()->onObjectEnd();
+
+        bool finishedDeserializing = deserializer.finished();
+        while (!finishedDeserializing) {
+            auto walRecord = WALRecord::deserialize(deserializer, clientContext);
+            finishedDeserializing = deserializer.finished();
+            switch (walRecord->type) {
+            case WALRecordType::CHECKPOINT_RECORD: {
+                // A CHECKPOINT record need not be final: a pinned checkpoint skips WAL
+                // rotation, so its record lands mid-file in the active WAL (and
+                // consecutive pins leave several). When no shadow file remains, every
+                // checkpoint in the file completed, so records up to and including the
+                // last one are already durable and only the suffix after it replays.
+                // When a shadow remains, some checkpoint may never have completed, so
+                // recovery instead replays the pre-checkpoint prefix (see the replay
+                // loops below). Remember the offsets and keep scanning instead of
+                // failing; a later COMMIT (or any other record) clears the
+                // last-record flag below.
+                replayInfo.isLastRecordCheckpoint = true;
+                replayInfo.checkpointFormatVersion =
+                    walRecord->constCast<CheckpointRecord>().bundleFormatVersion;
+                if (replayInfo.lastCheckpointOffset == 0) {
+                    replayInfo.offsetBeforeFirstCheckpoint = replayInfo.offsetDeserialized;
+                }
+                replayInfo.lastCheckpointOffset = getReadOffset(deserializer, enableChecksums);
+                replayInfo.offsetDeserialized = replayInfo.lastCheckpointOffset;
+            } break;
+            case WALRecordType::COMMIT_RECORD: {
+                // Update the offset to the end of the last commit record.
+                replayInfo.isLastRecordCheckpoint = false;
+                replayInfo.offsetDeserialized = getReadOffset(deserializer, enableChecksums);
+            } break;
+            default: {
+                // Any other record after a checkpoint also ends the checkpoint suffix.
+                replayInfo.isLastRecordCheckpoint = false;
+            }
+            }
+        }
+    } catch (...) {
+        // If we hit an exception while deserializing, we assume that the WAL file is (partially)
+        // corrupted. This should only happen for records of the last transaction recorded.
+        if (throwOnWalReplayFailure) {
+            throw;
+        }
+    }
+    return replayInfo;
+}
+
+void WALReplayer::replayWALRecord(WALRecord& walRecord) const {
+    if (!graphOIDReplayFloorValid) {
+        // The main-WAL pass captures the floor before applying any record, when
+        // its catalog is in the persisted state: every ID replay assigns is at
+        // or above it, and persisted entries are below it. A graph pass seeds
+        // the floor from its recovery state instead (see replayGraphWAL).
+        graphOIDReplayFloor = catalog::Catalog::Get(clientContext)->peekNextGraphOID();
+        graphOIDReplayFloorValid = true;
+    }
+    std::optional<ReplayOwnerScope> replayOwnerScope;
+    if (!walRecord.ownerCatalogName.empty()) {
+        auto dbManager = main::DatabaseManager::Get(clientContext);
+        if (dbManager == nullptr) {
+            return;
+        }
+        const auto upperOwnerName = StringUtils::getUpper(walRecord.ownerCatalogName);
+        if (cachedOwnerCatalog == nullptr || upperOwnerName != cachedOwnerName) {
+            if (!dbManager->hasGraph(walRecord.ownerCatalogName)) {
+                if (!failedOwnerNames.contains(upperOwnerName)) {
+                    // A graph created earlier in this same WAL is not registered yet: its
+                    // create-graph record only adds the catalog entry. Materialize that one
+                    // graph (not the full graph-recovery pass) before routing this record into
+                    // its catalog. A name whose materialization failed is remembered so its
+                    // remaining records skip this load instead of repeating it; replayed graph
+                    // DDL clears that memory (see the catalog-entry cases). The graph's own
+                    // WAL replay is deferred by the loader to the next transaction-free point,
+                    // because its standalone-session transactions cannot nest inside this one.
+                    dbManager->loadGraphFromCatalog(MemoryManager::Get(clientContext),
+                        &clientContext, walRecord.ownerCatalogName);
+                    if (!dbManager->hasGraph(walRecord.ownerCatalogName)) {
+                        failedOwnerNames.insert(upperOwnerName);
+                    }
+                }
+            }
+            if (!dbManager->hasGraph(walRecord.ownerCatalogName)) {
+                // DROP GRAPH reclaims the graph's files immediately, while records its
+                // earlier committed transactions logged stay in the main WAL until the
+                // next checkpoint. Such an owner cannot be materialized (no files to load)
+                // and no catalog remains to apply the record to. Skip it, exactly as
+                // loadGraphsFromCatalog skips graphs whose files are gone; throwing here
+                // would wedge recovery permanently, because the committed prefix can
+                // never replay past this record and the WAL can never be retired.
+                return;
+            }
+            cachedOwnerName = upperOwnerName;
+            cachedOwnerCatalog = dbManager->getGraphCatalog(walRecord.ownerCatalogName);
+        }
+        replayOwnerScope.emplace(*dbManager, cachedOwnerCatalog);
+    }
+    switch (walRecord.type) {
+    case WALRecordType::BEGIN_TRANSACTION_RECORD: {
+        TransactionContext::Get(clientContext)->beginRecoveryTransaction();
+    } break;
+    case WALRecordType::COMMIT_RECORD: {
+        TransactionContext::Get(clientContext)->commit();
+        // The enclosing recovery transaction just completed, so graph WALs queued by lazy
+        // materialization inside it can now replay without nesting their transactions.
+        // A drained pass runs its own replayer, whose records (e.g. extension init) can
+        // change graph registry membership, so the cached owner and the failed-owner set
+        // cannot survive it.
+        if (replayPendingGraphWALs(clientContext)) {
+            failedOwnerNames.clear();
+            cachedOwnerName.clear();
+            cachedOwnerCatalog = nullptr;
+        }
+    } break;
+    case WALRecordType::CREATE_CATALOG_ENTRY_RECORD: {
+        failedOwnerNames.clear();
+        cachedOwnerName.clear();
+        cachedOwnerCatalog = nullptr;
+        replayCreateCatalogEntryRecord(walRecord);
+    } break;
+    case WALRecordType::CREATE_INDEX_RECORD: {
+        replayCreateIndexRecord(walRecord);
+    } break;
+    case WALRecordType::DROP_CATALOG_ENTRY_RECORD: {
+        failedOwnerNames.clear();
+        cachedOwnerName.clear();
+        cachedOwnerCatalog = nullptr;
+        replayDropCatalogEntryRecord(walRecord);
+    } break;
+    case WALRecordType::ALTER_TABLE_ENTRY_RECORD: {
+        replayAlterTableEntryRecord(walRecord);
+    } break;
+    case WALRecordType::TABLE_INSERTION_RECORD: {
+        replayTableInsertionRecord(walRecord);
+    } break;
+    case WALRecordType::NODE_DELETION_RECORD: {
+        replayNodeDeletionRecord(walRecord);
+    } break;
+    case WALRecordType::NODE_UPDATE_RECORD: {
+        replayNodeUpdateRecord(walRecord);
+    } break;
+    case WALRecordType::REL_DELETION_RECORD: {
+        replayRelDeletionRecord(walRecord);
+    } break;
+    case WALRecordType::REL_DETACH_DELETE_RECORD: {
+        replayRelDetachDeletionRecord(walRecord);
+    } break;
+    case WALRecordType::REL_UPDATE_RECORD: {
+        replayRelUpdateRecord(walRecord);
+    } break;
+    case WALRecordType::COPY_TABLE_RECORD: {
+        replayCopyTableRecord(walRecord);
+    } break;
+    case WALRecordType::UPDATE_SEQUENCE_RECORD: {
+        replayUpdateSequenceRecord(walRecord);
+    } break;
+    case WALRecordType::UPDATE_SEQUENCE_NAMED_RECORD: {
+        replayUpdateSequenceNamedRecord(walRecord);
+    } break;
+    case WALRecordType::LOAD_EXTENSION_RECORD: {
+        // Extension init runs arbitrary code against the database, so the cached
+        // owner and the failed-owner set cannot be assumed to stay valid across this record.
+        failedOwnerNames.clear();
+        cachedOwnerName.clear();
+        cachedOwnerCatalog = nullptr;
+        replayLoadExtensionRecord(walRecord);
+    } break;
+    case WALRecordType::CHECKPOINT_RECORD: {
+        // This record should not be replayed during individual record replay.
+        // CHECKPOINT records are handled by the frozen/active WAL recovery path
+        // that replays shadow pages as a batch. If we reach here, the WAL file has
+        // been corrupted (or checksums are disabled and a torn write happened to
+        // produce type byte 254). Throw a descriptive error instead of asserting
+        // so that the database can still be opened with throwOnWalReplayFailure=false.
+        throw common::RuntimeException(std::format(
+            "WAL replay encountered a CHECKPOINT record outside the expected recovery "
+            "path. This is caused by a corrupted WAL tail. "
+            "Set throwOnWalReplayFailure=false to discard the tail and open the database."));
+    }
+    default:
+        throw common::RuntimeException(std::format(
+            "WAL replay encountered an unknown record type ({}). "
+            "The WAL file is corrupted. "
+            "Set throwOnWalReplayFailure=false to discard the tail and open the database.",
+            static_cast<int>(walRecord.type)));
+    }
+}
+
+void WALReplayer::removeWALAndShadowFiles(const std::string& walFilePath) const {
+    const bool walRemoved = removeFileIfExists(walFilePath);
+    const bool shadowRemoved = removeFileIfExists(shadowFilePath);
+    if (walRemoved || shadowRemoved) {
+        VirtualFileSystem::GetUnsafe(clientContext)
+            ->syncParentDirectory(walRemoved ? walFilePath : shadowFilePath);
+    }
+}
+
+void WALReplayer::removeFileAndSyncParentDirectory(const std::string& path) const {
+    if (removeFileIfExists(path)) {
+        VirtualFileSystem::GetUnsafe(clientContext)->syncParentDirectory(path);
+    }
+}
+
+bool WALReplayer::removeFileIfExists(const std::string& path) const {
+    if (StorageManager::Get(clientContext)->isReadOnly()) {
+        return false;
+    }
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    if (vfs->fileOrPathExists(path, &clientContext)) {
+        vfs->removeFileIfExists(path);
+        return true;
+    }
+    return false;
+}
+
+std::unique_ptr<FileInfo> WALReplayer::openWALFile() const {
+    auto flag = FileFlags::READ_ONLY;
+    if (!StorageManager::Get(clientContext)->isReadOnly()) {
+        flag |= FileFlags::WRITE; // The write flag here is to ensure the file is opened with O_RDWR
+                                  // so that we can sync it.
+    }
+    return VirtualFileSystem::GetUnsafe(clientContext)->openFile(walPath, FileOpenFlags(flag));
+}
+
+void WALReplayer::syncWALFile(const FileInfo& fileInfo) const {
+    if (StorageManager::Get(clientContext)->isReadOnly()) {
+        return;
+    }
+    fileInfo.syncFile();
+}
+
+void WALReplayer::truncateWALFile(FileInfo& fileInfo, uint64_t size) const {
+    if (StorageManager::Get(clientContext)->isReadOnly()) {
+        return;
+    }
+    if (fileInfo.getFileSize() > size) {
+        fileInfo.truncate(size);
+        fileInfo.syncFile();
+    }
+}
+
+} // namespace storage
+} // namespace riag
