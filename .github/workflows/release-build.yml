@@ -1,0 +1,361 @@
+# Builds the release artifacts from the released sources.
+#
+# This workflow runs in the public RiaGraph repository, started by
+# `Release (all repos)` in RiaGraphDev once the release has been published
+# there (it can also be started by hand). It builds from the tag alone: the
+# submodules it checks out are the public repositories, so the artifacts cannot
+# contain anything that was not released. The `plan` job records the commits and
+# repositories that went in (SOURCES.txt, attached to the release) and fails if
+# any submodule does not point at a public repository.
+#
+#   plan      checks the inputs, pins the commit, writes SOURCES.txt
+#   engine    compiles the engine once per selected platform (build-engine.yml)
+#   python    sdist + wheels      ┐
+#   nodejs    Node.js binding     │ link the engine from `engine`
+#   java      JNI libraries + jar │ and compile nothing else of it
+#   rust      the crate           ┘
+#   wasm      WebAssembly package   (Emscripten, its own toolchain)
+#   release   attaches everything and SHA256SUMS to the release, then publishes it
+#
+# The release is the draft that publish-public.yml created. It stays a draft
+# when any selected build fails, so a release only becomes visible once all of
+# it built. `publish: false` builds without touching any release (the artifacts
+# are kept as workflow artifacts), which is also how to rehearse in RiaGraphDev.
+name: Release build
+
+run-name: Release build ${{ inputs.version }}${{ inputs.dispatch_id != '' && format(' [{0}]', inputs.dispatch_id) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to build, e.g. v0.22.0 (with publish off: any branch, tag or SHA)"
+        required: true
+        type: string
+      libriag:
+        description: "Target: libriag (shared + static) and riag CLI archives"
+        required: false
+        default: true
+        type: boolean
+      python:
+        description: "Target: Python sdist and wheels"
+        required: false
+        default: true
+        type: boolean
+      nodejs:
+        description: "Target: Node.js binding"
+        required: false
+        default: true
+        type: boolean
+      java:
+        description: "Target: Java jar (needs linux-x64)"
+        required: false
+        default: true
+        type: boolean
+      rust:
+        description: "Target: Rust crate (needs linux-x64)"
+        required: false
+        default: true
+        type: boolean
+      wasm:
+        description: "Target: WebAssembly package (disabled until RiaGraphExtension is ported)"
+        required: false
+        default: false
+        type: boolean
+      linux_x64:
+        description: "Platform: Linux x86_64 (glibc >= 2.28)"
+        required: false
+        default: true
+        type: boolean
+      macos_arm64:
+        description: "Platform: macOS arm64"
+        required: false
+        default: true
+        type: boolean
+      windows_x64:
+        description: "Platform: Windows x86_64"
+        required: false
+        default: true
+        type: boolean
+      publish:
+        description: "Attach the artifacts to the release for the tag and publish it"
+        required: false
+        default: true
+        type: boolean
+      engine_run_id:
+        description: "Rehearsals only (publish off): reuse the engine of this earlier run of this repository instead of building it again"
+        required: false
+        default: ""
+        type: string
+      dispatch_id:
+        description: "Set by Release (all repos) to find this run; leave empty"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  # Reading artifacts of another run (a rehearsal that reuses an earlier engine)
+  # needs this; the current run's own artifacts do not.
+  actions: read
+
+concurrency:
+  group: release-build-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      platforms: ${{ steps.plan.outputs.platforms }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.version }}
+          persist-credentials: false
+
+      - name: Check the inputs and pin the commit
+        id: plan
+        env:
+          VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+          LIBRIAG: ${{ inputs.libriag }}
+          PYTHON: ${{ inputs.python }}
+          NODEJS: ${{ inputs.nodejs }}
+          JAVA: ${{ inputs.java }}
+          RUST: ${{ inputs.rust }}
+          WASM: ${{ inputs.wasm }}
+          ENGINE_RUN_ID: ${{ inputs.engine_run_id }}
+          LINUX_X64: ${{ inputs.linux_x64 }}
+          MACOS_ARM64: ${{ inputs.macos_arm64 }}
+          WINDOWS_X64: ${{ inputs.windows_x64 }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+
+          # The workflows run from the branch this build was dispatched on, but
+          # the package jobs use the helper actions of the tree they build. A
+          # ref from before this pipeline existed has none of them, and would
+          # only say so after the engines have been built.
+          for action in fetch-engine checkout-submodules; do
+            if [ ! -f ".github/actions/$action/action.yml" ]; then
+              echo "::error::'$VERSION' does not contain .github/actions/$action: it predates the release build. Build a newer tag, or a branch for a rehearsal (version=main, publish off)."
+              exit 1
+            fi
+          done
+
+          if [ -n "$ENGINE_RUN_ID" ] && { [ "$PUBLISH" = true ] || ! [[ $ENGINE_RUN_ID =~ ^[0-9]+$ ]]; }; then
+            echo "::error::engine_run_id must be a run number, and only a build without publish may reuse an engine"
+            exit 1
+          fi
+
+          if [ "$WASM" = true ]; then
+            echo "::error::the wasm target is disabled: the extension submodule is not ported to the riag namespace yet (see package-wasm.yml)"
+            exit 1
+          fi
+
+          if [ "$PUBLISH" = true ] && ! [[ $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version '$VERSION' is not vMAJOR.MINOR.PATCH[-suffix]; only a build without publish may name a branch or SHA"
+            exit 1
+          fi
+
+          # Everything the package builds need to know about a platform; each
+          # workflow picks the fields it uses.
+          table='[
+            {"platform": "linux-x64", "family": "linux", "os": "ubuntu-latest", "arch": "x86_64",
+             "container": "quay.io/pypa/manylinux_2_28_x86_64", "node_platform": "linux-x64", "cibw_archs": "x86_64"},
+            {"platform": "macos-arm64", "family": "macos", "os": "macos-15", "arch": "arm64",
+             "node_platform": "darwin-arm64", "cibw_archs": "arm64"},
+            {"platform": "windows-x64", "family": "windows", "os": "windows-2022", "arch": "x86_64",
+             "msvc_arch": "x64", "openssl_exe": "Win64OpenSSL_Light-3_5_9.exe", "node_platform": "win32-x64", "cibw_archs": "AMD64"}
+          ]'
+          selected=()
+          [ "$LINUX_X64" = true ] && selected+=(linux-x64)
+          [ "$MACOS_ARM64" = true ] && selected+=(macos-arm64)
+          [ "$WINDOWS_X64" = true ] && selected+=(windows-x64)
+          if [ ${#selected[@]} -eq 0 ]; then
+            echo "::error::select at least one platform"
+            exit 1
+          fi
+          if [ "$LIBRIAG$PYTHON$NODEJS$JAVA$RUST" = falsefalsefalsefalsefalse ]; then
+            echo "::error::select at least one target"
+            exit 1
+          fi
+          # Java runs its Gradle tests, and Rust verifies its crate, on Linux.
+          if [ "$LINUX_X64" != true ] && { [ "$JAVA" = true ] || [ "$RUST" = true ]; }; then
+            echo "::error::the java and rust targets need the linux-x64 platform"
+            exit 1
+          fi
+          platforms=$(printf '%s\n' "${selected[@]}" | jq -R . | jq -sc --argjson table "$table" \
+            '. as $sel | $table | map(select(.platform as $p | $sel | index($p)))')
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release build $VERSION"
+            echo
+            echo "Commit \`$sha\` of \`$GITHUB_REPOSITORY\`"
+            echo
+            echo "- targets: libriag=$LIBRIAG python=$PYTHON nodejs=$NODEJS java=$JAVA rust=$RUST wasm=$WASM"
+            echo "- platforms: ${selected[*]}"
+            echo "- publish: $PUBLISH"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The proof that the build uses released sources only. In the public
+      # repository every submodule must be another public repository; the Dev
+      # repositories name Dev submodules, so a rehearsal there only reports them.
+      - name: Record the sources
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA: ${{ steps.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          rehearsal=false
+          case "$GITHUB_REPOSITORY" in *Dev) rehearsal=true ;; esac
+          {
+            echo "RiaGraph $VERSION"
+            echo "repository: https://github.com/$GITHUB_REPOSITORY"
+            echo "commit:     $SHA"
+            echo
+            echo "submodules (path, repository, commit):"
+          } > SOURCES.txt
+
+          bad=0
+          while read -r key; do
+            name=${key#submodule.}; name=${name%.path}
+            path=$(git config -f .gitmodules "submodule.$name.path")
+            url=$(git config -f .gitmodules "submodule.$name.url")
+            commit=$(git ls-tree HEAD -- "$path" | awk '$1 == "160000" {print $3}')
+            [ -n "$commit" ] || { echo "::error::$path is in .gitmodules but is not a submodule at $SHA"; bad=1; continue; }
+            printf '  %-20s %s %s\n' "$path" "$url" "$commit" >> SOURCES.txt
+            if [ "$rehearsal" = false ]; then
+              if ! [[ $url =~ ^https://github\.com/${GITHUB_REPOSITORY_OWNER}/RiaGraph[A-Za-z]*(\.git)?$ ]] || [[ $url == *Dev* ]]; then
+                echo "::error::$path points at $url, which is not a public RiaGraph repository"
+                bad=1
+              fi
+            fi
+          done < <(git config -f .gitmodules --name-only --get-regexp '\.path$')
+
+          # A submodule without a .gitmodules entry would be skipped by the checkout.
+          listed=$(git config -f .gitmodules --get-regexp '\.path$' | awk '{print $2}' | sort)
+          pinned=$(git ls-tree -r HEAD | awk '$1 == "160000" {print $4}' | sort)
+          [ "$listed" = "$pinned" ] || { echo "::error::.gitmodules and the pinned submodules differ"; diff <(echo "$listed") <(echo "$pinned") || true; bad=1; }
+
+          cat SOURCES.txt
+          { echo '```'; cat SOURCES.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          [ "$bad" = 0 ]
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asset-sources
+          path: SOURCES.txt
+
+  engine:
+    needs: plan
+    if: ${{ inputs.engine_run_id == '' && (inputs.libriag || inputs.python || inputs.nodejs || inputs.java || inputs.rust) }}
+    uses: ./.github/workflows/build-engine.yml
+    with:
+      platforms: ${{ needs.plan.outputs.platforms }}
+      sha: ${{ needs.plan.outputs.sha }}
+
+  python:
+    needs: [plan, engine]
+    if: ${{ !cancelled() && !failure() && inputs.python }}
+    uses: ./.github/workflows/package-python.yml
+    with:
+      engine_run_id: ${{ inputs.engine_run_id }}
+      platforms: ${{ needs.plan.outputs.platforms }}
+      sha: ${{ needs.plan.outputs.sha }}
+    secrets: inherit
+
+  nodejs:
+    needs: [plan, engine]
+    if: ${{ !cancelled() && !failure() && inputs.nodejs }}
+    uses: ./.github/workflows/package-nodejs.yml
+    with:
+      engine_run_id: ${{ inputs.engine_run_id }}
+      platforms: ${{ needs.plan.outputs.platforms }}
+      sha: ${{ needs.plan.outputs.sha }}
+    secrets: inherit
+
+  java:
+    needs: [plan, engine]
+    if: ${{ !cancelled() && !failure() && inputs.java }}
+    uses: ./.github/workflows/package-java.yml
+    with:
+      engine_run_id: ${{ inputs.engine_run_id }}
+      platforms: ${{ needs.plan.outputs.platforms }}
+      sha: ${{ needs.plan.outputs.sha }}
+    secrets: inherit
+
+  rust:
+    needs: [plan, engine]
+    if: ${{ !cancelled() && !failure() && inputs.rust }}
+    uses: ./.github/workflows/package-rust.yml
+    with:
+      engine_run_id: ${{ inputs.engine_run_id }}
+      sha: ${{ needs.plan.outputs.sha }}
+    secrets: inherit
+
+  wasm:
+    needs: plan
+    if: ${{ inputs.wasm }}
+    uses: ./.github/workflows/package-wasm.yml
+    with:
+      sha: ${{ needs.plan.outputs.sha }}
+    secrets: inherit
+
+  release:
+    needs: [plan, engine, python, nodejs, java, rust, wasm]
+    if: ${{ always() && inputs.publish && needs.plan.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download the packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: asset-*
+          merge-multiple: true
+          path: assets
+
+      - name: Download the libriag and CLI archives
+        if: ${{ inputs.libriag }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: "{libriag*,riag_cli*}"
+          merge-multiple: true
+          path: assets
+
+      - name: Checksums
+        working-directory: assets
+        run: |
+          set -euo pipefail
+          # Every asset is a plain file at the top level; anything nested would
+          # not be attached.
+          if find . -mindepth 1 -type d | grep -q .; then
+            echo "::error::unexpected directories in the downloaded artifacts"; find . -type d; exit 1
+          fi
+          sha256sum -- * > ../SHA256SUMS
+          mv ../SHA256SUMS .
+          cat SHA256SUMS
+          { echo '### Release assets'; echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      # Files go onto the draft first and the release is published afterwards,
+      # so that a release is complete from the moment it is visible.
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.version }}
+          files: assets/*
+          draft: true
+          fail_on_unmatched_files: true
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.version }}
+          draft: false

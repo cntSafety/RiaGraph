@@ -1,0 +1,35 @@
+name: Check out submodules
+description: >
+  Initialises the named submodules of the checked-out RiaGraph tree. The release
+  build runs in the public repository, where every submodule is another public
+  repository and no credentials are needed. Only a rehearsal in the private Dev
+  repository passes a token, because there the submodules are private.
+
+inputs:
+  paths:
+    description: "Space-separated submodule paths, e.g. `tools/java_api dataset`"
+    required: true
+  token:
+    description: "Read access to the submodule repositories; leave empty in the public repository"
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Update ${{ inputs.paths }}
+      shell: bash
+      env:
+        PATHS: ${{ inputs.paths }}
+        TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        git config --global --add safe.directory '*'
+        git config --global core.longpaths true
+        if [ -n "$TOKEN" ]; then
+          echo "::add-mask::$TOKEN"
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+        fi
+        # shellcheck disable=SC2086 # the list is meant to split
+        git submodule update --init --recursive -- $PATHS
+        git submodule status --recursive

@@ -6,63 +6,70 @@
 # the Linux build has a glibc 2.28 floor (manylinux_2_28, -static-libstdc++), so
 # the binding loads on a stock system with no other files next to it.
 #
-# workflow_dispatch with a release tag, or pushing a `nodejs-v*` tag, attaches
-# the archives and SHA256SUMS to a GitHub release (a prerelease unless asked
-# otherwise). Without a tag the archives are only kept as workflow artifacts.
-name: Node.js binaries
+# Only the binding is compiled here. The engine comes from build-engine.yml as a
+# static libriag; the binding's CMake links it, together with a static OpenSSL
+# built (or installed) below, into riagjs.node.
+name: Package Node.js
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      release_tag:
-        description: "Release to create, e.g. nodejs-v0.22.0-1 (empty: build only)"
+      platforms:
+        description: "JSON list of platform objects from release-build.yml's plan job"
+        required: true
+        type: string
+      sha:
+        description: "Commit to build"
+        required: true
+        type: string
+      engine_run_id:
+        description: "Rehearsals only: take the engine from this earlier run instead of the current one"
         required: false
         default: ""
         type: string
-      prerelease:
-        description: "Mark the release as a prerelease"
-        required: false
-        default: true
-        type: boolean
-  push:
-    tags: ["nodejs-v*"]
-  # A change to this workflow builds all platforms (without releasing).
-  pull_request:
-    paths: [".github/workflows/nodejs-binaries.yml"]
 
 permissions:
   contents: read
+  # Reading artifacts of another run (a rehearsal that reuses an earlier engine)
+  # needs this; the current run's own artifacts do not.
+  actions: read
 
 env:
   NODE_VERSION: "24"
   OPENSSL_VERSION: "3.5.4"
 
 jobs:
-  build:
-    name: build (${{ matrix.platform }})
+  nodejs:
+    name: nodejs (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux-x64
-            os: ubuntu-22.04
-            container: quay.io/pypa/manylinux_2_28_x86_64
-          - platform: darwin-arm64
-            os: macos-15
-          - platform: win32-x64
-            os: windows-2022
-    runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
-    timeout-minutes: 180
+        include: ${{ fromJSON(inputs.platforms) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
 
-      - name: Check out the Node.js binding
+      - uses: ./.github/actions/checkout-submodules
+        with:
+          paths: tools/nodejs_api
+          token: ${{ secrets.GH_TOKEN_RIAGRAPH }}
+
+      # Not ${{ github.workspace }}: in a container job that is the host's path.
+      - name: Locate the engine directory
         shell: bash
-        run: |
-          git config --global --add safe.directory '*'
-          git config --global url."https://x-access-token:${{ secrets.GH_TOKEN_RIAGRAPH }}@github.com/".insteadOf "https://github.com/"
-          git submodule update --init tools/nodejs_api
+        run: echo "ENGINE_DIR=$GITHUB_WORKSPACE/precompiled-libriag" >> "$GITHUB_ENV"
+
+      - uses: ./.github/actions/fetch-engine
+        with:
+          platform: ${{ matrix.platform }}
+          kind: static
+          dir: precompiled-libriag
+          run-id: ${{ inputs.engine_run_id }}
 
       # ---- toolchains -------------------------------------------------------
 
@@ -71,7 +78,7 @@ jobs:
         run: |
           dnf install -y 'dnf-command(config-manager)'
           dnf config-manager --set-enabled powertools
-          dnf install -y cmake ninja-build python3 git ccache gcc-toolset-13 perl-IPC-Cmd perl-Pod-Html perl-Time-Piece xz
+          dnf install -y cmake ninja-build python3 git gcc-toolset-13 perl-IPC-Cmd perl-Pod-Html perl-Time-Piece xz
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -80,7 +87,7 @@ jobs:
           brew list ninja >/dev/null 2>&1 || brew install ninja
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -91,7 +98,7 @@ jobs:
           New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
           git config --system core.longpaths true
 
-      # ---- static OpenSSL 3 ---------------------------------------------------
+      # ---- static OpenSSL 3 -------------------------------------------------
 
       - name: Cache OpenSSL (Linux)
         if: runner.os == 'Linux'
@@ -143,12 +150,16 @@ jobs:
         working-directory: tools/nodejs_api
         run: npm install --include=dev --no-audit --no-fund
 
+      # RIAG_NODEJS_* tell the binding's CMake to link the prebuilt archive
+      # instead of the `riag` target; RIAG_API_* do the same for the top-level
+      # project, which then builds nothing but the binding.
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
           source /opt/rh/gcc-toolset-13/enable
           export CC=gcc CXX=g++ LDFLAGS="-static-libstdc++ -static-libgcc"
-          export EXTRA_CMAKE_FLAGS="-DBUILD_SHELL=FALSE -DBUILD_SHARED_RIAG=FALSE -DBUILD_SINGLE_FILE_HEADER=FALSE -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
+          lib="${ENGINE_DIR}/libriag.a"
+          export EXTRA_CMAKE_FLAGS="-DBUILD_RIAG=FALSE -DBUILD_SHELL=FALSE -DRIAG_API_USE_PRECOMPILED_LIB=TRUE -DRIAG_API_PRECOMPILED_LIB_PATH=${lib} -DRIAG_NODEJS_USE_PRECOMPILED_LIB=TRUE -DRIAG_NODEJS_PRECOMPILED_LIB_PATH=${lib} -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
           make GEN=Ninja nodejs NUM_THREADS="$(nproc)"
 
       - name: Build (macOS)
@@ -156,27 +167,32 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "15.0"
         run: |
-          export EXTRA_CMAKE_FLAGS="-DBUILD_SHELL=FALSE -DBUILD_SHARED_RIAG=FALSE -DBUILD_SINGLE_FILE_HEADER=FALSE -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
+          lib="${ENGINE_DIR}/libriag.a"
+          export EXTRA_CMAKE_FLAGS="-DBUILD_RIAG=FALSE -DBUILD_SHELL=FALSE -DRIAG_API_USE_PRECOMPILED_LIB=TRUE -DRIAG_API_PRECOMPILED_LIB_PATH=${lib} -DRIAG_NODEJS_USE_PRECOMPILED_LIB=TRUE -DRIAG_NODEJS_PRECOMPILED_LIB_PATH=${lib} -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
           make GEN=Ninja nodejs NUM_THREADS="$(sysctl -n hw.ncpu)"
 
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
-          arch: x64
+          arch: ${{ matrix.msvc_arch }}
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: |
           powershell.exe -Command "Add-MpPreference -ExclusionPath '${{ github.workspace }}'"
-          set "EXTRA_CMAKE_FLAGS=-DBUILD_SHELL=FALSE -DBUILD_SHARED_RIAG=FALSE -DBUILD_SINGLE_FILE_HEADER=FALSE -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_MSVC_STATIC_RT=FALSE -DOPENSSL_ROOT_DIR=%OPENSSL_ROOT_DIR:\=/%"
+          set "RIAG_LIB=%ENGINE_DIR:\=/%/riag.lib"
+          set "EXTRA_CMAKE_FLAGS=-DBUILD_RIAG=FALSE -DBUILD_SHELL=FALSE -DRIAG_API_USE_PRECOMPILED_LIB=TRUE -DRIAG_API_PRECOMPILED_LIB_PATH=%RIAG_LIB% -DRIAG_NODEJS_USE_PRECOMPILED_LIB=TRUE -DRIAG_NODEJS_PRECOMPILED_LIB_PATH=%RIAG_LIB% -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_MSVC_STATIC_RT=FALSE -DOPENSSL_ROOT_DIR=%OPENSSL_ROOT_DIR:\=/%"
           make GEN=Ninja nodejs
 
       # ---- package ----------------------------------------------------------
 
       - name: Assemble the binding directory
         shell: bash
+        env:
+          NODE_PLATFORM: ${{ matrix.node_platform }}
+          RELEASE_SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
           out="dist/riagraph-core"
@@ -214,12 +230,10 @@ jobs:
           {
             "engine": "riagraph",
             "repository": "https://github.com/${GITHUB_REPOSITORY}",
-            "branch": "${GITHUB_REF_NAME}",
-            "uncommittedChanges": false,
-            "commit": "${GITHUB_SHA}",
+            "commit": "${RELEASE_SHA}",
             "nodejsApiCommit": "$(git -C tools/nodejs_api rev-parse HEAD)",
             "version": "${version}",
-            "platform": "${{ matrix.platform }}",
+            "platform": "${NODE_PLATFORM}",
             "node": "$(node -v)",
             "openssl": "${openssl_version} (static)",
             "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
@@ -295,41 +309,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive="riagraph-nodejs-${VERSION}-${{ matrix.platform }}.tar.gz"
+          archive="riagraph-nodejs-${VERSION}-${{ matrix.node_platform }}.tar.gz"
           tar -C dist -czf "$archive" riagraph-core
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: riagraph-nodejs-${{ matrix.platform }}
+          name: asset-nodejs-${{ matrix.platform }}
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
-
-  release:
-    needs: build
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') || startsWith(github.ref, 'refs/tags/nodejs-v') }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: riagraph-nodejs-*
-          merge-multiple: true
-          path: assets
-      - name: Create the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-          PRERELEASE: ${{ github.event_name != 'workflow_dispatch' || inputs.prerelease }}
-        run: |
-          set -euo pipefail
-          cd assets
-          sha256sum riagraph-nodejs-*.tar.gz > SHA256SUMS
-          cat SHA256SUMS
-          flags=()
-          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
-          gh release create "$TAG" riagraph-nodejs-*.tar.gz SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" "${flags[@]}" \
-            --title "Node.js binaries $TAG" \
-            --notes "Self-contained Node.js bindings (OpenSSL linked statically; Linux glibc >= 2.28) built from ${GITHUB_SHA} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."

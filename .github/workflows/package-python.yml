@@ -1,0 +1,197 @@
+# Python source distribution and wheels.
+#
+# The sdist is `git archive` of the released tree plus the tools/python_api
+# submodule, so it carries exactly the released sources. The wheels are built
+# from that sdist with cibuildwheel, one job per platform, for every supported
+# CPython. They link the static libriag from build-engine.yml
+# (RIAG_API_PRECOMPILED_LIB_PATH) instead of compiling the engine for each
+# interpreter. OpenSSL 3 is excluded from the repaired wheels on purpose: users
+# supply their own.
+name: Package Python
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        description: "JSON list of platform objects from release-build.yml's plan job"
+        required: true
+        type: string
+      sha:
+        description: "Commit to build"
+        required: true
+        type: string
+      engine_run_id:
+        description: "Rehearsals only: take the engine from this earlier run instead of the current one"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  # Reading artifacts of another run (a rehearsal that reuses an earlier engine)
+  # needs this; the current run's own artifacts do not.
+  actions: read
+
+jobs:
+  sdist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/checkout-submodules
+        with:
+          paths: tools/python_api
+          token: ${{ secrets.GH_TOKEN_RIAGRAPH }}
+
+      - name: Package the sdist
+        run: python3 package_tar.py
+        working-directory: scripts/pip-package
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asset-python-sdist
+          path: scripts/pip-package/*.tar.gz
+          if-no-files-found: error
+
+  wheels:
+    name: wheels (${{ matrix.platform }})
+    needs: sdist
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.platforms) }}
+    env:
+      CIBW_PLATFORM: ${{ matrix.family }}
+      CIBW_ARCHS: ${{ matrix.cibw_archs }}
+      CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+      RIAG_PYTHON_PRECOMPILED_DIR: ${{ github.workspace }}/precompiled-libriag
+      RIAG_PYTHON_CIBW_SOURCE_DIR: ${{ github.workspace }}/scripts/pip-package/cibw-source/sdist
+
+      CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+      CIBW_BEFORE_ALL_LINUX: "command -v dnf && dnf install -y openssl3 openssl3-devel pkg-config && (ldconfig || true) && echo '-DOPENSSL_INCLUDE_DIR=/usr/include/openssl3 -DOPENSSL_CRYPTO_LIBRARY=/usr/lib64/libcrypto.so.3 -DOPENSSL_SSL_LIBRARY=/usr/lib64/libssl.so.3' > /tmp/riag_openssl_cmake_flags || apk add --no-cache openssl-dev pkgconfig"
+      # /project is the sdist tree inside the container; the engine is copied there below.
+      CIBW_ENVIRONMENT_LINUX: "RIAG_API_PRECOMPILED_LIB_PATH=/project/precompiled-libriag/libriag.a"
+      CIBW_ENVIRONMENT_MACOS: ${{ format('MACOSX_DEPLOYMENT_TARGET=15.0 RIAG_API_PRECOMPILED_LIB_PATH={0}/precompiled-libriag/libriag.a OPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR', github.workspace) }}
+      CIBW_ENVIRONMENT_WINDOWS: "DISTUTILS_USE_SDK=1 MSSdk=1 TMP=D:/t TEMP=D:/t RIAG_API_PRECOMPILED_LIB_PATH=$RIAG_API_PRECOMPILED_LIB_PATH"
+
+      # Exclude OpenSSL 3 from the repaired wheel on every platform
+      # so end users provide/update their own OpenSSL 3 runtime.
+      CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --exclude libssl.so.3 --exclude libcrypto.so.3 -w {dest_dir} {wheel}"
+      CIBW_REPAIR_WHEEL_COMMAND_MACOS: "delocate-wheel --require-archs {delocate_arch} --exclude libssl.3.dylib --exclude libcrypto.3.dylib -w {dest_dir} {wheel}"
+      CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair -w {dest_dir} --exclude libssl-3-x64.dll --exclude libcrypto-3-x64.dll {wheel}"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - name: Download the sdist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: asset-python-sdist
+          path: scripts/pip-package/
+
+      - name: Unpack the sdist
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdist="$(ls scripts/pip-package/*.tar.gz)"
+          rm -rf scripts/pip-package/cibw-source
+          mkdir -p scripts/pip-package/cibw-source
+          tar -xzf "$sdist" -C scripts/pip-package/cibw-source
+          ls scripts/pip-package/cibw-source
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: ./.github/actions/fetch-engine
+        with:
+          platform: ${{ matrix.platform }}
+          kind: static
+          dir: ${{ env.RIAG_PYTHON_PRECOMPILED_DIR }}
+          run-id: ${{ inputs.engine_run_id }}
+
+      - name: Put the engine into the wheel source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "${RIAG_PYTHON_CIBW_SOURCE_DIR}/precompiled-libriag"
+          mkdir -p "${RIAG_PYTHON_CIBW_SOURCE_DIR}/precompiled-libriag"
+          cp -R "${RIAG_PYTHON_PRECOMPILED_DIR}/." "${RIAG_PYTHON_CIBW_SOURCE_DIR}/precompiled-libriag/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "RIAG_API_PRECOMPILED_LIB_PATH=${RIAG_PYTHON_CIBW_SOURCE_DIR}/precompiled-libriag/riag.lib" >> "$GITHUB_ENV"
+          fi
+
+      # ---- platform toolchains ----------------------------------------------
+
+      - name: Install OpenSSL 3 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - name: Enable long paths and a scratch directory (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          git config --system core.longpaths true
+          New-Item -ItemType Directory -Force -Path D:\t | Out-Null
+
+      - name: Install OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Recent Windows images no longer ship C:/Program Files/OpenSSL,
+          # so download the Shining Light Productions installer directly
+          # (Inno Setup, silent).
+          $url = "https://slproweb.com/download/${{ matrix.openssl_exe }}"
+          $dst = "$env:RUNNER_TEMP\slp_openssl.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dst
+          Start-Process -FilePath $dst -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
+          if (-not (Test-Path "C:\Program Files\OpenSSL\include\openssl\ssl.h")) {
+            Write-Error "OpenSSL install not found at C:\Program Files\OpenSSL"
+            exit 1
+          }
+          "OPENSSL_ROOT_DIR=C:\Program Files\OpenSSL" >> $env:GITHUB_ENV
+
+      - name: Setup MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      # ---- wheels -----------------------------------------------------------
+
+      - name: Build wheels (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          powershell.exe -Command "Add-MpPreference -ExclusionPath '${{ github.workspace }}'"
+          pipx run --spec cibuildwheel cibuildwheel %RIAG_PYTHON_CIBW_SOURCE_DIR% --output-dir scripts\pip-package\wheelhouse
+          if errorlevel 1 exit /b 1
+
+      - name: Build wheels (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install uv
+          uv venv
+          source .venv/bin/activate
+          uv pip install cibuildwheel
+          python -m cibuildwheel --output-dir scripts/pip-package/wheelhouse "${RIAG_PYTHON_CIBW_SOURCE_DIR}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asset-python-wheels-${{ matrix.platform }}
+          path: scripts/pip-package/wheelhouse/*.whl
+          if-no-files-found: error

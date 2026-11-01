@@ -7,7 +7,7 @@ working native toolchain — on Windows in particular, where the core's
 `find_package(OpenSSL 3 REQUIRED)` is the usual blocker.
 
 The image tracks [`.github/docker/ubuntu-22.04-gcc13/Dockerfile`](../../.github/docker/ubuntu-22.04-gcc13/Dockerfile),
-which is what CI uses, so a result here means something about CI. Ubuntu 22.04 is the
+the reference toolchain image. The release build uses `manylinux_2_28` instead (see `docs/build_tips.md`). Ubuntu 22.04 is the
 floor: it is the oldest Ubuntu that ships OpenSSL 3.
 
 | Component | Version |

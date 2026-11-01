@@ -2,8 +2,9 @@
 #
 # A reproducible Linux toolchain for building and testing the core, used to run the
 # Phase 9 verification in docs/riagraph-fork-plan.md from any host. It is deliberately
-# close to .github/docker/ubuntu-22.04-gcc13/Dockerfile, which is what CI uses, so that
-# a result here means something about CI.
+# close to .github/docker/ubuntu-22.04-gcc13/Dockerfile, the reference toolchain image,
+# so that a result here means something about the other Linux builds. (The release build
+# uses manylinux_2_28, see docs/build_tips.md.)
 #
 # Ubuntu 22.04 is the floor: it ships OpenSSL 3.0, which the core requires
 # (find_package(OpenSSL 3 REQUIRED) in CMakeLists.txt).

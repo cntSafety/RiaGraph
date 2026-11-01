@@ -1,76 +1,64 @@
-name: Build Precompiled Binaries
+# Compiles the RiaGraph engine, once per platform, for a release build.
+#
+# Everything else in release-build.yml (Python wheels, the Node.js binding, the
+# Java native library, the Rust crate) links against what is built here instead
+# of compiling the engine again. The archives keep the names that
+# scripts/download-libriag.sh and the bindings' own download scripts look for.
+#
+#   libriag-<os>-<arch>                shared library + headers
+#   libriag-static-<os>-<arch>[-compat] static library + headers (what the bindings link)
+#   riag_cli-<os>-<arch>               the command line shell
+#
+# Linux is built in manylinux_2_28 with gcc-toolset-13 and -static-libstdc++, so
+# the result loads on any glibc >= 2.28 system.
+#
+# Only the RiaGraph tree itself is needed: the engine does not use the
+# submodules, so none are checked out here.
+name: Build engine
 
 on:
-  workflow_dispatch:
   workflow_call:
     inputs:
-      isNightly:
-        type: boolean
+      platforms:
+        description: "JSON list of platform objects from release-build.yml's plan job"
         required: true
-        default: false
+        type: string
+      sha:
+        description: "Commit to build"
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
 
 jobs:
-  build-precompiled-bin:
-    strategy:
-      matrix:
-        include:
-          # Linux compat: broad glibc compatibility via manylinux_2_28 containers,
-          # gcc-toolset-13 with -static-libstdc++. Produces shared + static + CLI.
-          - os: ubuntu-latest
-            container: quay.io/pypa/manylinux_2_28_x86_64
-            variant: compat
-            arch: x86_64
-          - os: ubuntu-24.04-arm
-            container: quay.io/pypa/manylinux_2_28_aarch64
-            variant: compat
-            arch: aarch64
-          # Linux perf: LLVM 21 on a modern runner. Static library only (for
-          # use by language bindings such as Node.js and Java).
-          - os: ubuntu-24.04
-            variant: perf
-            arch: x86_64
-          - os: ubuntu-24.04-arm
-            variant: perf
-            arch: aarch64
-          # macOS Intel (x86_64). Produces shared + static + CLI.
-          - os: macos-15-intel
-            arch: x86_64
-          # macOS Apple Silicon (arm64). Produces shared + static + CLI.
-          - os: macos-latest
-            arch: arm64
-          # Windows x86_64. Produces shared + static + CLI.
-          - os: windows-2022
-            arch: x86_64
-            msvc_arch: x64
-            openssl_exe: Win64OpenSSL_Light-3_5_9.exe
-          # Windows ARM64. Produces shared + static + CLI.
-          - os: windows-11-arm
-            arch: arm64
-            msvc_arch: arm64
-            openssl_exe: Win64ARMOpenSSL_Light-3_5_9.exe
+  engine:
+    name: engine (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.platforms) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
 
-      # ---- Dependency installation ----
+      # ---- Dependencies -----------------------------------------------------
 
-      - name: Install build dependencies (Linux compat)
-        if: runner.os == 'Linux' && matrix.variant == 'compat'
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
+          git config --global --add safe.directory '*'
           dnf install -y 'dnf-command(config-manager)'
           dnf config-manager --set-enabled powertools
-          dnf install -y cmake ninja-build python3 python3-pip git ccache gcc-toolset-13 openssl3 openssl3-devel pkg-config
-
-      - name: Install build dependencies (Linux perf)
-        if: runner.os == 'Linux' && matrix.variant == 'perf'
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y cmake ninja-build python3 python3-pip git ccache curl libssl-dev pkg-config
-          curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          dnf install -y cmake ninja-build python3 python3-pip git gcc-toolset-13 openssl3 openssl3-devel pkg-config
 
       - name: Install uv (Linux)
         if: runner.os == 'Linux'
@@ -82,81 +70,6 @@ jobs:
         if: runner.os != 'Linux'
         run: python3 -m pip install uv
 
-      # ---- ccache ----
-
-      - name: Setup ccache (Linux)
-        if: runner.os == 'Linux'
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: precompiled-bin-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ github.ref }}
-          max-size: 2G
-          restore-keys: |
-            precompiled-bin-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-refs/heads/main
-            precompiled-bin-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-
-
-      - name: Setup ccache (macOS)
-        if: runner.os == 'macOS'
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: precompiled-bin-${{ runner.os }}-${{ matrix.arch }}-${{ github.ref }}
-          max-size: 2G
-          restore-keys: |
-            precompiled-bin-${{ runner.os }}-${{ matrix.arch }}-refs/heads/main
-            precompiled-bin-${{ runner.os }}-${{ matrix.arch }}-
-
-      - name: Setup ccache (Windows)
-        if: runner.os == 'Windows'
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: precompiled-bin-${{ runner.os }}-${{ matrix.arch }}-${{ github.ref }}
-          max-size: 2G
-          restore-keys: |
-            precompiled-bin-${{ runner.os }}-${{ matrix.arch }}-refs/heads/main
-            precompiled-bin-${{ runner.os }}-${{ matrix.arch }}-
-
-      # ---- Optional nightly version bump ----
-
-      - name: Update nightly version
-        if: ${{ inputs.isNightly == true }}
-        shell: bash
-        run: |
-          uv venv
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            source .venv/Scripts/activate
-          else
-            source .venv/bin/activate
-          fi
-          python3 update-nightly-build-version.py
-        working-directory: scripts
-
-      # ---- Build ----
-
-      - name: Build (Linux compat)
-        if: runner.os == 'Linux' && matrix.variant == 'compat'
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: ccache
-          CMAKE_CXX_COMPILER_LAUNCHER: ccache
-        run: |
-          source /opt/rh/gcc-toolset-13/enable
-          export CC=gcc
-          export CXX=g++
-          export LDFLAGS="-static-libstdc++"
-          # Ensure CMake finds OpenSSL 3 installed by openssl3 packages inside the manylinux container
-          export EXTRA_CMAKE_FLAGS="-DOPENSSL_ROOT_DIR=/usr/lib64/openssl3 -DOPENSSL_INCLUDE_DIR=/usr/include/openssl3 -DOPENSSL_CRYPTO_LIBRARY=/usr/lib64/openssl3/libcrypto.so -DOPENSSL_SSL_LIBRARY=/usr/lib64/openssl3/libssl.so"
-          make GEN=Ninja
-          make install
-
-      - name: Build (Linux perf)
-        if: runner.os == 'Linux' && matrix.variant == 'perf'
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: ccache
-          CMAKE_CXX_COMPILER_LAUNCHER: ccache
-          CC: clang-21
-          CXX: clang++-21
-        run: |
-          make GEN=Ninja
-          make install
-
       - name: Install OpenSSL 3 (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -166,17 +79,8 @@ jobs:
           # guard in CMakeLists.txt. OPENSSL_ROOT_DIR is honored by CMake's
           # FindOpenSSL and propagated to `make` via the environment.
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          brew list ninja >/dev/null 2>&1 || brew install ninja
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: ccache
-          CMAKE_CXX_COMPILER_LAUNCHER: ccache
-          MACOSX_DEPLOYMENT_TARGET: 13.3
-        run: |
-          make GEN=Ninja
-          make install
 
       - name: Enable long paths (Windows)
         if: runner.os == 'Windows'
@@ -191,7 +95,7 @@ jobs:
         run: |
           # Recent Windows images no longer ship C:/Program Files/OpenSSL,
           # so download the Shining Light Productions installer directly
-          # (Inno Setup, silent). winget is not available on windows-11-arm.
+          # (Inno Setup, silent).
           $url = "https://slproweb.com/download/${{ matrix.openssl_exe }}"
           $dst = "$env:RUNNER_TEMP\slp_openssl.exe"
           Invoke-WebRequest -Uri $url -OutFile $dst
@@ -208,37 +112,49 @@ jobs:
         with:
           arch: ${{ matrix.msvc_arch }}
 
+      # ---- Build ------------------------------------------------------------
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          export CC=gcc
+          export CXX=g++
+          export LDFLAGS="-static-libstdc++"
+          # Ensure CMake finds OpenSSL 3 installed by openssl3 packages inside the manylinux container
+          export EXTRA_CMAKE_FLAGS="-DOPENSSL_ROOT_DIR=/usr/lib64/openssl3 -DOPENSSL_INCLUDE_DIR=/usr/include/openssl3 -DOPENSSL_CRYPTO_LIBRARY=/usr/lib64/openssl3/libcrypto.so -DOPENSSL_SSL_LIBRARY=/usr/lib64/openssl3/libssl.so"
+          make GEN=Ninja
+          make install
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: 13.3
+        run: |
+          make GEN=Ninja
+          make install
+
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: cmd
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: ccache
-          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           powershell.exe -Command "Add-MpPreference -ExclusionPath '${{ github.workspace }}'"
           make GEN=Ninja
           make install
 
-      # ---- Collect artifacts ----
+      # ---- Collect artifacts ------------------------------------------------
 
-      - name: Collect artifacts (Linux compat)
-        if: runner.os == 'Linux' && matrix.variant == 'compat'
+      - name: Collect artifacts (Linux)
+        if: runner.os == 'Linux'
         run: |
           cp install/include/riag.h .
           cp install/include/riag.hpp .
           # Preserve the versioned SONAME symlink chain so that consumers
           # linking against libriag.so can resolve the SONAME (libriag.so.0)
-          # at load time. See precompiled-bin-workflow.yml SONAME check below.
+          # at load time.
           cp -P install/lib*/libriag.so install/lib*/libriag.so.* .
           cp -L install/lib*/libriag.a .
           cp install/bin/riag .
-
-      - name: Collect artifacts (Linux perf)
-        if: runner.os == 'Linux' && matrix.variant == 'perf'
-        run: |
-          cp install/include/riag.h .
-          cp install/include/riag.hpp .
-          cp -L install/lib*/libriag.a .
 
       - name: Collect artifacts (macOS)
         if: runner.os == 'macOS'
@@ -247,7 +163,7 @@ jobs:
           cp install/include/riag.hpp .
           # Preserve the versioned install_name symlink chain so that consumers
           # linking against libriag.dylib can resolve @rpath/libriag.0.dylib
-          # at load time. See precompiled-bin-workflow.yml install_name check below.
+          # at load time.
           cp -P install/lib/libriag.dylib install/lib/libriag.*.dylib .
           cp -L install/lib/libriag.a .
           cp install/bin/riag .
@@ -271,10 +187,10 @@ jobs:
           Copy-Item install\lib\riag.lib .
           Copy-Item install\bin\riag_shell.exe riag.exe
 
-      # ---- Create archives ----
+      # ---- Archives ---------------------------------------------------------
 
-      - name: Create tarballs (Linux compat)
-        if: runner.os == 'Linux' && matrix.variant == 'compat'
+      - name: Create tarballs (Linux)
+        if: runner.os == 'Linux'
         run: |
           # libriag.so, libriag.so.0, libriag.so.0.15.3: unversioned link-time
           # name, SONAME, and real file. The latter two are symlinks preserved
@@ -282,11 +198,6 @@ jobs:
           tar -czvf libriag-linux-${{ matrix.arch }}.tar.gz riag.h riag.hpp libriag.so libriag.so.*
           tar -czvf libriag-static-linux-${{ matrix.arch }}-compat.tar.gz riag.h riag.hpp libriag.a
           tar -czvf riag_cli-linux-${{ matrix.arch }}.tar.gz riag
-
-      - name: Create tarballs (Linux perf)
-        if: runner.os == 'Linux' && matrix.variant == 'perf'
-        run: |
-          tar -czvf libriag-static-linux-${{ matrix.arch }}-perf.tar.gz riag.h riag.hpp libriag.a
 
       - name: Create tarballs (macOS)
         if: runner.os == 'macOS'
@@ -307,7 +218,7 @@ jobs:
           Compress-Archive -Path riag.h, riag.hpp, riag.lib -DestinationPath libriag-static-windows-${{ matrix.arch }}.zip
           Compress-Archive -Path riag.exe -DestinationPath riag_cli-windows-${{ matrix.arch }}.zip
 
-      # ---- Verify shared-library tarball self-consistency ----
+      # ---- Verify shared-library tarball self-consistency -------------------
       # Guards against the class of bug where the tarball's on-disk filenames
       # don't match the SONAME / install_name embedded in the shared library.
       # A consumer linking -lriag resolves the link-time name (libriag.so /
@@ -315,8 +226,8 @@ jobs:
       # binary; that stamped name is what the dynamic loader then looks up at
       # runtime, so it has to be present in the tarball too.
 
-      - name: Verify tarball SONAME consistency (Linux compat)
-        if: runner.os == 'Linux' && matrix.variant == 'compat'
+      - name: Verify tarball SONAME consistency (Linux)
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           tarball=libriag-linux-${{ matrix.arch }}.tar.gz
@@ -342,63 +253,57 @@ jobs:
             exit 1
           fi
 
-      # ---- Upload artifacts ----
+      # ---- Upload -----------------------------------------------------------
 
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'Linux' && matrix.variant == 'compat'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: runner.os == 'Linux'
         with:
           name: libriag-linux-${{ matrix.arch }}
           path: libriag-linux-${{ matrix.arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'Linux' && matrix.variant == 'compat'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: runner.os == 'Linux'
         with:
           name: libriag-static-linux-${{ matrix.arch }}-compat
           path: libriag-static-linux-${{ matrix.arch }}-compat.tar.gz
 
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'Linux' && matrix.variant == 'compat'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: runner.os == 'Linux'
         with:
           name: riag_cli-linux-${{ matrix.arch }}
           path: riag_cli-linux-${{ matrix.arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'Linux' && matrix.variant == 'perf'
-        with:
-          name: libriag-static-linux-${{ matrix.arch }}-perf
-          path: libriag-static-linux-${{ matrix.arch }}-perf.tar.gz
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: runner.os == 'macOS'
         with:
           name: libriag-osx-${{ matrix.arch }}
           path: libriag-osx-${{ matrix.arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: runner.os == 'macOS'
         with:
           name: libriag-static-osx-${{ matrix.arch }}
           path: libriag-static-osx-${{ matrix.arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: runner.os == 'macOS'
         with:
           name: riag_cli-osx-${{ matrix.arch }}
           path: riag_cli-osx-${{ matrix.arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: runner.os == 'Windows'
         with:
           name: libriag-windows-${{ matrix.arch }}
           path: libriag-windows-${{ matrix.arch }}.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: runner.os == 'Windows'
         with:
           name: libriag-static-windows-${{ matrix.arch }}
           path: libriag-static-windows-${{ matrix.arch }}.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: runner.os == 'Windows'
         with:
           name: riag_cli-windows-${{ matrix.arch }}

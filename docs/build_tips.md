@@ -67,14 +67,13 @@ make release SINGLE_THREADED=1
 
 ## Benchmarking Against Release Builds
 
-Release libraries are built by `precompiled-bin-workflow.yml` with `make GEN=Ninja`. A local build only compares with a release when it uses the same compiler and settings:
+Release libraries are built by `build-engine.yml` (started from `release-build.yml`) with `make GEN=Ninja`. A local build only compares with a release when it uses the same compiler and settings:
 
 | Release | Compiler | Settings |
 |---|---|---|
-| Linux x86_64 and aarch64, compat: shared library, CLI, and the static library the Python wheels link | `gcc-toolset-13` in a `manylinux_2_28` container | `LDFLAGS=-static-libstdc++` |
-| Linux x86_64 and aarch64, perf: static library for bindings such as Node.js and Java | `clang-21` from apt.llvm.org on Ubuntu 24.04 | `CC=clang-21 CXX=clang++-21` |
-| macOS x86_64 and arm64 | the runner's Apple Clang | `MACOSX_DEPLOYMENT_TARGET=13.3` |
-| Windows x64 and ARM64 | MSVC | |
+| Linux x86_64, compat: shared library, CLI, and the static library the bindings link | `gcc-toolset-13` in a `manylinux_2_28` container | `LDFLAGS=-static-libstdc++` |
+| macOS arm64 | the runner's Apple Clang | `MACOSX_DEPLOYMENT_TARGET=13.3` |
+| Windows x64 | MSVC | |
 
 On every platform, start from an empty `build/release` (`rm -rf build/release`, or `BUILD_PATH=<dir>` for a new one). `make test-build-release` and `make all` leave `BUILD_TESTS=TRUE` (the former also `ENABLE_BACKTRACES=TRUE`) in its cache, where a later `make python` keeps it; `BUILD_TESTS` exports every symbol, and such a build used 2–5% more instructions on Ubuntu 24.04 x86_64. CMake also reads `CC`, `CXX`, `CFLAGS` and `CXXFLAGS` only when it first configures a directory.
 

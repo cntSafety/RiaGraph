@@ -71,7 +71,7 @@ if __name__ == "__main__":
         shutil.rmtree(os.path.join(tempdir, "riagraph-source/test"))
         shutil.rmtree(os.path.join(tempdir, "riagraph-source/.github"))
 
-        os.makedirs(os.path.join(tempdir, "riagraph"))
+        os.makedirs(os.path.join(tempdir, "riag"))
         for path in ["setup.py", "setup.cfg", "MANIFEST.in"]:
             shutil.copy2(path, os.path.join(tempdir, path))
         shutil.copy2("../../LICENSE", os.path.join(tempdir, "LICENSE"))

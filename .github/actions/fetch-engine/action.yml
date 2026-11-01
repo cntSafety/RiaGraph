@@ -1,0 +1,73 @@
+name: Fetch the engine build
+description: >
+  Downloads the libriag / CLI archive that build-engine.yml produced for one
+  platform in this run and unpacks it. Every package build starts from this, so
+  the engine is compiled once per platform and nothing else compiles it again.
+
+inputs:
+  platform:
+    description: "linux-x64, macos-arm64 or windows-x64"
+    required: true
+  kind:
+    description: "static (libriag.a / riag.lib + headers), shared or cli"
+    required: false
+    default: static
+  dir:
+    description: "Where to unpack the archive"
+    required: true
+  run-id:
+    description: "Take the artifact from this run of the same repository instead of the current one (rehearsals only)"
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # The archive names are the ones download-libriag.sh and the language
+    # bindings' download scripts look for, so a release asset and a run artifact
+    # are interchangeable.
+    - name: Resolve the artifact name
+      id: names
+      shell: bash
+      env:
+        PLATFORM: ${{ inputs.platform }}
+        KIND: ${{ inputs.kind }}
+      run: |
+        set -euo pipefail
+        case "$PLATFORM" in
+          linux-x64)   os=linux;   arch=x86_64; ext=tar.gz; variant=-compat ;;
+          macos-arm64) os=osx;     arch=arm64;  ext=tar.gz; variant= ;;
+          windows-x64) os=windows; arch=x86_64; ext=zip;    variant= ;;
+          *) echo "::error::unknown platform '$PLATFORM'"; exit 1 ;;
+        esac
+        case "$KIND" in
+          static) name="libriag-static-$os-$arch$variant" ;;
+          shared) name="libriag-$os-$arch" ;;
+          cli)    name="riag_cli-$os-$arch" ;;
+          *) echo "::error::unknown kind '$KIND'"; exit 1 ;;
+        esac
+        echo "artifact=$name" >> "$GITHUB_OUTPUT"
+        echo "archive=$name.$ext" >> "$GITHUB_OUTPUT"
+
+    - name: Download ${{ steps.names.outputs.artifact }}
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        name: ${{ steps.names.outputs.artifact }}
+        path: engine-download/${{ steps.names.outputs.artifact }}
+        run-id: ${{ inputs.run-id || github.run_id }}
+        github-token: ${{ github.token }}
+
+    - name: Unpack ${{ steps.names.outputs.archive }}
+      shell: bash
+      env:
+        ARCHIVE: engine-download/${{ steps.names.outputs.artifact }}/${{ steps.names.outputs.archive }}
+        TARGET: ${{ inputs.dir }}
+      run: |
+        set -euo pipefail
+        [ -f "$ARCHIVE" ] || { echo "::error::$ARCHIVE is not in the artifact"; ls -R engine-download; exit 1; }
+        mkdir -p "$TARGET"
+        case "$ARCHIVE" in
+          *.zip) unzip -o -q "$ARCHIVE" -d "$TARGET" ;;
+          *)     tar -xzf "$ARCHIVE" -C "$TARGET" ;;
+        esac
+        ls -la "$TARGET"

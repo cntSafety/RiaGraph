@@ -22,20 +22,31 @@ git grep -n 'RIAG-TODO(infra'
 
 | Topic | Where | What is missing | What would unblock it |
 |---|---|---|---|
-| `infra-benchmark-runners` | `.github/workflows/benchmark-workflow.yml`, `.github/workflows/lsqb-benchmark-workflow.yml` | Dedicated benchmark machines with a consistent specification. `lsqb` additionally installs a wheel from PyPI that RiaGraph does not publish. | Self-hosted runners with a stable hardware profile, plus a decision on registry publication (open item O3). Benchmark numbers from shared GitHub runners are noise. |
-| `infra-builder-image` | `.github/workflows/build-and-deploy.yml`, `.github/workflows/java-workflow.yml`, `.github/workflows/nodejs-workflow.yml` | `ghcr.io/cntsafety/ubuntu-22.04-gcc13`. The reference is renamed into our namespace, but the image has never been built or pushed. | Build `.github/docker/ubuntu-22.04-gcc13/Dockerfile` and publish it to GHCR under `cntSafety`. This is the cheapest row here and unblocks three workflows. |
-| `infra-extension-repo` | `.github/workflows/deploy-extension.yml`, `.github/workflows/purge-extension.yml`, `.github/workflows/build-and-deploy-extension.yml`, `.github/workflows/get-extensions-from-ghcr.yml` | `ghcr.io/cntsafety/extension-repo` and the CDN-fronted deploy target behind it. | **Superseded by Phase 6.** Extensions are now published to GitHub Pages by `cntSafety/RiaGraphExtension/.github/workflows/publish-pages.yml`, which is what `OFFICIAL_EXTENSION_REPO` resolves against. These four workflows describe the mechanism they replaced. Reconcile — most likely by removing them — rather than reviving them. |
-| `infra-api-docs` | `.github/workflows/gen-docs.yml` | A RiaGraph equivalent of `LadybugDB/api-docs`, and the `DOC_PUSH_TOKEN` secret. | Decide where generated API documentation should live. The checkout still names the **upstream** repository: that reference is deliberately left alone because renaming it would invent a repository name, and the workflow cannot run without the secret. Do not point it at an upstream repository we can push to. |
 | `infra-musl-runner` | `.github/workflows/ci-musl-test-workflow.yml` | Nothing missing, but unverified. | The runner workspace path is derived from the repository name and is now `/__w/RiaGraph/RiaGraph`. The mechanical rename produced a lowercase `riagraph`, which would have been wrong; it is corrected. Confirm on a real runner. |
+
+## Removed
+
+The other rows were resolved by deleting the workflows instead of building the
+infrastructure they needed:
+
+- `infra-benchmark-runners`: `benchmark-workflow.yml`, `lsqb-benchmark-workflow.yml`
+- `infra-builder-image`: `build-and-deploy.yml`, `java-workflow.yml`, `nodejs-workflow.yml`.
+  The release build (`release-build.yml`) builds in `manylinux_2_28` instead of the GHCR image.
+- `infra-extension-repo`: `deploy-extension.yml`, `purge-extension.yml`,
+  `build-and-deploy-extension.yml`, `get-extensions-from-ghcr.yml`, `build-extensions.yml`.
+  Extensions are published to GitHub Pages by `RiaGraphExtension`.
+- `infra-api-docs`: `gen-docs.yml`, which pushed to an upstream repository.
+
+`nightly-sanitizers.yml` went with them (the sanitizer runs live in the verification
+repository), and so did the old release path: `precompiled-bin-workflow.yml`,
+`python-wheel-workflow.yml`, `wasm-workflow.yml`, `nodejs-binaries.yml` and
+`release-artifacts.yml`, all replaced by `release-build.yml` (see
+[`release-process.md`](release-process.md)). Git history has all of them.
 
 ## Not in this register
 
-These inherited workflows carry no marker and are expected to work once the rename lands.
-If one of them fails, that is a bug to fix, not an infrastructure decision:
-
-`ci-workflow.yml`, `codeql.yml`, `nightly-sanitizers.yml`, `zizmor.yml`,
-`wasm-workflow.yml`, `python-wheel-workflow.yml`, `precompiled-bin-workflow.yml`,
-`release-artifacts.yml`, `build-extensions.yml`.
+`ci-workflow.yml`, `codeql.yml` and `zizmor.yml` carry no marker and are expected to work.
+If one of them fails, that is a bug to fix, not an infrastructure decision.
 
 ## Observed consequence
 

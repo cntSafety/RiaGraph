@@ -1,0 +1,225 @@
+# Java: one JNI library per platform, then one multiplatform jar.
+#
+# The native job compiles only src/jni/riag_java.cpp and links the static libriag
+# from build-engine.yml. The assemble job puts the libraries of all selected
+# platforms into the jar's resources and runs the Gradle build, tests included,
+# on Linux — which is why release-build.yml requires linux-x64 for Java.
+#
+# Linux is built in manylinux_2_28 like the engine, so the library loads on any
+# glibc >= 2.28 system. It needs OpenSSL 3 at run time, as the shared libriag does.
+name: Package Java
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        description: "JSON list of platform objects from release-build.yml's plan job"
+        required: true
+        type: string
+      sha:
+        description: "Commit to build"
+        required: true
+        type: string
+      engine_run_id:
+        description: "Rehearsals only: take the engine from this earlier run instead of the current one"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  # Reading artifacts of another run (a rehearsal that reuses an earlier engine)
+  # needs this; the current run's own artifacts do not.
+  actions: read
+
+jobs:
+  native:
+    name: native (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.platforms) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/checkout-submodules
+        with:
+          paths: tools/java_api
+          token: ${{ secrets.GH_TOKEN_RIAGRAPH }}
+
+      # Not ${{ github.workspace }}: in a container job that is the host's path.
+      - name: Locate the engine directory
+        shell: bash
+        run: echo "ENGINE_DIR=$GITHUB_WORKSPACE/precompiled-libriag" >> "$GITHUB_ENV"
+
+      - uses: ./.github/actions/fetch-engine
+        with:
+          platform: ${{ matrix.platform }}
+          kind: static
+          dir: precompiled-libriag
+          run-id: ${{ inputs.engine_run_id }}
+
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # ---- toolchains -------------------------------------------------------
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled powertools
+          dnf install -y cmake ninja-build python3 git gcc-toolset-13 openssl3 openssl3-devel pkg-config
+
+      - name: Install OpenSSL 3 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Pin to OpenSSL 3: the top-level CMakeLists enforces it, and
+          # Homebrew now also ships openssl@4.
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - name: Enable long paths (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          git config --system core.longpaths true
+
+      - name: Install OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://slproweb.com/download/${{ matrix.openssl_exe }}"
+          $dst = "$env:RUNNER_TEMP\slp_openssl.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dst
+          Start-Process -FilePath $dst -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
+          if (-not (Test-Path "C:\Program Files\OpenSSL\include\openssl\ssl.h")) {
+            Write-Error "OpenSSL install not found at C:\Program Files\OpenSSL"
+            exit 1
+          }
+          "OPENSSL_ROOT_DIR=C:\Program Files\OpenSSL" >> $env:GITHUB_ENV
+
+      - name: Setup MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      # ---- build ------------------------------------------------------------
+
+      - name: Build the JNI library (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          export CC=gcc CXX=g++ LDFLAGS="-static-libstdc++"
+          export EXTRA_CMAKE_FLAGS="-DBUILD_RIAG=FALSE -DBUILD_SHELL=FALSE -DRIAG_API_USE_PRECOMPILED_LIB=TRUE -DRIAG_API_PRECOMPILED_LIB_PATH=${ENGINE_DIR}/libriag.a -DOPENSSL_ROOT_DIR=/usr/lib64/openssl3 -DOPENSSL_INCLUDE_DIR=/usr/include/openssl3 -DOPENSSL_CRYPTO_LIBRARY=/usr/lib64/openssl3/libcrypto.so -DOPENSSL_SSL_LIBRARY=/usr/lib64/openssl3/libssl.so"
+          make GEN=Ninja java
+
+      - name: Build the JNI library (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.3"
+        run: |
+          export EXTRA_CMAKE_FLAGS="-DBUILD_RIAG=FALSE -DBUILD_SHELL=FALSE -DRIAG_API_USE_PRECOMPILED_LIB=TRUE -DRIAG_API_PRECOMPILED_LIB_PATH=${ENGINE_DIR}/libriag.a"
+          make GEN=Ninja java
+
+      - name: Build the JNI library (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          powershell.exe -Command "Add-MpPreference -ExclusionPath '${{ github.workspace }}'"
+          set "EXTRA_CMAKE_FLAGS=-DBUILD_RIAG=FALSE -DBUILD_SHELL=FALSE -DRIAG_API_USE_PRECOMPILED_LIB=TRUE -DRIAG_API_PRECOMPILED_LIB_PATH=%ENGINE_DIR:\=/%/riag.lib"
+          make GEN=Ninja java
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: java-lib-${{ matrix.platform }}
+          path: tools/java_api/build/libriag_java_native*
+          if-no-files-found: error
+
+  assemble:
+    name: jar
+    needs: native
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SKIP_CMAKE_BUILD: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # dataset: the Java tests read it.
+      - uses: ./.github/actions/checkout-submodules
+        with:
+          paths: tools/java_api dataset
+          token: ${{ secrets.GH_TOKEN_RIAGRAPH }}
+
+      - name: Download the native libraries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: java-lib-*
+          merge-multiple: true
+          path: tools/java_api/src/main/resources
+
+      - name: Show the native libraries in the jar
+        run: ls -l tools/java_api/src/main/resources
+
+      - name: Build and test the jar
+        working-directory: tools/java_api
+        run: ./gradlew build --stacktrace --info --warning-mode all --no-parallel --max-workers=1
+
+      - name: Upload Java test diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: java-test-diagnostics
+          path: |
+            tools/java_api/build/test-results/test
+            tools/java_api/build/reports/tests/test
+            tools/java_api/build/hs_err_pid*.log
+          if-no-files-found: ignore
+
+      # The layout Maven Central expects. It is not uploaded anywhere; it is
+      # attached to the release so that publishing it later needs no rebuild.
+      - name: Create the Maven bundle
+        working-directory: tools/java_api
+        run: |
+          set -euo pipefail
+          here="$(pwd)"
+          ./gradlew publishMavenJavaToLocalRepo -i
+          cd build/repo
+          zip -r riag-java-bundle.zip com
+          mv riag-java-bundle.zip "$here"
+
+      # One flat directory: the release job attaches every file at the top of
+      # the downloaded artifacts.
+      - name: Collect the release files
+        working-directory: tools/java_api
+        run: |
+          set -euo pipefail
+          mkdir release-files
+          cp build/libs/riag*.jar riag-java-bundle.zip release-files/
+          ls -l release-files
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asset-java
+          path: tools/java_api/release-files/*
+          if-no-files-found: error

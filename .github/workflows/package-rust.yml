@@ -1,0 +1,78 @@
+# The Rust crate.
+#
+# `cargo package` builds the crate it just packed, which is the check that the
+# files listed in Cargo.toml are enough to build from. The crate's build script
+# would normally download a prebuilt libriag; here it finds the engine from
+# build-engine.yml already in its cache directory and links that, so nothing
+# compiles the engine again.
+#
+# riag-src is the link back to the RiaGraph tree the crate bundles its engine
+# sources from (see Cargo.toml `include`). The packed .crate therefore contains
+# the released sources.
+name: Package Rust
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: "Commit to build"
+        required: true
+        type: string
+      engine_run_id:
+        description: "Rehearsals only: take the engine from this earlier run instead of the current one"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  # Reading artifacts of another run (a rehearsal that reuses an earlier engine)
+  # needs this; the current run's own artifacts do not.
+  actions: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RIAG_SOURCE_DIR: ${{ github.workspace }}
+      RIAG_LINUX_VARIANT: compat
+      # The build script looks for the engine under <cache>/run-<id>-compat/lib
+      # before it tries to download anything.
+      RIAG_PRECOMPILED_RUN_ID: ${{ github.run_id }}
+      RIAG_GITHUB_REPOSITORY: ${{ github.repository }}
+      RIAG_PREBUILT_CACHE_DIR: ${{ github.workspace }}/rust-engine-cache
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/checkout-submodules
+        with:
+          paths: tools/rust_api
+          token: ${{ secrets.GH_TOKEN_RIAGRAPH }}
+
+      - uses: ./.github/actions/fetch-engine
+        with:
+          platform: linux-x64
+          kind: static
+          dir: ${{ env.RIAG_PREBUILT_CACHE_DIR }}/run-${{ github.run_id }}-compat/lib
+          run-id: ${{ inputs.engine_run_id }}
+
+      - name: Link the RiaGraph tree into the crate
+        run: ln -s "$(pwd)" tools/rust_api/riag-src
+
+      - name: Update the crate version
+        run: python3 update_version.py
+        working-directory: tools/rust_api
+
+      - name: Package and build the crate
+        run: cargo package --allow-dirty
+        working-directory: tools/rust_api
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asset-rust
+          path: tools/rust_api/target/package/*.crate
+          if-no-files-found: error

@@ -1,0 +1,80 @@
+# The WebAssembly package.
+#
+# This is the one target that does not use build-engine.yml: the engine is
+# cross-compiled with Emscripten, which has its own toolchain and no native
+# platform. It is built once, on Linux, and the package works everywhere.
+#
+# The package has no extensions. It used to link httpfs statically
+# (-DBUILD_EXTENSIONS=httpfs), but the extension submodule still declares its
+# classes in namespace lbug while the engine is riag, so the generated extension
+# loader does not compile. Once RiaGraphExtension is ported, check out
+# `extension` again below and restore EXTRA_CMAKE_FLAGS.
+name: Package WebAssembly
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: "Commit to build"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      # dataset: the API tests.
+      - uses: ./.github/actions/checkout-submodules
+        with:
+          paths: tools/wasm dataset
+          token: ${{ secrets.GH_TOKEN_RIAGRAPH }}
+
+      - name: Install CMake and Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install dependencies
+        working-directory: tools/wasm
+        run: npm ci
+
+      - name: Setup Emscripten
+        run: |
+          if [ ! -d /home/runner/emsdk ]; then
+            git clone https://github.com/emscripten-core/emsdk.git /home/runner/emsdk
+          fi
+          cd /home/runner/emsdk
+          ./emsdk install latest
+          ./emsdk activate latest
+
+      - name: Verify Emscripten
+        run: |
+          source /home/runner/emsdk/emsdk_env.sh
+          emcc -v
+
+      - name: Build the WebAssembly package
+        working-directory: tools/wasm
+        env:
+          GEN: Ninja
+        run: |
+          source /home/runner/emsdk/emsdk_env.sh
+          npm run build
+
+      - name: API test
+        working-directory: tools/wasm
+        run: npm run test
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asset-wasm
+          path: tools/wasm/riag-wasm.tar.gz
+          if-no-files-found: error
