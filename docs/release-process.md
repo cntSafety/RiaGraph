@@ -21,8 +21,10 @@ and are never published.
 
 1. Run **Release (all repos)** (`release-all-repos.yml`) with the version, e.g.
    `v0.22.0`, and `kind`. It releases every Dev repository, pins the
-   submodules of RiaGraphDev to the released commits (`release/<version>`) and
-   creates the RiaGraphDev release.
+   submodules of RiaGraphDev to the released commits and sets the build version
+   in `CMakeLists.txt` to the release number (both on `release/<version>`), and
+   creates the RiaGraphDev release. The version line is where the engine and
+   every package take their version from; a prerelease suffix is dropped.
 2. `kind: prerelease` stops there. Everything stays in the Dev repositories,
    and nothing is built.
 3. `kind: release` continues with **Publish to public repositories**
