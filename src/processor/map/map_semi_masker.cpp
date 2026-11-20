@@ -1,6 +1,7 @@
 #include "function/gds/gds.h"
 #include "planner/operator/sip/logical_semi_masker.h"
 #include "processor/operator/recursive_extend.h"
+#include "processor/operator/scan/primary_key_scan_node_table.h"
 #include "processor/operator/scan/scan_multi_rel_tables.h"
 #include "processor/operator/scan/scan_node_table.h"
 #include "processor/operator/scan/scan_rel_table.h"
@@ -64,6 +65,9 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapSemiMasker(
             DASSERT(semiMasker.getTargetType() == SemiMaskTargetType::SCAN_NODE);
             auto scan = physicalOp->ptrCast<ScanNodeTable>();
             anyMaskAttached |= initMask(masksPerTable, scan->getSemiMasks());
+        } break;
+        case PhysicalOperatorType::PRIMARY_KEY_SCAN_NODE_TABLE: {
+            // The index already provides the candidate IDs; no scan mask attaches.
         } break;
         case PhysicalOperatorType::SCAN_REL_TABLE:
         case PhysicalOperatorType::PACKED_EXTEND: {

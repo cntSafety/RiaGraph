@@ -1,0 +1,98 @@
+-DATASET CSV EMPTY
+
+--
+
+# repeat, lpad and rpad take a count or a target length from the query. string_t keeps its length
+# in 32 bits, so a result that does not fit has to be an error, not a truncated length: it used to
+# write 4 GiB into a 12 byte inline buffer (repeat) or loop for ever (negative repeat count,
+# huge pad length).
+
+-CASE RepeatCountBounds
+-LOG RepeatBoundaryCasesKeepWorking
+-STATEMENT RETURN repeat('ab', 3)
+---- 1
+ababab
+-STATEMENT RETURN size(repeat('ab', 0))
+---- 1
+0
+-STATEMENT RETURN size(repeat('', 0))
+---- 1
+0
+-STATEMENT RETURN size(repeat('', 9223372036854775807))
+---- 1
+0
+-STATEMENT RETURN size(repeat('abcdefghijklmnop', 1000))
+---- 1
+16000
+-STATEMENT RETURN size(repeat('a', 12)), size(repeat('a', 13))
+---- 1
+12|13
+-LOG RepeatNegativeCountIsEmpty
+-STATEMENT RETURN size(repeat('ab', -1))
+---- 1
+0
+-STATEMENT RETURN size(repeat('', -1))
+---- 1
+0
+-STATEMENT RETURN size(repeat('ab', -9223372036854775807))
+---- 1
+0
+-LOG RepeatResultTooLong
+-STATEMENT RETURN size(repeat('ab', 2147483649))
+---- error
+Overflow exception: The result of repeat(2 bytes, 2147483649) exceeds the maximum string length of 4294967295 bytes.
+-STATEMENT RETURN repeat('a', 4294967297)
+---- error
+Overflow exception: The result of repeat(1 bytes, 4294967297) exceeds the maximum string length of 4294967295 bytes.
+-STATEMENT RETURN size(repeat('abc', 1431655766))
+---- error
+Overflow exception: The result of repeat(3 bytes, 1431655766) exceeds the maximum string length of 4294967295 bytes.
+-STATEMENT RETURN repeat('ab', 9223372036854775807)
+---- error
+Overflow exception: The result of repeat(2 bytes, 9223372036854775807) exceeds the maximum string length of 4294967295 bytes.
+
+-CASE PadLengthBounds
+-LOG PadBoundaryCasesKeepWorking
+-STATEMENT RETURN lpad('a', 4, 'b'), rpad('a', 4, 'xy'), lpad('abc', 2, 'x'), rpad('abc', 0, 'x')
+---- 1
+bbba|axyx|ab|
+-STATEMENT RETURN size(lpad('a', 100000, 'b')), size(rpad('a', 100000, 'b'))
+---- 1
+100000|100000
+-STATEMENT RETURN size(lpad('a', -9223372036854775807, 'b')), size(rpad('a', -9223372036854775807, 'b'))
+---- 1
+0|0
+-LOG PadResultTooLong
+-STATEMENT RETURN lpad('a', 9223372036854775807, 'b')
+---- error
+Overflow exception: The padded string exceeds the maximum string length of 4294967295 bytes.
+-STATEMENT RETURN rpad('a', 9223372036854775807, 'b')
+---- error
+Overflow exception: The padded string exceeds the maximum string length of 4294967295 bytes.
+-STATEMENT RETURN lpad('a', 4294967296, 'b')
+---- error
+Overflow exception: The padded string exceeds the maximum string length of 4294967295 bytes.
+-STATEMENT RETURN rpad('a', 4294967297, 'b')
+---- error
+Overflow exception: The padded string exceeds the maximum string length of 4294967295 bytes.
+
+-CASE SubstringHugeLength
+-LOG LengthPastTheEndOfTheString
+-STATEMENT RETURN substring('abc', 2, 9223372036854775807), left('abc', 9223372036854775807), right('abc', 9223372036854775807)
+---- 1
+bc|abc|abc
+-STATEMENT RETURN size(left('abc', -9223372036854775807)), size(right('abc', -9223372036854775807))
+---- 1
+0|0
+-LOG NegativeLengthSelectsNothing
+# A negative length used to be read as a huge unsigned end position: substring('abc', 2, -2)
+# crashed the process, and a non-ASCII input returned the rest of the string.
+-STATEMENT RETURN size(substring('abc', 2, -2)), size(substring('abc', 2, -5)), size(substring('abc', 1, -1)), size(substring('héllo', 2, -9))
+---- 1
+0|0|0|0
+-STATEMENT RETURN substring('abc', 2, 1), substring('abc', 2, 2), substring('abc', 1, 3), substring('héllo', 2, 3)
+---- 1
+b|bc|abc|éll
+-STATEMENT RETURN size(substring('abc', 0, 2)), size(substring('abc', -1, 2)), size(substring('abc', 4, 2)), size(substring('abc', 9223372036854775807, 1))
+---- 1
+0|0|0|0

@@ -718,16 +718,17 @@ void ArtPrimaryKeyIndex::eraseOffsetFromLeaf(Node& node, offset_t offset) {
     }
 }
 
-bool ArtPrimaryKeyIndex::eraseInternal(Node& node, const std::vector<uint8_t>& key,
-    uint64_t depth) {
+bool ArtPrimaryKeyIndex::eraseInternal(Node& node, const std::vector<uint8_t>& key, uint64_t depth,
+    offset_t offset) {
     const auto prefixMatch = matchPrefix(node.prefix, key, depth);
     if (prefixMatch != node.prefix.size()) {
         return false;
     }
     depth += node.prefix.size();
     if (depth == key.size()) {
-        node.offset.reset();
-        node.overflowOffsets.reset();
+        // Only this row's offset: the leaf can also hold the offset of another row with the
+        // same key, e.g. the existing row a rolled-back COPY collided with.
+        eraseOffsetFromLeaf(node, offset);
         return node.empty();
     }
     const auto byte = key[depth];
@@ -735,15 +736,15 @@ bool ArtPrimaryKeyIndex::eraseInternal(Node& node, const std::vector<uint8_t>& k
     if (child == nullptr) {
         return false;
     }
-    if (eraseInternal(*child, key, depth + 1)) {
+    if (eraseInternal(*child, key, depth + 1, offset)) {
         node.removeChild(byte);
     }
     return node.empty();
 }
 
-void ArtPrimaryKeyIndex::erase(const ArtKey& key) {
+void ArtPrimaryKeyIndex::erase(const ArtKey& key, offset_t offset) {
     if (!key.empty()) {
-        eraseInternal(root, key.getBytes(), 0);
+        eraseInternal(root, key.getBytes(), 0, offset);
     }
 }
 
@@ -1102,12 +1103,12 @@ bool ArtPrimaryKeyIndex::scanPrimaryKeyRange(ValueVector* lowerBoundVector, uint
     return true;
 }
 
-void ArtPrimaryKeyIndex::discardPrimaryKey(ValueVector* keyVector) {
+void ArtPrimaryKeyIndex::discardPrimaryKey(ValueVector* keyVector, offset_t firstOffset) {
     std::lock_guard lck{mutex};
     materializeDiskTree();
     for (auto i = 0u; i < keyVector->state->getSelSize(); ++i) {
         const auto pos = keyVector->state->getSelVector()[i];
-        erase(ArtKey::encode(keyVector, pos));
+        erase(ArtKey::encode(keyVector, pos), firstOffset + pos);
     }
 }
 

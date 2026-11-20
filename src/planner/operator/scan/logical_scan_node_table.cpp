@@ -4,9 +4,9 @@ namespace riag {
 namespace planner {
 
 LogicalScanNodeTable::LogicalScanNodeTable(const LogicalScanNodeTable& other)
-    : LogicalOperator{type_}, scanType{other.scanType}, nodeID{other.nodeID},
-      nodeTableIDs{other.nodeTableIDs}, tableDBMap{other.tableDBMap}, properties{other.properties},
-      propertyPredicates{copyVector(other.propertyPredicates)} {
+    : LogicalOperator{type_}, namespaceScope{other.namespaceScope}, scanType{other.scanType},
+      nodeID{other.nodeID}, nodeTableIDs{other.nodeTableIDs}, tableDBMap{other.tableDBMap},
+      properties{other.properties}, propertyPredicates{copyVector(other.propertyPredicates)} {
     if (other.extraInfo != nullptr) {
         setExtraInfo(other.extraInfo->copy());
     }
@@ -24,7 +24,7 @@ void LogicalScanNodeTable::computeFactorizedSchema() {
     switch (scanType) {
     case LogicalScanNodeTableType::PRIMARY_KEY_SCAN: {
         auto& primaryKeyScanInfo = extraInfo->constCast<PrimaryKeyScanInfo>();
-        if (!primaryKeyScanInfo.isRange) {
+        if (!primaryKeyScanInfo.isRange && !primaryKeyScanInfo.nonUnique) {
             schema->setGroupAsSingleState(groupPos);
         }
     } break;

@@ -12,6 +12,7 @@ add_subdirectory(macro)
 add_library(riag_processor_operator
         OBJECT
         arrow_result_collector.cpp
+        assert_condition.cpp
         base_partitioner_shared_state.cpp
         cross_product.cpp
         empty_result.cpp

@@ -30,6 +30,7 @@ enum class StatementType : uint8_t {
     EXTENSION_CLAUSE = 40,
     CREATE_GRAPH = 41,
     USE_GRAPH = 42,
+    NAMESPACE = 43,
 };
 
 } // namespace common

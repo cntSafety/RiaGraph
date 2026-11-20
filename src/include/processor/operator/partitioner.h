@@ -2,6 +2,7 @@
 
 #include "binder/expression/expression.h"
 #include "common/enums/column_evaluate_type.h"
+#include "common/namespace_set.h"
 #include "expression_evaluator/expression_evaluator.h"
 #include "processor/operator/base_partitioner_shared_state.h"
 #include "processor/operator/sink.h"
@@ -95,6 +96,7 @@ private:
 };
 
 struct PartitionerDataInfo {
+    common::namespace_id_t namespaceTarget = common::GLOBAL_NAMESPACE_ID;
     std::string tableName;
     std::string fromTableName;
     std::string toTableName;
@@ -113,8 +115,9 @@ struct PartitionerDataInfo {
 
 private:
     PartitionerDataInfo(const PartitionerDataInfo& other)
-        : tableName{other.tableName}, fromTableName{other.fromTableName},
-          toTableName{other.toTableName}, columnTypes{common::LogicalType::copy(other.columnTypes)},
+        : namespaceTarget{other.namespaceTarget}, tableName{other.tableName},
+          fromTableName{other.fromTableName}, toTableName{other.toTableName},
+          columnTypes{common::LogicalType::copy(other.columnTypes)},
           columnEvaluators{copyVector(other.columnEvaluators)}, evaluateTypes{other.evaluateTypes} {
     }
 };

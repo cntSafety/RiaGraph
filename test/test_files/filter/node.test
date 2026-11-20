@@ -88,7 +88,7 @@
 -STATEMENT MATCH (a:organisation) WHERE a.state IS NOT NULL RETURN COUNT(*)
 ---- 1
 2
--STATEMENT MATCH (a:organisation) WHERE a.ID=4 SET a.state={revenue: CAST(1, "INT16"), location: ["aaa"], stock: {price: [1], volumn: 1}}
+-STATEMENT MATCH (a:organisation) WHERE a.ID=4 SET a.state={revenue: CAST(1, "INT16"), location: ["aaa"], stock: {price: [1], volume: 1}}
 ---- ok
 -STATEMENT MATCH (a:organisation) WHERE a.state IS NULL RETURN COUNT(*)
 ---- 1

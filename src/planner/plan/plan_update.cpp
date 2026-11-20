@@ -3,6 +3,7 @@
 #include "binder/query/updating_clause/bound_merge_clause.h"
 #include "binder/query/updating_clause/bound_set_clause.h"
 #include "planner/operator/persistent/logical_merge.h"
+#include "planner/operator/persistent/logical_namespace_mutation.h"
 #include "planner/planner.h"
 
 using namespace riag::common;
@@ -41,6 +42,9 @@ void Planner::planInsertClause(const BoundUpdatingClause& updatingClause, Logica
     } else {
         appendAccumulate(plan);
     }
+    for (const auto& assertion : insertClause.namespaceAssertions) {
+        appendFilter(assertion, plan);
+    }
     if (insertClause.hasNodeInfo()) {
         appendInsertNode(insertClause.getNodeInfos(), plan);
     }
@@ -51,6 +55,9 @@ void Planner::planInsertClause(const BoundUpdatingClause& updatingClause, Logica
 
 void Planner::planMergeClause(const BoundUpdatingClause& updatingClause, LogicalPlan& plan) {
     auto& mergeClause = updatingClause.constCast<BoundMergeClause>();
+    for (const auto& assertion : mergeClause.namespaceAssertions) {
+        appendFilter(assertion, plan);
+    }
     expression_vector predicates;
     if (mergeClause.hasPredicate()) {
         predicates = mergeClause.getPredicate()->splitOnAND();
@@ -75,6 +82,8 @@ void Planner::planMergeClause(const BoundUpdatingClause& updatingClause, Logical
     planOptionalMatch(*mergeClause.getQueryGraphCollection(), predicates, existenceMark, plan,
         nullptr /* hint */);
     auto merge = std::make_shared<LogicalMerge>(existenceMark, keys, plan.getLastOperator());
+    merge->onMatchNamespaceMoves = mergeClause.onMatchNamespaceMoves;
+    merge->onCreateNamespaceMoves = mergeClause.onCreateNamespaceMoves;
     if (mergeClause.hasInsertNodeInfo()) {
         for (auto& info : mergeClause.getInsertNodeInfos()) {
             merge->addInsertNodeInfo(createLogicalInsertInfo(info)->copy());
@@ -119,6 +128,12 @@ void Planner::planSetClause(const BoundUpdatingClause& updatingClause, LogicalPl
     }
     if (setClause.hasRelInfo()) {
         appendSetProperty(setClause.getRelInfos(), plan);
+    }
+    if (!setClause.namespaceMoves.empty()) {
+        auto mutation = std::make_shared<LogicalNamespaceMutation>(setClause.namespaceMoves,
+            plan.getLastOperator());
+        mutation->computeFactorizedSchema();
+        plan.setLastOperator(std::move(mutation));
     }
 }
 

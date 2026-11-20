@@ -1,0 +1,396 @@
+-DATASET CSV empty
+--
+
+# Index entries of COPYs that share one transaction with other writes to the same node table.
+#
+# Several COPYs into one table in one transaction: rolling the transaction back undoes them newest
+# first, and each undo scans its rows to discard their index entries. Undoing a later COPY must
+# not hide the earlier COPY's rows from that scan, or their keys stay in the index and point at
+# rows that no longer exist.
+
+-CASE TwoCopiesRolledBackLeaveNoKeys
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i, i);
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(4, 6) AS i RETURN i, i);
+---- ok
+-STATEMENT MATCH (f:foo {id: 2}) RETURN f.v;
+---- 1
+2
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo {id: 3}) RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo {id: 4}) RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) RETURN count(*);
+---- 1
+0
+-STATEMENT CREATE (:foo {id: 1, v: 10});
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(2, 6) AS i RETURN i, i * 10);
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) RETURN f.v;
+---- 1
+10
+-STATEMENT MATCH (f:foo {id: 3}) RETURN f.v;
+---- 1
+30
+-STATEMENT MATCH (f:foo) RETURN count(*);
+---- 1
+6
+
+-CASE SecondCopyFailingRollsBackTheFirst
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i, i);
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(3, 5) AS i RETURN i, i);
+---- error
+Copy exception: Found duplicated primary key value 3, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (f:foo {id: 1}) RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo {id: 3}) RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) RETURN count(*);
+---- 1
+0
+-STATEMENT CREATE (:foo {id: 1, v: 0});
+---- ok
+-STATEMENT CREATE (:foo {id: 3, v: 0});
+---- ok
+-STATEMENT MATCH (f:foo) RETURN f.id ORDER BY f.id;
+---- 2
+1
+3
+
+-CASE TwoCopiesRolledBackAfterCheckpoint
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE (:foo {id: 10, v: 1});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i, i);
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(4, 6) AS i RETURN i, i);
+---- ok
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo {id: 10}) RETURN f.v;
+---- 1
+1
+-STATEMENT CREATE (:foo {id: 1, v: 0});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-RELOADDB
+-STATEMENT MATCH (f:foo) RETURN f.id ORDER BY f.id;
+---- 2
+1
+10
+-STATEMENT MATCH (f:foo {id: 1}) RETURN f.v;
+---- 1
+0
+-STATEMENT MATCH (f:foo {id: 3}) RETURN f.id;
+---- 0
+-STATEMENT CREATE (:foo {id: 3, v: 3});
+---- ok
+
+# The COPYs span several vectors, and the second one starts in the middle of one.
+-CASE TwoLargeCopiesRolledBackLeaveNoKeys
+-STATEMENT CREATE NODE TABLE foo(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3000) AS i RETURN i);
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(3001, 5000) AS i RETURN i);
+---- ok
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo {id: 2500}) RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo {id: 4000}) RETURN f.id;
+---- 0
+-STATEMENT COPY foo FROM (UNWIND range(1, 5000) AS i RETURN i);
+---- ok
+-STATEMENT MATCH (f:foo {id: 2500}) RETURN f.id;
+---- 1
+2500
+-STATEMENT MATCH (f:foo) RETURN count(*);
+---- 1
+5000
+
+-CASE ArtTwoCopiesRolledBackLeaveNoKeys
+-STATEMENT CALL enable_default_hash_index=false;
+---- ok
+-STATEMENT CREATE NODE TABLE art(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX art_pk FOR (a:art) ON (a.id);
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY art FROM (UNWIND range(1, 3) AS i RETURN i);
+---- ok
+-STATEMENT COPY art FROM (UNWIND range(4, 6) AS i RETURN i);
+---- ok
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (a:art {id: 1}) RETURN a.id;
+---- 0
+-STATEMENT MATCH (a:art) WHERE a.id >= 1 AND a.id <= 6 RETURN a.id;
+---- 0
+-STATEMENT CREATE (:art {id: 1});
+---- ok
+-STATEMENT MATCH (a:art {id: 1}) RETURN a.id;
+---- 1
+1
+-STATEMENT CALL enable_default_hash_index=true;
+---- ok
+
+-CASE TwoCopiesCommitted
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i, i);
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(4, 6) AS i RETURN i, i);
+---- ok
+-STATEMENT COMMIT;
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) RETURN f.v;
+---- 1
+1
+-STATEMENT MATCH (f:foo {id: 6}) RETURN f.v;
+---- 1
+6
+-RELOADDB
+-STATEMENT MATCH (f:foo {id: 3}) RETURN f.v;
+---- 1
+3
+-STATEMENT MATCH (f:foo) RETURN count(*);
+---- 1
+6
+-STATEMENT CREATE (:foo {id: 4, v: 0});
+---- error
+Runtime exception: Found duplicated primary key value 4, which violates the uniqueness constraint of the primary key column.
+
+# Rows that CREATE or MERGE inserted into a table are held in the transaction's local storage at
+# node offsets that COPY would hand out again, so COPY into that table in the same transaction is
+# refused instead of producing two rows with one node ID and unchecked keys.
+
+-CASE CopyAfterCreateInSameTransactionIsRefused
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE (:foo {id: 10, v: 10});
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:foo {id: 4, v: 4});
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 4) AS i RETURN i, i);
+---- error
+Copy exception: Cannot COPY into node table foo after rows were inserted into it by CREATE or MERGE in the same transaction. Commit the transaction before the COPY.
+# The failed COPY rolls the whole transaction back, the CREATE of 4 included.
+-STATEMENT MATCH (f:foo) RETURN f.id;
+---- 1
+10
+-STATEMENT MATCH (f:foo {id: 4}) RETURN f.id;
+---- 0
+-STATEMENT CREATE (:foo {id: 4, v: 4});
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i, i);
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) RETURN f.v;
+---- 1
+1
+-STATEMENT MATCH (f:foo {id: 4}) RETURN f.v;
+---- 1
+4
+-STATEMENT MATCH (f:foo) RETURN f.id ORDER BY f.id;
+---- 5
+1
+2
+3
+4
+10
+
+-CASE CopyAfterMergeOrDeletedCreateIsRefused
+-STATEMENT CREATE NODE TABLE foo(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT MERGE (:foo {id: 20});
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i);
+---- error
+Copy exception: Cannot COPY into node table foo after rows were inserted into it by CREATE or MERGE in the same transaction. Commit the transaction before the COPY.
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:foo {id: 30});
+---- ok
+-STATEMENT MATCH (f:foo {id: 30}) DELETE f;
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i);
+---- error
+Copy exception: Cannot COPY into node table foo after rows were inserted into it by CREATE or MERGE in the same transaction. Commit the transaction before the COPY.
+-STATEMENT MATCH (f:foo) RETURN count(*);
+---- 1
+0
+
+# The other orders and tables are unaffected: rows created after a COPY get offsets after its rows.
+-CASE CreateAfterCopyInSameTransaction
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE NODE TABLE bar(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:bar {id: 1});
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i, i);
+---- ok
+-STATEMENT CREATE (:foo {id: 4, v: 4});
+---- ok
+-STATEMENT CREATE (:foo {id: 2, v: 0});
+---- error
+Runtime exception: Found duplicated primary key value 2, which violates the uniqueness constraint of the primary key column.
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:bar {id: 1});
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i, i);
+---- ok
+-STATEMENT CREATE (:foo {id: 4, v: 4});
+---- ok
+-STATEMENT MATCH (f:foo {id: 2}) RETURN f.v;
+---- 1
+2
+-STATEMENT MATCH (f:foo {id: 4}) RETURN f.v;
+---- 1
+4
+-STATEMENT COMMIT;
+---- ok
+-RELOADDB
+-STATEMENT MATCH (f:foo) RETURN f.id, f.v ORDER BY f.id;
+---- 4
+1|1
+2|2
+3|3
+4|4
+-STATEMENT MATCH (f:foo {id: 4}) RETURN f.v;
+---- 1
+4
+-STATEMENT MATCH (b:bar {id: 1}) RETURN b.id;
+---- 1
+1
+
+# An ART index on a non-key column is filled by COPY as it appends the rows, so a rolled-back COPY
+# must remove its rows from that index too. Otherwise a lookup of a rolled-back value reaches a
+# row that no longer exists, or, once a later insert reuses the offset, a row with another value.
+
+-CASE FailedCopyLeavesNoSecondaryIndexEntries
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX foo_v FOR (f:foo) ON (f.v);
+---- ok
+-STATEMENT CREATE (:foo {id: 10, v: 10});
+---- ok
+-STATEMENT COPY foo FROM (UNWIND [1, 2, 10] AS i RETURN i, i + 1000);
+---- error
+Copy exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (f:foo) WHERE f.v = 1001 RETURN f.id;
+---- 0
+-STATEMENT COPY foo FROM (UNWIND [5, 6] AS i RETURN i, i + 2000);
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 1001 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 1002 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 2005 RETURN f.id;
+---- 1
+5
+-STATEMENT MATCH (f:foo) WHERE f.v = 10 RETURN f.id;
+---- 1
+10
+
+# A rolled-back row whose value equals an existing row's removes only its own entry.
+-CASE FailedCopyKeepsEqualSecondaryValues
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX foo_v FOR (f:foo) ON (f.v);
+---- ok
+-STATEMENT CREATE (:foo {id: 10, v: 7});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT COPY foo FROM (UNWIND [3, 4, 10] AS i RETURN i, 7);
+---- error
+Copy exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (f:foo) WHERE f.v = 7 RETURN f.id;
+---- 1
+10
+-STATEMENT COPY foo FROM (UNWIND [3, 4] AS i RETURN i, 7);
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 7 RETURN f.id ORDER BY f.id;
+---- 3
+3
+4
+10
+-STATEMENT CHECKPOINT;
+---- ok
+-RELOADDB
+-STATEMENT MATCH (f:foo) WHERE f.v = 7 RETURN f.id ORDER BY f.id;
+---- 3
+3
+4
+10
+
+-CASE TwoCopiesRolledBackLeaveNoSecondaryIndexEntries
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX foo_v FOR (f:foo) ON (f.v);
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 3) AS i RETURN i, i + 100);
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(4, 6) AS i RETURN i, i + 100);
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 105 RETURN f.id;
+---- 1
+5
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 101 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 105 RETURN f.id;
+---- 0
+-STATEMENT COPY foo FROM (UNWIND range(1, 6) AS i RETURN i, i + 200);
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 101 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 203 RETURN f.id;
+---- 1
+3
+-RELOADDB
+-STATEMENT MATCH (f:foo) WHERE f.v = 101 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 206 RETURN f.id;
+---- 1
+6

@@ -4,6 +4,7 @@ add_library(riag_catalog
         OBJECT
         catalog.cpp
         catalog_set.cpp
+        namespace_catalog.cpp
         property_definition_collection.cpp)
 
 set(ALL_OBJECT_FILES

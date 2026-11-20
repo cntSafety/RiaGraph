@@ -11,7 +11,7 @@ not covered here, it is an *open item* — add it to §16 rather than inventing 
 
 | # | Question | Decision |
 |---|----------|----------|
-| D1 | Upstream relationship | **Occasional cherry-picks** from `ladybugdb/ladybug`. Not a tracking fork; not a clean-room hard fork. See §14 for the cherry-pick mechanism that survives the rename. |
+| D1 | Upstream relationship | **Independent since 2026-11-18: nothing is taken from `ladybugdb/ladybug` any more**, and changes need not stay mergeable with it. This revises the original decision (occasional cherry-picks, not a tracking fork), which held through the October 2026 round. §14 and `docs/upstream-picks.md` describe that mechanism and what it brought in; both are history. |
 | D2 | Rename depth in C/C++ core | **Full rename**, including the root C++ namespace, all macros, all identifiers, all file names. No compatibility aliases in the C/C++ API. |
 | D3 | On-disk compatibility | **New magic bytes `RIAG`, accept `LBUG` on read.** Storage format itself is unchanged. RiaGraph opens ladybug databases; ladybug cannot open RiaGraph databases (one-way). |
 | D4 | Distribution | **GitHub-only for now.** GitHub Releases + GitHub Packages + GHCR under `cntSafety`. Package *names* are set now; public-registry publication is deferred. |
@@ -86,6 +86,9 @@ disable pushes to upstream:
 ```bash
 git remote set-url --push upstream DISABLED
 ```
+
+Since D1 was revised (2026-11-18) a clone needs no `upstream` remote. Where one still exists it
+is harmless as long as pushes to it stay disabled.
 
 ---
 
@@ -287,7 +290,9 @@ baseline** — every later phase is judged against it.
 
 ## 5. Phase 1 — Mechanical core rename
 
-Write `scripts/riag-rename.py` and commit it. §14 argues for keeping it permanently.
+Write `scripts/riag-rename.py` and commit it. §14 argues for keeping it permanently. (That
+argument was the `--patch` mode, which is unused since D1 was revised; the script stays for
+`--check`, the guard CI runs.)
 
 ### 5.1 Required behaviour
 
@@ -537,6 +542,10 @@ a pre-existing failure — record it, do not fix it in this programme (D8).
 ---
 
 ## 14. Cherry-picking from upstream after the rename
+
+> **Retired 2026-11-18.** D1 was revised: RiaGraph no longer takes changes from upstream. This
+> section is kept because it explains the shape of Phases 1 and 2 and of the picks already in
+> the history. Do not follow it for new work.
 
 This is why §5.1 items 9 and 10 exist, and why Phase 1 and Phase 2 are separate commits.
 

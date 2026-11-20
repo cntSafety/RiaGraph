@@ -1,10 +1,12 @@
 #include "catalog/catalog_set.h"
 
+#include <algorithm>
 #include <mutex>
 
 #include "binder/ddl/bound_alter_info.h"
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/dummy_catalog_entry.h"
+#include "catalog/catalog_entry/namespace_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/assert.h"
@@ -51,7 +53,7 @@ bool CatalogSet::containsEntryNoLock(const Transaction* transaction,
     // Check versions.
     const auto entry =
         traverseVersionChainsForTransactionNoLock(transaction, entries.at(name).get());
-    return !entry->isDeleted();
+    return entry && !entry->isDeleted();
 }
 
 CatalogEntry* CatalogSet::getEntry(const Transaction* transaction, const std::string& name) {
@@ -71,12 +73,13 @@ CatalogEntry* CatalogSet::getEntryNoLock(const Transaction* transaction,
 }
 
 oid_t CatalogSet::createEntry(Transaction* transaction, std::unique_ptr<CatalogEntry> entry,
-    bool skipLoggingToWAL) {
+    bool skipLoggingToWAL, std::optional<oid_t> restoredOID) {
     CatalogEntry* entryPtr = nullptr;
     oid_t oid = INVALID_OID;
     {
         std::unique_lock lck{mtx};
-        oid = nextOID++;
+        oid = restoredOID.has_value() ? *restoredOID : nextOID;
+        nextOID = std::max(nextOID, oid + 1);
         entry->setOID(oid);
         entryPtr = createEntryNoLock(transaction, std::move(entry));
     }
@@ -85,6 +88,33 @@ oid_t CatalogSet::createEntry(Transaction* transaction, std::unique_ptr<CatalogE
         transaction->pushCreateDropCatalogEntry(*this, *entryPtr, isInternal(), skipLoggingToWAL);
     }
     return oid;
+}
+
+CatalogEntry* CatalogSet::replaceNamespaceEntry(Transaction* transaction,
+    std::unique_ptr<CatalogEntry> entry, bool skipLoggingToWAL) {
+    const auto type = entry->getType();
+    if (type != CatalogEntryType::NAMESPACE_POLICY_ENTRY &&
+        type != CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY) {
+        throw CatalogException("Only namespace policy and membership entries may be replaced.");
+    }
+    CatalogEntry* oldEntry = nullptr;
+    CatalogEntry* newEntry = nullptr;
+    {
+        std::unique_lock lck{mtx};
+        validateExistNoLock(transaction, entry->getName());
+        if (checkWWConflict(transaction, entries.at(entry->getName()).get())) {
+            throw CatalogException("Write-write conflict updating namespace metadata.");
+        }
+        oldEntry = getEntryNoLock(transaction, entry->getName());
+        entry->setOID(oldEntry->getOID());
+        entry->setTimestamp(transaction->getID());
+        newEntry = entry.get();
+        emplaceNoLock(std::move(entry));
+    }
+    if (transaction->shouldAppendToUndoBuffer()) {
+        transaction->pushCreateDropCatalogEntry(*this, *oldEntry, isInternal(), skipLoggingToWAL);
+    }
+    return newEntry;
 }
 
 CatalogEntry* CatalogSet::createEntryNoLock(const Transaction* transaction,
@@ -117,15 +147,161 @@ void CatalogSet::emplaceNoLock(std::unique_ptr<CatalogEntry> entry) {
         entry->setPrev(std::move(entries.at(entry->getName())));
         entries.erase(entry->getName());
     }
+    indexNamespaceEntryNoLock(entry.get());
     entries.emplace(entry->getName(), std::move(entry));
 }
 
 void CatalogSet::eraseNoLock(const std::string& name) {
+    if (namespaceLookup) {
+        const auto* entry = entries.at(name).get();
+        const auto identity = namespaceLookup->identities.find(entry->getOID());
+        if (identity != namespaceLookup->identities.end()) {
+            const auto [tableID, groupIndex] = identity->second;
+            auto& heads = namespaceLookup->heads.at(tableID);
+            // A renamed definition's identity heads its new name's chain; erasing the chain
+            // of an earlier name (when a rollback restores its tombstone) keeps that head.
+            const auto head = heads.find(groupIndex);
+            if (tableID != INVALID_TABLE_ID || (head != heads.end() && head->second == entry)) {
+                heads.erase(groupIndex);
+            }
+        }
+    }
     entries.erase(name);
+}
+
+void CatalogSet::enableNamespaceLookup() {
+    std::unique_lock lock{mtx};
+    namespaceLookup = std::make_unique<NamespaceLookup>();
+    for (const auto& [_, entry] : entries) {
+        indexNamespaceEntryNoLock(entry.get());
+    }
+}
+
+void CatalogSet::indexNamespaceEntryNoLock(CatalogEntry* entry) {
+    if (!namespaceLookup) {
+        return;
+    }
+    if (entry->getType() == CatalogEntryType::NAMESPACE_ENTRY) {
+        // A reserved table key also makes identity-to-name lookup independent
+        // of the number of table policies and membership groups in this catalog.
+        namespaceLookup->identities[entry->getOID()] = {INVALID_TABLE_ID, entry->getOID()};
+    } else if (entry->getType() == CatalogEntryType::NAMESPACE_POLICY_ENTRY ||
+               entry->getType() == CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY) {
+        const auto& info = entry->constCast<NamespaceCatalogEntry>();
+        namespaceLookup->identities[entry->getOID()] = {info.tableID,
+            entry->getType() == CatalogEntryType::NAMESPACE_POLICY_ENTRY ? INVALID_ROW_IDX :
+                                                                           info.groupIndex};
+    }
+    const auto identity = namespaceLookup->identities.find(entry->getOID());
+    if (identity == namespaceLookup->identities.end()) {
+        return;
+    }
+    const auto [tableID, groupIndex] = identity->second;
+    auto& head = namespaceLookup->heads[tableID][groupIndex];
+    if (tableID == INVALID_TABLE_ID && head && head->getName() != entry->getName()) {
+        // A namespace definition's identity moved to another name's version chain.
+        if (entry->getType() != CatalogEntryType::NAMESPACE_ENTRY) {
+            // A tombstone or dummy restored by a rollback on an earlier name: the identity
+            // stays on the chain that holds its newest definition.
+            return;
+        }
+        // A rename: remember the earlier name for snapshots older than the rename.
+        auto& names = namespaceLookup->previousNames[entry->getOID()];
+        if (std::find(names.begin(), names.end(), head->getName()) == names.end()) {
+            names.push_back(head->getName());
+        }
+    }
+    head = entry;
+}
+
+CatalogEntry* CatalogSet::getNamespaceEntry(const Transaction* transaction, table_id_t tableID,
+    uint64_t groupIndex) {
+    std::shared_lock lock{mtx};
+    DASSERT(namespaceLookup);
+    const auto table = namespaceLookup->heads.find(tableID);
+    if (table == namespaceLookup->heads.end()) {
+        return nullptr;
+    }
+    const auto group = table->second.find(groupIndex);
+    if (group == table->second.end()) {
+        return nullptr;
+    }
+    auto* entry = traverseVersionChainsForTransactionNoLock(transaction, group->second);
+    if (entry && !entry->isDeleted()) {
+        return entry;
+    }
+    if (tableID == INVALID_TABLE_ID) {
+        // A snapshot older than a rename of this namespace sees the definition under an
+        // earlier name. At most one name holds a visible definition of an identity.
+        const auto previous = namespaceLookup->previousNames.find(groupIndex);
+        if (previous != namespaceLookup->previousNames.end()) {
+            for (const auto& name : previous->second) {
+                const auto chain = entries.find(name);
+                if (chain == entries.end()) {
+                    continue;
+                }
+                auto* visible =
+                    traverseVersionChainsForTransactionNoLock(transaction, chain->second.get());
+                if (visible && !visible->isDeleted() && visible->getOID() == groupIndex &&
+                    visible->getType() == CatalogEntryType::NAMESPACE_ENTRY) {
+                    return visible;
+                }
+            }
+        }
+    }
+    return nullptr;
 }
 
 std::unique_ptr<CatalogEntry> CatalogSet::createDummyEntryNoLock(std::string name, oid_t oid) {
     return std::make_unique<DummyCatalogEntry>(std::move(name), oid);
+}
+
+std::vector<uint64_t> CatalogSet::getNamespaceGroupIndices(table_id_t tableID) const {
+    std::shared_lock lock{mtx};
+    DASSERT(namespaceLookup);
+    std::vector<uint64_t> result;
+    if (const auto table = namespaceLookup->heads.find(tableID);
+        table != namespaceLookup->heads.end()) {
+        result.reserve(table->second.size());
+        for (const auto& [group, _] : table->second) {
+            if (group != INVALID_ROW_IDX) {
+                result.push_back(group);
+            }
+        }
+    }
+    return result;
+}
+
+void CatalogSet::pruneNamespaceMembershipVersions(table_id_t tableID, uint64_t groupIndex,
+    transaction_t horizon) {
+    if (horizon == INVALID_TRANSACTION) {
+        return;
+    }
+    std::unique_lock lock{mtx};
+    DASSERT(namespaceLookup);
+    const auto table = namespaceLookup->heads.find(tableID);
+    if (table == namespaceLookup->heads.end()) {
+        return;
+    }
+    const auto group = table->second.find(groupIndex);
+    if (group == table->second.end()) {
+        return;
+    }
+    auto* boundary = group->second;
+    while (boundary && boundary->getTimestamp() > horizon) {
+        boundary = boundary->hasPrev() ? boundary->getPrev() : nullptr;
+    }
+    if (!boundary) {
+        return;
+    }
+    // All active snapshots can see this boundary or a newer version. Preserve
+    // the boundary itself for reader caches and writer undo records. Destroy
+    // older chains iteratively: a long-running reader may have pinned many.
+    auto retired = boundary->movePrev();
+    while (retired) {
+        auto older = retired->movePrev();
+        retired = std::move(older);
+    }
 }
 
 CatalogEntry* CatalogSet::traverseVersionChainsForTransactionNoLock(const Transaction* transaction,
@@ -139,7 +315,7 @@ CatalogEntry* CatalogSet::traverseVersionChainsForTransactionNoLock(const Transa
             // This entry was committed before the current transaction starts.
             break;
         }
-        currentEntry = currentEntry->getPrev();
+        currentEntry = currentEntry->hasPrev() ? currentEntry->getPrev() : nullptr;
     }
     return currentEntry;
 }
@@ -176,6 +352,29 @@ CatalogEntry* CatalogSet::dropEntryNoLock(const Transaction* transaction, const 
     const auto tombstonePtr = tombstone.get();
     emplaceNoLock(std::move(tombstone));
     return tombstonePtr->getPrev();
+}
+
+void CatalogSet::renameNamespaceEntry(Transaction* transaction, const std::string& oldName,
+    const std::string& newName) {
+    CatalogEntry* droppedEntry = nullptr;
+    CatalogEntry* createdEntry = nullptr;
+    {
+        std::unique_lock lck{mtx};
+        const auto* entry = getEntryNoLock(transaction, oldName);
+        if (entry->getType() != CatalogEntryType::NAMESPACE_ENTRY) {
+            throw CatalogException("Only namespace definitions may be renamed.");
+        }
+        auto renamed = entry->constCast<NamespaceCatalogEntry>().copy();
+        renamed->rename(newName);
+        droppedEntry = dropEntryNoLock(transaction, oldName, entry->getOID());
+        createdEntry = createEntryNoLock(transaction, std::move(renamed));
+    }
+    // As in alterTableEntry, push undo records only after releasing mtx. The drop is logged
+    // before the create, so replay frees the old name before the identity takes the new one.
+    if (transaction->shouldAppendToUndoBuffer()) {
+        transaction->pushCreateDropCatalogEntry(*this, *droppedEntry, isInternal());
+        transaction->pushCreateDropCatalogEntry(*this, *createdEntry, isInternal());
+    }
 }
 
 void CatalogSet::alterTableEntry(Transaction* transaction, const binder::BoundAlterInfo& alterInfo,
@@ -243,7 +442,7 @@ CatalogEntrySet CatalogSet::getEntries(const Transaction* transaction) {
     std::shared_lock lck{mtx};
     for (auto& [name, entry] : entries) {
         auto currentEntry = traverseVersionChainsForTransactionNoLock(transaction, entry.get());
-        if (currentEntry->isDeleted()) {
+        if (!currentEntry || currentEntry->isDeleted()) {
             continue;
         }
         result.emplace(name, currentEntry);
@@ -259,7 +458,7 @@ CatalogEntry* CatalogSet::getEntryOfOID(const Transaction* transaction, oid_t oi
         }
         const auto currentEntry =
             traverseVersionChainsForTransactionNoLock(transaction, entry.get());
-        if (currentEntry->isDeleted()) {
+        if (!currentEntry || currentEntry->isDeleted()) {
             continue;
         }
         return currentEntry;

@@ -97,6 +97,13 @@ struct CachedPreparedStatement {
     std::mutex physicalPlanPoolMutex;
     std::unordered_map<std::thread::id, std::vector<std::unique_ptr<processor::PhysicalPlan>>>
         physicalPlanPool;
+    uint64_t namespaceSelectionGeneration = 0;
+    std::string namespaceCatalogName;
+    uint64_t namespaceCatalogPlanVersion = 0;
+    // ID of the transaction the logical plan was bound in, 0 if none. While that transaction is
+    // still the active one the plan was bound against the snapshot it runs on, so a concurrent
+    // schema change cannot have made it stale (see namespacePlanStale).
+    uint64_t bindTransactionID = 0;
 
     CachedPreparedStatement();
     ~CachedPreparedStatement();

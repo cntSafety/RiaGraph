@@ -9,6 +9,7 @@ add_library(riag_processor_operator_simple
         export_db.cpp
         use_database.cpp
         use_graph.cpp
+        namespace_command.cpp
         uninstall_extension.cpp)
 
 set(ALL_OBJECT_FILES

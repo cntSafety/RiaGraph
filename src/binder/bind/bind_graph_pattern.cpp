@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <mutex>
 #include <unordered_map>
 
@@ -7,8 +8,10 @@
 #include "binder/expression/property_expression.h"
 #include "binder/expression_visitor.h"
 #include "catalog/catalog.h"
+#include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/constants.h"
 #include "common/enums/rel_direction.h"
 #include "common/exception/binder.h"
@@ -19,6 +22,7 @@
 #include "function/cast/functions/cast_from_string_functions.h"
 #include "function/gds/rec_joins.h"
 #include "function/rewrite_function.h"
+#include "function/schema/namespace_functions.h"
 #include "function/schema/vector_node_rel_functions.h"
 #include "main/client_context.h"
 #include "main/database_manager.h"
@@ -56,28 +60,221 @@ static bool isRiaGDatabase(main::DatabaseManager* dbManager, const std::string& 
 //    - In UPDATE clause, there are properties to set.
 // We do not store key-value pairs in query graph primarily because we will merge key-value
 // std::pairs with other predicates specified in WHERE clause.
-BoundGraphPattern Binder::bindGraphPattern(const std::vector<PatternElement>& graphPattern) {
+NamespaceSet Binder::bindNamespaceSelector(const NamespaceSelector& selector) const {
+    if (selector.all) {
+        return NamespaceSet{};
+    }
+    std::vector<namespace_id_t> ids;
+    if (selector.global) {
+        ids.push_back(GLOBAL_NAMESPACE_ID);
+    }
+    const auto* namespaces = Catalog::Get(*clientContext)->getNamespaces();
+    for (const auto& name : selector.names) {
+        if (!namespaces) {
+            throw BinderException("Namespace " + name + " does not exist.");
+        }
+        ids.push_back(namespaces->resolve(transaction::Transaction::Get(*clientContext), name));
+    }
+    if (ids.empty()) {
+        throw BinderException("A finite namespace selection must not be empty.");
+    }
+    return NamespaceSet::finite(std::move(ids));
+}
+
+std::shared_ptr<Expression> Binder::bindNamespaceReadPredicate(const NodePattern& pattern,
+    NodeOrRelExpression& entity) {
+    entity.namespaceMutable |= namespaceMayMutate;
+    if (namespaceReadBase.isUnrestricted() && !pattern.getNamespaceSelector()) {
+        return nullptr;
+    }
+    auto selected = namespaceReadBase;
+    if (pattern.getNamespaceSelector()) {
+        selected = selected.intersect(bindNamespaceSelector(*pattern.getNamespaceSelector()));
+    }
+    if (selected.isUnrestricted()) {
+        return nullptr;
+    }
+    return function::createNamespacePredicate(entity, std::move(selected), clientContext,
+        getUniqueExpressionName("namespace_match"));
+}
+
+void Binder::prepareNamespaceWrites(const std::optional<NamespaceSelector>& selector,
+    const std::unordered_set<std::string>& existing, bool merge) {
+    namespaceExistingPatterns = existing;
+    namespaceNewTargets.clear();
+    namespaceWriteAssertions.clear();
+    namespaceMergeBinding = merge;
+    namespaceReadBase = clientContext->getNamespaceSelection();
+    if (selector) {
+        if (selector->all || selector->names.size() + selector->global != 1) {
+            throw BinderException("A write namespace selector must name exactly one namespace.");
+        }
+        namespaceWriteDefault = bindNamespaceSelector(*selector).getSingleton();
+    } else if (clientContext->getNamespaceSelection().isUnrestricted()) {
+        namespaceWriteDefault = GLOBAL_NAMESPACE_ID;
+    } else {
+        namespaceWriteDefault = clientContext->getNamespaceSelection().getSingleton();
+    }
+}
+
+void Binder::bindNamespaceWriteTarget(const NodePattern& pattern, NodeOrRelExpression& entity,
+    expression_vector& matchPredicates) {
+    const auto& entries = entity.getEntries();
+    if (!pattern.getNamespaceSelector() && namespaceWriteDefault == GLOBAL_NAMESPACE_ID &&
+        !namespaceMayMutate && std::all_of(entries.begin(), entries.end(), [](const auto* entry) {
+            return !entry->getOwningCatalog() || !entry->getOwningCatalog()->getNamespaces();
+        })) {
+        // With only implicit-global owners, every new target is already zero.
+        // Avoid allocating namespace target/assertion tracking for ordinary writes.
+        return;
+    }
+    std::optional<namespace_id_t> explicitTarget;
+    if (pattern.getNamespaceSelector()) {
+        const auto& selector = *pattern.getNamespaceSelector();
+        if (selector.all || selector.names.size() + selector.global != 1) {
+            throw BinderException("A write pattern must name exactly one namespace.");
+        }
+        explicitTarget = bindNamespaceSelector(selector).getSingleton();
+    }
+    if (!pattern.getVariableName().empty() &&
+        namespaceExistingPatterns.contains(pattern.getVariableName())) {
+        if (explicitTarget) {
+            if (auto assertion = function::createNamespacePredicate(entity,
+                    NamespaceSet::single(*explicitTarget), clientContext,
+                    getUniqueExpressionName("namespace_assert"), true)) {
+                namespaceWriteAssertions.push_back(std::move(assertion));
+            }
+        }
+        return;
+    }
+    const auto existing = namespaceNewTargets.find(entity.getUniqueName());
+    if (existing != namespaceNewTargets.end()) {
+        if (explicitTarget && *explicitTarget != existing->second) {
+            throw BinderException("Conflicting namespace targets for the same new variable.");
+        }
+        return;
+    }
+    const auto target = explicitTarget ? explicitTarget : namespaceWriteDefault;
+    if (!target) {
+        throw BinderException(
+            "An explicit namespace target is required with a multi-namespace session selection.");
+    }
+    entity.namespaceWriteTarget = *target;
+    namespaceMayMutate |= *target != GLOBAL_NAMESPACE_ID;
+    entity.namespaceMutable = namespaceMayMutate;
+    namespaceNewTargets.emplace(entity.getUniqueName(), *target);
+    auto* transaction = transaction::Transaction::Get(*clientContext);
+    for (auto* entry : entries) {
+        // Entries a remote partition provider hands out have no owning catalog, and so no
+        // namespace policy.
+        const auto* owner = entry->getOwningCatalog();
+        const auto* namespaces = owner ? owner->getNamespaces() : nullptr;
+        const auto* policy =
+            namespaces ? namespaces->getPolicy(transaction, entry->getTableID()) : nullptr;
+        if (policy && !policy->allowed.contains(*target)) {
+            throw BinderException(
+                "Namespace target is not allowed for table " + entry->getName() + ".");
+        }
+        if (*target != GLOBAL_NAMESPACE_ID) {
+            if (owner != Catalog::Get(*clientContext)) {
+                throw BinderException(
+                    "Named namespace writes require the owning catalog to be selected.");
+            }
+            for (const auto* index : owner->getIndexEntries(transaction, entry->getTableID())) {
+                const auto type = StringUtils::getUpper(index->getIndexType());
+                if (type != "HASH" && type != "ART" && type != "NAMESPACE_HASH") {
+                    throw BinderException(
+                        "Named namespace writes are not supported for tables with FTS/vector or "
+                        "other extension indexes in this version.");
+                }
+            }
+            if (entry->getType() == CatalogEntryType::NODE_TABLE_ENTRY) {
+                const auto& node = entry->constCast<NodeTableCatalogEntry>();
+                if (node.isPartitioned() || node.isPartitionChild() || node.getScanFunction() ||
+                    node.getStorageFormat() != StorageFormat::NONE || !node.getStorage().empty()) {
+                    throw BinderException("Named namespace writes require a native, unpartitioned "
+                                          "stored node table.");
+                }
+            } else {
+                const auto& rel = entry->constCast<RelGroupCatalogEntry>();
+                if (rel.getScanFunction() || rel.getStorageFormat() != StorageFormat::NONE ||
+                    !rel.getStorage().empty()) {
+                    throw BinderException(
+                        "Named namespace writes require a native stored relationship table.");
+                }
+            }
+        }
+    }
+    if (namespaceMergeBinding) {
+        if (auto predicate =
+                function::createNamespacePredicate(entity, NamespaceSet::single(*target),
+                    clientContext, getUniqueExpressionName("namespace_merge"))) {
+            matchPredicates.push_back(std::move(predicate));
+        }
+    }
+}
+
+BoundGraphPattern Binder::bindGraphPattern(const std::vector<PatternElement>& graphPattern,
+    bool namespaceWrite) {
     auto queryGraphCollection = QueryGraphCollection();
+    expression_vector namespacePredicates;
     for (auto& patternElement : graphPattern) {
-        queryGraphCollection.addAndMergeQueryGraphIfConnected(bindPatternElement(patternElement));
+        queryGraphCollection.addAndMergeQueryGraphIfConnected(
+            bindPatternElement(patternElement, namespacePredicates, namespaceWrite));
     }
     queryGraphCollection.finalize();
     auto boundPattern = BoundGraphPattern();
     boundPattern.queryGraphCollection = std::move(queryGraphCollection);
+    for (const auto& predicate : namespacePredicates) {
+        boundPattern.where = expressionBinder.combineBooleanExpressions(ExpressionType::AND,
+            boundPattern.where, predicate);
+    }
     return boundPattern;
 }
 
 // Grammar ensures pattern element is always connected and thus can be bound as a query graph.
-QueryGraph Binder::bindPatternElement(const PatternElement& patternElement) {
+QueryGraph Binder::bindPatternElement(const PatternElement& patternElement,
+    expression_vector& namespacePredicates, bool namespaceWrite) {
     auto queryGraph = QueryGraph();
     expression_vector nodeAndRels;
     auto leftNode = bindQueryNode(*patternElement.getFirstNodePattern(), queryGraph);
+    if (namespaceWrite) {
+        bindNamespaceWriteTarget(*patternElement.getFirstNodePattern(), *leftNode,
+            namespacePredicates);
+    }
+    if (!namespaceWrite) {
+        leftNode->namespaceDeleteScope = namespaceReadBase;
+        if (auto predicate =
+                bindNamespaceReadPredicate(*patternElement.getFirstNodePattern(), *leftNode)) {
+            namespacePredicates.push_back(std::move(predicate));
+        }
+    }
     nodeAndRels.push_back(leftNode);
     for (auto i = 0u; i < patternElement.getNumPatternElementChains(); ++i) {
         auto patternElementChain = patternElement.getPatternElementChain(i);
         auto rightNode = bindQueryNode(*patternElementChain->getNodePattern(), queryGraph);
         auto rel =
             bindQueryRel(*patternElementChain->getRelPattern(), leftNode, rightNode, queryGraph);
+        if (namespaceWrite) {
+            bindNamespaceWriteTarget(*patternElementChain->getNodePattern(), *rightNode,
+                namespacePredicates);
+            bindNamespaceWriteTarget(*patternElementChain->getRelPattern(), *rel,
+                namespacePredicates);
+        }
+        if (!namespaceWrite) {
+            rightNode->namespaceDeleteScope = namespaceReadBase;
+            rel->namespaceDeleteScope = namespaceReadBase;
+            if (auto predicate = bindNamespaceReadPredicate(*patternElementChain->getNodePattern(),
+                    *rightNode)) {
+                namespacePredicates.push_back(std::move(predicate));
+            }
+            if (!rel->isRecursive()) {
+                if (auto predicate =
+                        bindNamespaceReadPredicate(*patternElementChain->getRelPattern(), *rel)) {
+                    namespacePredicates.push_back(std::move(predicate));
+                }
+            }
+        }
         nodeAndRels.push_back(rel);
         nodeAndRels.push_back(rightNode);
         leftNode = rightNode;
@@ -161,7 +358,7 @@ static std::vector<std::string> getPropertyNames(const std::vector<TableCatalogE
 
 static std::shared_ptr<PropertyExpression> createPropertyExpression(const std::string& propertyName,
     const std::string& uniqueVariableName, const std::string& rawVariableName,
-    const std::vector<TableCatalogEntry*>& entries) {
+    const std::vector<TableCatalogEntry*>& entries, main::ClientContext* clientContext) {
     table_id_map_t<SingleLabelPropertyInfo> infos;
     std::vector<LogicalType> dataTypes;
     for (auto& entry : entries) {
@@ -180,8 +377,19 @@ static std::shared_ptr<PropertyExpression> createPropertyExpression(const std::s
         infos.insert({entry->getTableID(), std::move(info)});
     }
     LogicalType maxType = LogicalTypeUtils::combineTypes(dataTypes);
-    return std::make_shared<PropertyExpression>(std::move(maxType), propertyName,
+    auto result = std::make_shared<PropertyExpression>(std::move(maxType), propertyName,
         uniqueVariableName, rawVariableName, std::move(infos));
+    auto* transaction = transaction::Transaction::Get(*clientContext);
+    for (const auto* entry : entries) {
+        // Entries a remote partition provider hands out are never stored in a catalog set, so
+        // they have no owning catalog and no namespace policy.
+        const auto* owner = entry->getOwningCatalog();
+        if (const auto* namespaces = owner ? owner->getNamespaces() : nullptr) {
+            const auto* policy = namespaces->getPolicy(transaction, entry->getTableID());
+            result->localPrimaryKey |= policy && policy->localPrimaryKey;
+        }
+    }
+    return result;
 }
 
 static void checkRelDirectionTypeAgainstStorageDirection(const RelExpression* rel) {
@@ -290,6 +498,7 @@ std::shared_ptr<RelExpression> Binder::bindQueryRel(const RelPattern& relPattern
     queryRel->setLeftNode(leftNode);
     queryRel->setRightNode(rightNode);
     queryRel->setAlias(parsedName);
+    queryRel->namespaceMutable = namespaceMayMutate;
     // Carry the database context for each rel entry so planning/physical routing
     // (cardinality estimation, extend scan) can resolve the right storage manager.
     for (auto& [entry, dbName] : dbNames) {
@@ -366,8 +575,8 @@ std::shared_ptr<RelExpression> Binder::createNonRecursiveQueryRel(const std::str
     std::vector<std::shared_ptr<PropertyExpression>> propertyExpressions;
     if (!entries.empty()) {
         for (auto& propertyName : getPropertyNames(entries)) {
-            propertyExpressions.push_back(
-                createPropertyExpression(propertyName, uniqueName, parsedName, entries));
+            propertyExpressions.push_back(createPropertyExpression(propertyName, uniqueName,
+                parsedName, entries, clientContext));
         }
     }
     auto queryRel = std::make_shared<RelExpression>(LogicalType::REL(getBaseRelStructFields()),
@@ -524,6 +733,12 @@ std::shared_ptr<RelExpression> Binder::createRecursiveQueryRel(const parser::Rel
     // Bind predicates in (r, n | WHERE )
     bool emptyRecursivePattern = false;
     std::shared_ptr<Expression> nodePredicate = nullptr;
+    relPredicate = expressionBinder.combineBooleanExpressions(ExpressionType::AND, relPredicate,
+        bindNamespaceReadPredicate(relPattern, *rel));
+    if (!namespaceReadBase.isUnrestricted()) {
+        nodePredicate = function::createNamespacePredicate(*node, namespaceReadBase, clientContext,
+            getUniqueExpressionName("namespace_recursive_node"));
+    }
     if (recursivePatternInfo->whereExpression != nullptr) {
         expressionBinder.config.disableLabelFunctionLiteralRewrite = true;
         auto wherePredicate = bindWhereExpression(*recursivePatternInfo->whereExpression);
@@ -752,11 +967,12 @@ std::shared_ptr<NodeExpression> Binder::createQueryNode(const std::string& parse
     std::vector<std::shared_ptr<PropertyExpression>> propertyExpressions;
     for (auto& propertyName : getPropertyNames(entries)) {
         propertyExpressions.push_back(
-            createPropertyExpression(propertyName, uniqueName, parsedName, entries));
+            createPropertyExpression(propertyName, uniqueName, parsedName, entries, clientContext));
     }
     auto queryNode = std::make_shared<NodeExpression>(LogicalType::NODE(getBaseNodeStructFields()),
         uniqueName, parsedName, entries);
     queryNode->setAlias(parsedName);
+    queryNode->namespaceMutable = namespaceMayMutate;
     // Keep every property bound: the insert path and explicit `n.prop` access rely on the full
     // set. Internal columns are hidden from projection (below), not dropped here.
     for (auto& property : propertyExpressions) {

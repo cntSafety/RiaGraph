@@ -1,0 +1,203 @@
+-DATASET CSV EMPTY
+
+--
+
+# A DECIMAL inside a LIST, ARRAY, STRUCT or MAP has to be cast to another DECIMAL precision or
+# scale the way a scalar DECIMAL is. The nested cast chose between casting and copying the leaf by
+# the type ID only, and two DECIMALs share it, so the raw integers were copied into a vector of
+# another physical width and scale: a negative DECIMAL(3,2) came back as 651.56 in DECIMAL(6,2)
+# (the INT16 bit pattern read into an INT32), and a scale change was not applied at all.
+
+-CASE CastDecimalListToOtherPrecisionOrScale
+-LOG WiderPhysicalType
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(3,2)[]'), 'DECIMAL(6,2)[]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(6,2)[]'), 'DECIMAL(12,2)[]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(12,2)[]'), 'DECIMAL(20,2)[]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([-3.8, 1.5], 'DECIMAL(3,2)[]'), 'DECIMAL(38,2)[]')
+---- 1
+[-3.80,1.50]
+-LOG ScaleUp
+-STATEMENT RETURN CAST(CAST([3.8], 'DECIMAL(3,2)[]'), 'DECIMAL(6,3)[]')
+---- 1
+[3.800]
+-STATEMENT RETURN CAST(CAST([-3.8, 2.5], 'DECIMAL(4,2)[]'), 'DECIMAL(4,3)[]')
+---- 1
+[-3.800,2.500]
+-LOG ScaleDown
+-STATEMENT RETURN CAST(CAST([3.8, 2.5], 'DECIMAL(4,2)[]'), 'DECIMAL(4,1)[]')
+---- 1
+[3.8,2.5]
+-STATEMENT RETURN CAST(CAST([12.34], 'DECIMAL(4,2)[]'), 'DECIMAL(3,1)[]')
+---- 1
+[12.3]
+-STATEMENT RETURN CAST(CAST([-12.35, 12.35], 'DECIMAL(4,2)[]'), 'DECIMAL(3,1)[]')
+---- 1
+[-12.4,12.4]
+-LOG NarrowerPhysicalType
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(20,2)[]'), 'DECIMAL(3,1)[]')
+---- 1
+[-3.8]
+-LOG NullElementsAndEmptyLists
+-STATEMENT RETURN CAST(CAST([NULL, -3.8, NULL], 'DECIMAL(3,2)[]'), 'DECIMAL(6,3)[]')
+---- 1
+[,-3.800,]
+-STATEMENT RETURN CAST(CAST([], 'DECIMAL(3,2)[]'), 'DECIMAL(6,3)[]')
+---- 1
+[]
+
+-CASE CastDecimalArrayToOtherPrecisionOrScale
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(3,2)[1]'), 'DECIMAL(6,2)[1]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([2.4, -3.8, 4.4], 'DECIMAL(3,2)[3]'), 'DECIMAL(6,2)[3]')
+---- 1
+[2.40,-3.80,4.40]
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(6,2)[1]'), 'DECIMAL(12,2)[1]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(12,2)[1]'), 'DECIMAL(20,2)[1]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([3.8], 'DECIMAL(3,2)[1]'), 'DECIMAL(6,3)[1]')
+---- 1
+[3.800]
+-STATEMENT RETURN CAST(CAST([3.8, 2.5], 'DECIMAL(4,2)[2]'), 'DECIMAL(4,1)[2]')
+---- 1
+[3.8,2.5]
+-STATEMENT RETURN CAST(CAST([-3.8, 2.5], 'DECIMAL(4,2)[2]'), 'DECIMAL(4,3)[2]')
+---- 1
+[-3.800,2.500]
+-STATEMENT RETURN CAST(CAST([12.34], 'DECIMAL(4,2)[1]'), 'DECIMAL(3,1)[1]')
+---- 1
+[12.3]
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(6,2)[1]'), 'DECIMAL(3,2)[1]')
+---- 1
+[-3.80]
+-LOG ListToArrayAndBack
+-STATEMENT RETURN CAST(CAST([-3.8, 1.25], 'DECIMAL(3,2)[]'), 'DECIMAL(6,3)[2]')
+---- 1
+[-3.800,1.250]
+-STATEMENT RETURN CAST(CAST([-3.8, 1.25], 'DECIMAL(3,2)[2]'), 'DECIMAL(6,3)[]')
+---- 1
+[-3.800,1.250]
+
+-CASE CastStoredDecimalListToOtherPrecisionOrScale
+-STATEMENT CREATE NODE TABLE T(id INT64 PRIMARY KEY, l DECIMAL(3,2)[], a DECIMAL(3,2)[2]);
+---- ok
+-STATEMENT CREATE (:T {id: 1, l: CAST([-3.8, 1.0] AS DECIMAL(3,2)[]), a: CAST([-3.8, 1.0] AS DECIMAL(3,2)[2])});
+---- ok
+-STATEMENT CREATE (:T {id: 2, l: CAST([NULL, -9.99] AS DECIMAL(3,2)[])});
+---- ok
+-STATEMENT CREATE (:T {id: 3});
+---- ok
+-STATEMENT MATCH (t:T) RETURN t.id, CAST(t.l AS DECIMAL(6,2)[]), CAST(t.a AS DECIMAL(6,2)[2]);
+---- 3
+1|[-3.80,1.00]|[-3.80,1.00]
+2|[,-9.99]|
+3||
+-STATEMENT MATCH (t:T) RETURN t.id, CAST(t.l AS DECIMAL(5,3)[]), CAST(t.l AS DECIMAL(3,1)[]);
+---- 3
+1|[-3.800,1.000]|[-3.8,1.0]
+2|[,-9.990]|[,-10.0]
+3||
+-STATEMENT MATCH (t:T) WHERE t.id = 1 RETURN CAST(t.a AS DECIMAL(4,3)[]);
+---- 1
+[-3.800,1.000]
+
+# A value that does not fit the target raises the error the scalar cast raises.
+-CASE CastDecimalListOverflow
+-STATEMENT RETURN CAST(CAST(999.99 AS DECIMAL(5,2)) AS DECIMAL(3,2))
+---- error
+Overflow exception: Decimal Cast Failed: input 999.99 is not in range of DECIMAL(3, 2)
+-STATEMENT RETURN CAST(CAST([999.99], 'DECIMAL(5,2)[]'), 'DECIMAL(3,2)[]')
+---- error
+Overflow exception: Decimal Cast Failed: input 999.99 is not in range of DECIMAL(3, 2)
+-STATEMENT RETURN CAST(CAST([1.5, 999.99], 'DECIMAL(5,2)[2]'), 'DECIMAL(3,2)[2]')
+---- error
+Overflow exception: Decimal Cast Failed: input 999.99 is not in range of DECIMAL(3, 2)
+-LOG ScaleUpOverflow
+-STATEMENT RETURN CAST(CAST(99.99 AS DECIMAL(4,2)) AS DECIMAL(4,3))
+---- error
+Overflow exception: Decimal Cast Failed: input 99.99 is not in range of DECIMAL(4, 3)
+-STATEMENT RETURN CAST(CAST([99.99], 'DECIMAL(4,2)[]'), 'DECIMAL(4,3)[]')
+---- error
+Overflow exception: Decimal Cast Failed: input 99.99 is not in range of DECIMAL(4, 3)
+-LOG RoundingOverflow
+-STATEMENT RETURN CAST(CAST(99.99 AS DECIMAL(4,2)) AS DECIMAL(3,1))
+---- error
+Overflow exception: Decimal Cast Failed: input 99.99 is not in range of DECIMAL(3, 1)
+-STATEMENT RETURN CAST(CAST([99.99], 'DECIMAL(4,2)[]'), 'DECIMAL(3,1)[]')
+---- error
+Overflow exception: Decimal Cast Failed: input 99.99 is not in range of DECIMAL(3, 1)
+
+-CASE CastDecimalInsideOtherNestedTypes
+-LOG StructField
+-STATEMENT RETURN CAST({a: CAST(-3.8 AS DECIMAL(3,2))} AS STRUCT(a DECIMAL(6,2)))
+---- 1
+{a: -3.80}
+-STATEMENT RETURN CAST({a: CAST(-3.8 AS DECIMAL(3,2)), b: 'x'} AS STRUCT(a DECIMAL(6,3), b STRING))
+---- 1
+{a: -3.800, b: x}
+-STATEMENT RETURN CAST([{a: CAST(-3.8 AS DECIMAL(3,2))}] AS STRUCT(a DECIMAL(20,1))[])
+---- 1
+[{a: -3.8}]
+-STATEMENT RETURN CAST({a: CAST(999.99 AS DECIMAL(5,2))} AS STRUCT(a DECIMAL(3,2)))
+---- error
+Overflow exception: Decimal Cast Failed: input 999.99 is not in range of DECIMAL(3, 2)
+-LOG NestedList
+-STATEMENT RETURN CAST(CAST([[-3.8], [1.5, 2.25]], 'DECIMAL(4,2)[][]'), 'DECIMAL(10,3)[][]')
+---- 1
+[[-3.800],[1.500,2.250]]
+-STATEMENT RETURN CAST(CAST([[-3.8, 1.5], [2.25, 0]], 'DECIMAL(4,2)[2][2]'), 'DECIMAL(10,1)[][]')
+---- 1
+[[-3.8,1.5],[2.3,0.0]]
+-LOG MapKeyAndValue
+-STATEMENT RETURN CAST(map([1, 2], [CAST(-3.8 AS DECIMAL(3,2)), CAST(1.5 AS DECIMAL(3,2))]) AS MAP(INT64, DECIMAL(6,3)))
+---- 1
+{1=-3.800, 2=1.500}
+-STATEMENT RETURN CAST(map([CAST(-3.8 AS DECIMAL(3,2))], [1]) AS MAP(DECIMAL(20,1), INT64))
+---- 1
+{-3.8=1}
+-LOG UnionField
+-STATEMENT RETURN CAST([CAST(-3.8 AS DECIMAL(3,2))] AS UNION(a DECIMAL(6,3))[])
+---- 1
+[-3.800]
+
+# These were right before the fix and have to stay so.
+-CASE CastDecimalListBoundariesKeepWorking
+-STATEMENT RETURN CAST(CAST(-3.8 AS DECIMAL(3,2)) AS DECIMAL(6,2))
+---- 1
+-3.80
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(3,2)[]'), 'DECIMAL(4,2)[]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(6,2)[]'), 'DECIMAL(3,2)[]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(20,2)[]'), 'DECIMAL(6,2)[]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([-3.8], 'DECIMAL(3,2)[]'), 'DECIMAL(3,2)[]')
+---- 1
+[-3.80]
+-STATEMENT RETURN CAST(CAST([-3.8, 1.0], 'DECIMAL(3,2)[]'), 'DOUBLE[]')
+---- 1
+[-3.800000,1.000000]
+-STATEMENT RETURN CAST(CAST([-3.8, 1.0], 'DECIMAL(3,2)[]'), 'INT64[]')
+---- 1
+[-4,1]
+-STATEMENT RETURN CAST(CAST([-3, 1], 'INT16[]'), 'INT32[]')
+---- 1
+[-3,1]
+-STATEMENT RETURN CAST(CAST([-3, 1], 'INT16[]'), 'DECIMAL(6,2)[]')
+---- 1
+[-3.00,1.00]
+-STATEMENT RETURN [CAST(-3.8 AS DECIMAL(3,2)), CAST(1 AS DECIMAL(6,2))]
+---- 1
+[-3.80,1.00]

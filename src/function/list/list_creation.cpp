@@ -56,7 +56,19 @@ static std::unique_ptr<FunctionBindData> bindFunc(const ScalarBindFuncInput& inp
     } else {
         binder::ExpressionUtil::tryCombineDataType(input.arguments, combinedType);
         if (combinedType.getLogicalTypeID() == LogicalTypeID::ANY) {
-            combinedType = LogicalType::INT64();
+            if (distinctTypes.empty()) { // Only NULLs, e.g. [NULL, NULL].
+                combinedType = LogicalType::INT64();
+            } else {
+                // Same type ID but no combined type, e.g. two maps whose fields of the same name
+                // have incompatible types. Target the first one, so that the error names the
+                // two element types rather than INT64.
+                for (auto& arg : input.arguments) {
+                    if (arg->getDataType().getLogicalTypeID() != LogicalTypeID::ANY) {
+                        combinedType = arg->getDataType().copy();
+                        break;
+                    }
+                }
+            }
         }
     }
     if (combinedType.containsAny()) {

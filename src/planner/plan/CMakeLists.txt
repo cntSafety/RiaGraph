@@ -22,6 +22,7 @@ add_library(riag_planner_plan_operator
         append_set.cpp
         append_simple.cpp
         append_unwind.cpp
+        plan_assert.cpp
         plan_copy.cpp
         plan_join_order.cpp
         plan_node_scan.cpp

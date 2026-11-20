@@ -1,5 +1,6 @@
 #pragma once
 
+#include "binder/query/updating_clause/bound_namespace_move.h"
 #include "binder/query/updating_clause/bound_set_info.h"
 #include "planner/operator/logical_operator.h"
 #include "planner/operator/persistent/logical_insert.h"
@@ -11,6 +12,8 @@ class LogicalMerge final : public LogicalOperator {
     static constexpr LogicalOperatorType type_ = LogicalOperatorType::MERGE;
 
 public:
+    std::vector<binder::BoundNamespaceMove> onMatchNamespaceMoves;
+    std::vector<binder::BoundNamespaceMove> onCreateNamespaceMoves;
     LogicalMerge(std::shared_ptr<binder::Expression> existenceMark, binder::expression_vector keys,
         std::shared_ptr<LogicalOperator> child)
         : LogicalOperator{type_, std::move(child)}, existenceMark{std::move(existenceMark)},

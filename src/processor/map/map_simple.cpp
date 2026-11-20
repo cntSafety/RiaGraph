@@ -8,6 +8,7 @@
 #include "planner/operator/simple/logical_extension.h"
 #include "planner/operator/simple/logical_graph.h"
 #include "planner/operator/simple/logical_import_db.h"
+#include "planner/operator/simple/logical_namespace.h"
 #include "planner/operator/simple/logical_use_database.h"
 #include "processor/operator/persistent/copy_to.h"
 #include "processor/operator/simple/attach_database.h"
@@ -16,6 +17,7 @@
 #include "processor/operator/simple/import_db.h"
 #include "processor/operator/simple/install_extension.h"
 #include "processor/operator/simple/load_extension.h"
+#include "processor/operator/simple/namespace_command.h"
 #include "processor/operator/simple/uninstall_extension.h"
 #include "processor/operator/simple/use_database.h"
 #include "processor/operator/simple/use_graph.h"
@@ -90,6 +92,8 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapExportDatabase(
         FactorizedTableUtils::getSingleStringColumnFTable(MemoryManager::Get(*clientContext));
     auto exportDB = std::make_unique<ExportDB>(boundFileInfo->copy(),
         exportDatabase->isSchemaOnly(), messageTable, getOperatorID(), std::move(printInfo));
+    exportDB->namespaceAware = exportDatabase->namespaceAware;
+    exportDB->namespaceImport = exportDatabase->namespaceImport;
     auto sink = std::make_unique<DummySimpleSink>(messageTable, getOperatorID());
     sink->addChild(std::move(exportDB));
     for (auto child : exportDatabase->getChildren()) {
@@ -166,6 +170,14 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapUseGraph(const LogicalOperator*
         FactorizedTableUtils::getSingleStringColumnFTable(MemoryManager::Get(*clientContext));
     return std::make_unique<UseGraph>(useGraph->getGraphName(), std::move(messageTable),
         getOperatorID(), std::move(printInfo));
+}
+
+std::unique_ptr<PhysicalOperator> PlanMapper::mapNamespace(const LogicalOperator* logicalOperator) {
+    const auto& op = logicalOperator->constCast<LogicalNamespace>();
+    auto messageTable =
+        FactorizedTableUtils::getSingleStringColumnFTable(MemoryManager::Get(*clientContext));
+    return std::make_unique<NamespaceCommand>(op.action, op.name, op.newName, op.ifExists,
+        op.selector, std::move(messageTable), getOperatorID(), std::make_unique<OPPrintInfo>());
 }
 
 } // namespace processor

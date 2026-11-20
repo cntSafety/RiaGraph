@@ -1,9 +1,13 @@
 #pragma once
 
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <unordered_map>
 #include <vector>
 
+#include "common/namespace_set.h"
 #include "common/types/types.h"
 #include "storage/index/hash_index.h"
 #include "storage/predicate/column_predicate.h"
@@ -47,6 +51,7 @@ struct RIAG_API NodeTableScanState : TableScanState {
 // There is a vtable bug related to the Apple clang v15.0.0+. Adding the `FINAL` specifier to
 // derived class causes casting failures in Apple platform.
 struct RIAG_API NodeTableInsertState : TableInsertState {
+    common::namespace_id_t namespaceID = common::GLOBAL_NAMESPACE_ID;
     common::ValueVector& nodeIDVector;
     const common::ValueVector& pkVector;
     std::vector<std::unique_ptr<Index::InsertState>> indexInsertStates;
@@ -112,6 +117,7 @@ private:
 };
 
 class StorageManager;
+class NamespacePrimaryKeyIndex;
 
 class RIAG_API NodeTable : public Table {
 public:
@@ -139,7 +145,8 @@ public:
 
     // Return the max node offset during insertions.
     common::offset_t validateUniquenessConstraint(const transaction::Transaction* transaction,
-        const std::vector<common::ValueVector*>& propertyVectors) const;
+        const std::vector<common::ValueVector*>& propertyVectors,
+        common::namespace_id_t namespaceID = common::GLOBAL_NAMESPACE_ID) const;
 
     void initInsertState(main::ClientContext* context, TableInsertState& insertState) override;
     void insert(transaction::Transaction* transaction, TableInsertState& insertState) override;
@@ -178,6 +185,15 @@ public:
 
     common::column_id_t getPKColumnID() const { return pkColumnID; }
     Index* tryGetPrimaryKeyIndex() const;
+    bool hasLocalPrimaryKey() const { return namespacePKIndex != nullptr; }
+    void enableLocalPrimaryKey();
+    bool lookupPKInNamespace(const transaction::Transaction* transaction, common::ValueVector* key,
+        uint64_t position, common::namespace_id_t namespaceID, common::offset_t& result) const;
+    bool lookupPKInNamespaces(const transaction::Transaction* transaction, common::ValueVector* key,
+        uint64_t position, const common::NamespaceSet& scope,
+        std::vector<common::offset_t>& results) const;
+    void moveNamespace(transaction::Transaction* transaction, common::offset_t offset,
+        common::namespace_id_t destination);
     PrimaryKeyIndex* tryGetPKIndex() const;
     PrimaryKeyIndex* getPKIndex() const {
         auto* index = tryGetPKIndex();
@@ -218,7 +234,7 @@ public:
     void finalizeCheckpoint(main::ClientContext& context) override;
     void reclaimStorage(PageAllocator& pageAllocator) const override;
 
-    void rollbackPKIndexInsert(main::ClientContext* context, common::row_idx_t startRow,
+    void rollbackIndexInsert(main::ClientContext* context, common::row_idx_t startRow,
         common::row_idx_t numRows_, common::node_group_idx_t nodeGroupIdx_);
     void rollbackGroupCollectionInsert(common::row_idx_t numRows_);
 
@@ -285,6 +301,22 @@ private:
     // freed by reclaimDroppedIndexes() during checkpoint (after the dropping tx is durable).
     std::vector<IndexHolder> droppedIndexes;
     NodeTableVersionRecordHandler versionRecordHandler;
+    catalog::Catalog* namespaceOwner;
+    NamespacePrimaryKeyIndex* namespacePKIndex = nullptr;
+    // ART secondary indexes are changed in place by DELETE (erase) and SET (re-key), not through
+    // the undo buffer. Per write transaction, the rows whose entries it changed this way, so its
+    // rollback can rebuild them from the restored rows (see trackSecondaryIndexChange).
+    std::mutex secondaryIndexChangesMtx;
+    std::unordered_map<common::transaction_t, std::shared_ptr<std::vector<common::offset_t>>>
+        secondaryIndexChanges;
+
+    void trackSecondaryIndexChange(transaction::Transaction* transaction,
+        common::offset_t nodeOffset);
+    void restoreSecondaryIndexEntries(transaction::Transaction& transaction,
+        const std::vector<common::offset_t>& offsets);
+
+public:
+    catalog::Catalog* getOwningCatalog() const { return namespaceOwner; }
 };
 
 } // namespace storage

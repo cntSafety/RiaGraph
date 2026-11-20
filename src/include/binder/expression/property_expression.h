@@ -35,13 +35,16 @@ public:
 
     PropertyExpression(const PropertyExpression& other)
         : Expression{expressionType_, other.dataType.copy(), other.uniqueName},
-          propertyName{other.propertyName}, uniqueVarName{other.uniqueVarName},
-          rawVariableName{other.rawVariableName}, infos{copyUnorderedMap(other.infos)} {}
+          localPrimaryKey{other.localPrimaryKey}, propertyName{other.propertyName},
+          uniqueVarName{other.uniqueVarName}, rawVariableName{other.rawVariableName},
+          infos{copyUnorderedMap(other.infos)} {}
 
     // If this property is primary key on all tables.
     bool isPrimaryKey() const;
     // If this property is primary key for given table.
     bool isPrimaryKey(common::table_id_t tableID) const;
+    bool isGloballyUniquePrimaryKey() const { return isPrimaryKey() && !localPrimaryKey; }
+    bool localPrimaryKey = false;
 
     std::string getPropertyName() const { return propertyName; }
     std::string getVariableName() const { return uniqueVarName; }

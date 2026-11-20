@@ -58,6 +58,10 @@ public:
         const std::unordered_map<common::table_id_t, uint64_t>& epochWatermarks,
         common::transaction_t retentionHorizon = common::INVALID_TRANSACTION,
         const std::vector<common::transaction_t>& openStartTSs = {});
+    // Release the storage of tables the catalog no longer contains. The caller guarantees that
+    // no open transaction can still see them: a checkpoint without overlapping readers, or an
+    // in-memory database with no open transaction (which never checkpoints).
+    void reclaimDroppedTables(const catalog::Catalog& catalog);
 
     // Capture the current changeEpoch for every table. Must be called under the
     // write gate so that no active writers can bump epochs concurrently.
@@ -110,6 +114,7 @@ public:
         const main::ClientContext& clientContext);
 
     void setDatabaseHeader(std::unique_ptr<storage::DatabaseHeader> header);
+    void ensureNamespaceStorageVersion(main::ClientContext& context);
 
     static StorageManager* Get(const main::ClientContext& context);
 
@@ -120,7 +125,6 @@ private:
     void createRelTableGroup(catalog::RelGroupCatalogEntry* entry,
         main::ClientContext* context = nullptr);
 
-    void reclaimDroppedTables(const catalog::Catalog& catalog);
     // Reclaim on-disk pages of indexes dropped via DROP INDEX since the last checkpoint.
     void reclaimDroppedIndexes();
 
@@ -128,6 +132,7 @@ private:
     mutable std::shared_mutex mtx;
     std::string databasePath;
     std::unique_ptr<storage::DatabaseHeader> databaseHeader;
+    std::mutex namespaceFormatMutex;
     bool readOnly;
     FileHandle* dataFH;
     std::unordered_map<common::table_id_t, std::unique_ptr<Table>> tables;

@@ -8,7 +8,13 @@ add it to its section 16 and ask.
 
 `scripts/riag-rename.py` is the single implementation of that substitution table.
 Never hand-edit what it covers: fix the script and re-run it. `--check` must be clean
-before every push. Its `--patch` mode is what makes cherry-picks from upstream work.
+before every push.
+
+RiaGraph is developed independently of the project it was forked from. Upstream changes are
+no longer integrated: do not cherry-pick from upstream, and do not shape a change so that it
+stays mergeable with upstream. [`docs/upstream-picks.md`](docs/upstream-picks.md) is the
+closed log of what was taken until October 2026; the script's `--patch` mode served those
+picks and has no use any more.
 
 Inherited CI that depends on infrastructure this fork does not have is registered in
 [`docs/riagraph-open-infra.md`](docs/riagraph-open-infra.md). Those workflows are marked,

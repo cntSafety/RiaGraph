@@ -1,0 +1,83 @@
+-DATASET CSV empty
+
+--
+
+# A two-hop walk over a persistent CSR whose first hop reaches the same bound node twice (two
+# parallel self loops on node 5), and node 5's list straddles the end of the 2048-row cached
+# window: node 0's list holds the hub edges, so node 5's three rels sit at positions hub..hub+2.
+# The first occurrence of node 5 moved the window past the start of its list, and the second
+# occurrence used to skip the part behind the window: 2049 instead of 2052 for a hub of 2046.
+# Expected: 2 * deg(5) via the two self loops + hub via 5 -> 0 = 6 + hub. The hubs of 2045 and
+# 2048 do not straddle the window and are the boundary cases that were always right.
+-CASE CachedWindowRepeatedBoundNodeHub2045
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P);
+---- ok
+-STATEMENT UNWIND range(0, 599) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT COPY (UNWIND range(1, 2045) AS i RETURN 0 AS f, 499 AS t
+                 UNION ALL UNWIND [5, 5] AS s RETURN s AS f, 5 AS t
+                 UNION ALL RETURN 5 AS f, 0 AS t) TO "${DATABASE_PATH}/k.csv" (header=true);
+---- ok
+-STATEMENT COPY K FROM "${DATABASE_PATH}/k.csv" (header=true);
+---- ok
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) WHERE a.id = 5 RETURN count(*);
+---- 1
+2051
+
+-CASE CachedWindowRepeatedBoundNodeHub2046
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P);
+---- ok
+-STATEMENT UNWIND range(0, 599) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT COPY (UNWIND range(1, 2046) AS i RETURN 0 AS f, 499 AS t
+                 UNION ALL UNWIND [5, 5] AS s RETURN s AS f, 5 AS t
+                 UNION ALL RETURN 5 AS f, 0 AS t) TO "${DATABASE_PATH}/k.csv" (header=true);
+---- ok
+-STATEMENT COPY K FROM "${DATABASE_PATH}/k.csv" (header=true);
+---- ok
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) WHERE a.id = 5 RETURN count(*);
+---- 1
+2052
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) WHERE a.id = 5 RETURN b.id, count(*);
+---- 2
+0|2046
+5|6
+
+-CASE CachedWindowRepeatedBoundNodeHub2047ThreeLoops
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P);
+---- ok
+-STATEMENT UNWIND range(0, 599) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT COPY (UNWIND range(1, 2047) AS i RETURN 0 AS f, 499 AS t
+                 UNION ALL UNWIND [5, 5, 5] AS s RETURN s AS f, 5 AS t
+                 UNION ALL RETURN 5 AS f, 0 AS t) TO "${DATABASE_PATH}/k.csv" (header=true);
+---- ok
+-STATEMENT COPY K FROM "${DATABASE_PATH}/k.csv" (header=true);
+---- ok
+# 3 self loops, deg(5) = 4: 3 * 4 + 2047.
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) WHERE a.id = 5 RETURN count(*);
+---- 1
+2059
+
+-CASE CachedWindowRepeatedBoundNodeHub2048
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P);
+---- ok
+-STATEMENT UNWIND range(0, 599) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT COPY (UNWIND range(1, 2048) AS i RETURN 0 AS f, 499 AS t
+                 UNION ALL UNWIND [5, 5] AS s RETURN s AS f, 5 AS t
+                 UNION ALL RETURN 5 AS f, 0 AS t) TO "${DATABASE_PATH}/k.csv" (header=true);
+---- ok
+-STATEMENT COPY K FROM "${DATABASE_PATH}/k.csv" (header=true);
+---- ok
+-STATEMENT MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) WHERE a.id = 5 RETURN count(*);
+---- 1
+2054

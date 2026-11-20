@@ -1,6 +1,7 @@
 add_riag_test(types_test
         hash_test.cpp
         alp_encode_test.cpp
+        assert_clause_test.cpp
         int128_test.cpp
         uint128_test.cpp
         date_test.cpp
@@ -9,6 +10,9 @@ add_riag_test(types_test
         extension_ca_cert_test.cpp
         interval_test.cpp
         null_mask_test.cpp
+        namespace_set_test.cpp
+        namespace_parser_test.cpp
+        namespace_execution_test.cpp
         string_test.cpp
         time_test.cpp
         timestamp_test.cpp
@@ -17,4 +21,5 @@ add_riag_test(types_test
         simd_filter_test.cpp
         timer_test.cpp
         antlr_interval_set_test.cpp
+        parser_input_test.cpp
 )

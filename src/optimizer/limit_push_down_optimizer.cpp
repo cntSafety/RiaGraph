@@ -1,5 +1,7 @@
 #include "optimizer/limit_push_down_optimizer.h"
 
+#include <algorithm>
+
 #include "binder/expression/expression_util.h"
 #include "planner/operator/extend/logical_recursive_extend.h"
 #include "planner/operator/logical_distinct.h"
@@ -41,12 +43,32 @@ void LimitPushDownOptimizer::visitOperator(planner::LogicalOperator* op) {
     switch (op->getOperatorType()) {
     case LogicalOperatorType::LIMIT: {
         auto& limit = op->constCast<LogicalLimit>();
-        if (limit.hasSkipNum() && ExpressionUtil::canEvaluateAsLiteral(*limit.getSkipNum())) {
-            skipNumber = ExpressionUtil::evaluateAsSkipLimit(*limit.getSkipNum());
+        // Without a known number there is no finite row demand to hand down.
+        if ((limit.hasSkipNum() && !ExpressionUtil::canEvaluateAsLiteral(*limit.getSkipNum())) ||
+            (limit.hasLimitNum() && !ExpressionUtil::canEvaluateAsLiteral(*limit.getLimitNum()))) {
+            return;
         }
-        if (limit.hasLimitNum() && ExpressionUtil::canEvaluateAsLiteral(*limit.getLimitNum())) {
-            limitNumber = ExpressionUtil::evaluateAsSkipLimit(*limit.getLimitNum());
+        offset_t innerSkip = 0;
+        offset_t innerLimit = INVALID_LIMIT;
+        if (limit.hasSkipNum()) {
+            innerSkip = ExpressionUtil::evaluateAsSkipLimit(*limit.getSkipNum());
         }
+        if (limit.hasLimitNum()) {
+            innerLimit = ExpressionUtil::evaluateAsSkipLimit(*limit.getLimitNum());
+        }
+        // This operator sits below the ones already visited, so (skipNumber, limitNumber) is
+        // the SKIP/LIMIT that applies to its output. Stacked SKIP/LIMITs compose: the rows kept
+        // are those this operator keeps, minus the first skipNumber of them, at most limitNumber
+        // of those. Overwriting either number instead loses the clauses above (two SKIPs above
+        // a DISTINCT capped it at the inner skip + the outer limit).
+        offset_t remaining = innerLimit;
+        if (innerLimit != INVALID_LIMIT) {
+            remaining = innerLimit > skipNumber ? innerLimit - skipNumber : 0;
+        }
+        // On overflow the saturated skip makes the operators below refuse the push down.
+        skipNumber =
+            innerSkip > INVALID_LIMIT - skipNumber ? INVALID_LIMIT : innerSkip + skipNumber;
+        limitNumber = std::min(remaining, limitNumber);
         visitOperator(limit.getChild(0).get());
         return;
     }
@@ -66,6 +88,13 @@ void LimitPushDownOptimizer::visitOperator(planner::LogicalOperator* op) {
         // remaining LIMIT/SKIP operator on top selects the requested rows. SKIP without LIMIT
         // must not cap DISTINCT, and skip + limit must not overflow.
         if (limitNumber == INVALID_LIMIT || skipNumber >= INVALID_LIMIT - limitNumber) {
+            return;
+        }
+        // A capped DISTINCT stops pulling once it holds enough groups, so a write in its pipeline
+        // would apply to only the rows pulled so far: MATCH (a) SET a.v = 1 RETURN DISTINCT a.v
+        // LIMIT 1 set one row. Planner::planProjectionBody relies on this: it does not
+        // materialize a DISTINCT's output before a LIMIT.
+        if (op->getChild(0)->hasUpdateInPipeline()) {
             return;
         }
         auto& distinctOp = op->cast<LogicalDistinct>();

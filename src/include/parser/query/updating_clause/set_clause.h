@@ -12,9 +12,12 @@ public:
 
     inline void addSetItem(parsed_expr_pair setItem) { setItems.push_back(std::move(setItem)); }
     inline const std::vector<parsed_expr_pair>& getSetItemsRef() const { return setItems; }
+    void addNamespaceMove(NamespaceMove move) { namespaceMoves.push_back(std::move(move)); }
+    const std::vector<NamespaceMove>& getNamespaceMoves() const { return namespaceMoves; }
 
 private:
     std::vector<parsed_expr_pair> setItems;
+    std::vector<NamespaceMove> namespaceMoves;
 };
 
 } // namespace parser

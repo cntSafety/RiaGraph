@@ -1,8 +1,10 @@
-#include "binder/expression/expression_util.h"
+#include "binder/expression/expression.h"
+#include "common/exception/binder.h"
 #include "expression_evaluator/expression_evaluator_utils.h"
 #include "function/string/functions/base_regexp_function.h"
 #include "function/string/vector_string_functions.h"
 #include "re2.h"
+#include <format>
 
 namespace riag {
 namespace function {
@@ -39,24 +41,46 @@ struct RegexpFullMatchStaticPattern : BaseRegexpOperation {
     }
 };
 
-static std::unique_ptr<FunctionBindData> regexFullMatchBindFunc(const ScalarBindFuncInput& input) {
-    if (input.arguments[1]->expressionType == ExpressionType::LITERAL) {
-        auto value = evaluator::ExpressionEvaluatorUtils::evaluateConstantExpression(
-            input.arguments[1], input.context);
-        input.definition->ptrCast<ScalarFunction>()->execFunc =
-            ScalarFunction::BinaryExecWithBindData<string_t, string_t, uint8_t,
-                RegexpFullMatchStaticPattern>;
-        input.definition->ptrCast<ScalarFunction>()->selectFunc =
-            ScalarFunction::BinarySelectWithBindData<string_t, string_t,
-                RegexpFullMatchStaticPattern>;
-        auto patternInStr = value.getValue<std::string>();
-        return std::make_unique<RegexFullMatchBindData>(
-            binder::ExpressionUtil::getDataTypes(input.arguments),
-            BaseRegexpOperation::parseCypherPattern(patternInStr));
-    } else {
-        return std::make_unique<RegexpBindData>(
-            binder::ExpressionUtil::getDataTypes(input.arguments), LogicalType::BOOL());
+// =~ matches STRING against STRING only, as in Cypher: any other operand is a type error, not
+// cast. A NULL literal or a parameter of unknown type has type ANY and is bound as a STRING.
+static void validateOperandType(const binder::Expression& operand) {
+    const auto& type = operand.getDataType();
+    if (type.getLogicalTypeID() == LogicalTypeID::STRING ||
+        type.getLogicalTypeID() == LogicalTypeID::ANY) {
+        return;
     }
+    throw BinderException(
+        std::format("Type mismatch: the operands of =~ must be STRING, but {} has data type {}.",
+            operand.toString(), type.toString()));
+}
+
+// The parameter types of the bind data are the types the binder casts the arguments to, and the
+// execution functions read both arguments as STRING: they must be the declared types, never the
+// types of the arguments.
+static std::unique_ptr<FunctionBindData> regexFullMatchBindFunc(const ScalarBindFuncInput& input) {
+    for (auto& argument : input.arguments) {
+        validateOperandType(*argument);
+    }
+    auto paramTypes = logical_type_vec_t{};
+    paramTypes.push_back(LogicalType::STRING());
+    paramTypes.push_back(LogicalType::STRING());
+    const auto& pattern = input.arguments[1];
+    if (pattern->expressionType == ExpressionType::LITERAL &&
+        pattern->getDataType().getLogicalTypeID() == LogicalTypeID::STRING) {
+        auto value =
+            evaluator::ExpressionEvaluatorUtils::evaluateConstantExpression(pattern, input.context);
+        if (!value.isNull()) {
+            input.definition->ptrCast<ScalarFunction>()->execFunc =
+                ScalarFunction::BinaryExecWithBindData<string_t, string_t, uint8_t,
+                    RegexpFullMatchStaticPattern>;
+            input.definition->ptrCast<ScalarFunction>()->selectFunc =
+                ScalarFunction::BinarySelectWithBindData<string_t, string_t,
+                    RegexpFullMatchStaticPattern>;
+            return std::make_unique<RegexFullMatchBindData>(std::move(paramTypes),
+                BaseRegexpOperation::parseCypherPattern(value.getValue<std::string>()));
+        }
+    }
+    return std::make_unique<RegexpBindData>(std::move(paramTypes), LogicalType::BOOL());
 }
 
 function_set RegexpFullMatchFunction::getFunctionSet() {

@@ -21,6 +21,8 @@
 #include "storage/buffer_manager/memory_manager.h"
 #include "storage/checkpointer.h"
 #include "storage/database_header.h"
+#include "storage/file_handle.h"
+#include "storage/page_manager.h"
 #include "storage/partition_storage_registry.h"
 #include "storage/shadow_utils.h"
 #include "storage/storage_manager.h"
@@ -215,8 +217,12 @@ void DatabaseManager::createGraph(const std::string& graphName,
     // lookup fall back to it while the session is on this graph.
     catalog->setFunctionFallback(mainCatalog);
     auto dbPath = clientContext->getDatabasePath();
+    // An in-memory database keeps its graphs in memory too. The graph's storage manager takes
+    // the main database's own in-memory path: StorageManager, WAL and ShadowFile decide "in
+    // memory" from the path alone, and a made-up name like ":g" is not recognised as one, so
+    // it would create a real file of that name in the working directory.
     auto graphPath = DBConfig::isDBPathInMemory(dbPath) ?
-                         ":" + graphName :
+                         dbPath :
                          storage::StorageUtils::getGraphPath(dbPath, graphName);
     auto storageManager = std::make_unique<storage::StorageManager>(graphPath, false, false,
         *memoryManager, false, clientContext->getDBConfig()->enableDefaultHashIndex,
@@ -309,8 +315,12 @@ void DatabaseManager::dropGraph(const std::string& graphName, main::ClientContex
             auto dbStorageManager = clientContext->getDatabase()->getStorageManager();
             auto databaseHeader = dbStorageManager->getOrInitDatabaseHeader(*clientContext);
             auto newHeader = std::make_unique<storage::DatabaseHeader>(*databaseHeader);
-            newHeader->catalogPageRange.startPageIdx = common::INVALID_PAGE_IDX;
-            newHeader->catalogPageRange.numPages = 0;
+            // The next checkpoint rewrites both ranges. Free the current ones here, or nothing
+            // frees them: the checkpoint only frees the range the header still names. Freed pages
+            // become reusable only after that checkpoint, so the on-disk header stays valid.
+            auto* pageManager = dbStorageManager->getDataFH()->getPageManager();
+            newHeader->updateCatalogPageRange(*pageManager, storage::PageRange{});
+            newHeader->freeMetadataPageRange(*pageManager);
             newHeader->metadataPageRange.startPageIdx = common::INVALID_PAGE_IDX;
             newHeader->metadataPageRange.numPages = 0;
             dbStorageManager->setDatabaseHeader(std::move(newHeader));
@@ -403,8 +413,9 @@ bool DatabaseManager::loadGraph(main::ClientContext* clientContext,
     auto* mainCatalog = clientContext->getDatabase()->getCatalog();
     catalog->setFunctionFallback(mainCatalog);
     auto dbPath = clientContext->getDatabasePath();
+    // In-memory database: same in-memory path as the main database (see createGraph).
     auto graphPath = DBConfig::isDBPathInMemory(dbPath) ?
-                         ":" + graphName :
+                         dbPath :
                          storage::StorageUtils::getGraphPath(dbPath, graphName);
 
     // Check if graph file exists before trying to load
@@ -692,11 +703,11 @@ std::vector<catalog::Catalog*> DatabaseManager::getGraphs() const {
 }
 
 void DatabaseManager::bumpGraphCatalogVersions(
-    const std::unordered_set<catalog::Catalog*>& catalogs) {
+    const std::unordered_set<catalog::Catalog*>& catalogs, bool invalidatePlans) {
     GraphsSharedLock lck{*this};
     for (auto& graph : graphs) {
         if (catalogs.contains(graph.get())) {
-            graph->incrementVersion();
+            graph->incrementVersion(invalidatePlans);
         }
     }
 }

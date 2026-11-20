@@ -34,3 +34,26 @@ Hello
 -STATEMENT RETURN BLOB('\xAA\xBB\xCD\x1A')
 ---- 1
 \xAA\xBB\xCD\x1A
+
+-CASE UnicodeEscapeBounds
+-STATEMENT RETURN "\uFFFF" = "\U0000FFFF"
+---- 1
+True
+-STATEMENT RETURN size("\U0010FFFF")
+---- 1
+1
+-STATEMENT RETURN "\U00110000"
+---- error
+Parser exception: Invalid unicode escape sequence '\U00110000' in string literal: the code point is above U+10FFFF.
+-STATEMENT RETURN "\UFFFFFFFF"
+---- error
+Parser exception: Invalid unicode escape sequence '\UFFFFFFFF' in string literal: the code point is above U+10FFFF.
+-STATEMENT RETURN "\uD800"
+---- error
+Parser exception: Invalid unicode escape sequence '\uD800' in string literal: UTF-16 surrogates (U+D800 to U+DFFF) are not valid characters.
+-STATEMENT RETURN '\U0000DFFF'
+---- error
+Parser exception: Invalid unicode escape sequence '\U0000DFFF' in string literal: UTF-16 surrogates (U+D800 to U+DFFF) are not valid characters.
+-STATEMENT RETURN "\uD7FF" = "\uE000"
+---- 1
+False

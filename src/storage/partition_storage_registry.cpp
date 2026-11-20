@@ -32,8 +32,12 @@ PartitionStorageRegistry* PartitionStorageRegistry::Get(main::ClientContext* con
 static std::string getChildPath(main::ClientContext* context, const std::string& childName) {
     auto dbPath = context->getDatabasePath();
     if (main::DBConfig::isDBPathInMemory(dbPath)) {
-        // In-memory databases keep partitions in memory too; the path is only a registry key.
-        return ":" + childName;
+        // An in-memory database keeps its partitions in memory too. The child takes the main
+        // database's own in-memory path: StorageManager, WAL and ShadowFile decide "in memory"
+        // from the path alone, and a made-up name like ":<child>" is not recognised as one, so
+        // it would create a real file of that name in the working directory. The registry is
+        // keyed by table ID, not by path, so children sharing this path is fine.
+        return dbPath;
     }
     return StorageUtils::getGraphPath(dbPath, childName);
 }
@@ -259,7 +263,10 @@ void PartitionStorageRegistry::dropAll(main::ClientContext* context,
             if (it == managers.end()) {
                 continue;
             }
-            paths.push_back(it->second->getDatabasePath());
+            // An in-memory child has no files to remove.
+            if (!main::DBConfig::isDBPathInMemory(it->second->getDatabasePath())) {
+                paths.push_back(it->second->getDatabasePath());
+            }
             it->second->closeFileHandle();
             managers.erase(it);
         }
@@ -291,6 +298,10 @@ void PartitionStorageRegistry::dropAllNotInCatalog(main::ClientContext* context,
 
 void PartitionStorageRegistry::renameChild(main::ClientContext* context, table_id_t tableID,
     const std::string& newChildName) {
+    // An in-memory child is not named after its table (see getChildPath): nothing to rename.
+    if (main::DBConfig::isDBPathInMemory(context->getDatabasePath())) {
+        return;
+    }
     StorageManager* sm = nullptr;
     std::string oldPath;
     {
@@ -302,9 +313,9 @@ void PartitionStorageRegistry::renameChild(main::ClientContext* context, table_i
         sm = it->second.get();
         oldPath = sm->getDatabasePath();
     }
-    namespace fs = std::filesystem;
-    const auto dir = fs::path(oldPath).parent_path();
-    const auto newPath = (dir / fs::path(getChildPath(context, newChildName)).filename()).string();
+    const auto dir = FileSystem::pathFromUTF8(oldPath).parent_path();
+    const auto newPath = FileSystem::pathToUTF8(
+        dir / FileSystem::pathFromUTF8(getChildPath(context, newChildName)).filename());
     auto vfs = VirtualFileSystem::GetUnsafe(*context);
     sm->closeFileHandle();
     const std::pair<std::string, std::string> moves[] = {{oldPath, newPath},
@@ -321,6 +332,10 @@ void PartitionStorageRegistry::renameChild(main::ClientContext* context, table_i
 
 void PartitionStorageRegistry::reconcilePaths(main::ClientContext* context,
     const catalog::Catalog& catalog) {
+    // An in-memory database has no child files whose names could drift from the catalog.
+    if (main::DBConfig::isDBPathInMemory(context->getDatabasePath())) {
+        return;
+    }
     std::vector<std::pair<table_id_t, std::string>> renames;
     {
         std::shared_lock lck{mtx};
@@ -339,9 +354,10 @@ void PartitionStorageRegistry::reconcilePaths(main::ClientContext* context,
             if (it == expectedNames.end()) {
                 continue;
             }
-            const auto expected =
-                std::filesystem::path(getChildPath(context, it->second)).filename().string();
-            if (std::filesystem::path(sm->getDatabasePath()).filename().string() != expected) {
+            const auto expected = FileSystem::pathToUTF8(
+                FileSystem::pathFromUTF8(getChildPath(context, it->second)).filename());
+            if (FileSystem::pathToUTF8(
+                    FileSystem::pathFromUTF8(sm->getDatabasePath()).filename()) != expected) {
                 renames.emplace_back(tableID, it->second);
             }
         }

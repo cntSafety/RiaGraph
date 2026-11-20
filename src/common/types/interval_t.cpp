@@ -3,14 +3,18 @@
 #include "common/assert.h"
 #include "common/exception/conversion.h"
 #include "common/exception/overflow.h"
+#include "common/exception/runtime.h"
 #include "common/string_utils.h"
 #include "common/types/cast_helpers.h"
 #include "common/types/timestamp_t.h"
 #include "function/arithmetic/add.h"
+#include "function/arithmetic/divide.h"
 #include "function/arithmetic/multiply.h"
+#include "function/arithmetic/subtract.h"
 #include "function/cast/functions/cast_from_string_functions.h"
 #include "function/cast/functions/cast_functions.h"
 #include "re2.h"
+#include <format>
 
 namespace riag {
 namespace common {
@@ -44,11 +48,24 @@ bool interval_t::operator>=(const interval_t& rhs) const {
     return *this > rhs || *this == rhs;
 }
 
+// The checked Add/Subtract/Multiply/Divide specializations only match non-const int32_t& /
+// int64_t& operands; a const operand silently selects the unchecked generic template. The
+// members of a const interval_t are const, so every operand below is copied into a local first.
+static int32_t checkedInt32(int64_t value) {
+    if (value < INT32_MIN || value > INT32_MAX) {
+        throw OverflowException(std::format("Value {} is not within INT32 range.", value));
+    }
+    return static_cast<int32_t>(value);
+}
+
 interval_t interval_t::operator+(const interval_t& rhs) const {
     interval_t result{};
-    result.months = months + rhs.months;
-    result.days = days + rhs.days;
-    result.micros = micros + rhs.micros;
+    int32_t lMonths = months, rMonths = rhs.months;
+    int32_t lDays = days, rDays = rhs.days;
+    int64_t lMicros = micros, rMicros = rhs.micros;
+    function::Add::operation(lMonths, rMonths, result.months);
+    function::Add::operation(lDays, rDays, result.days);
+    function::Add::operation(lMicros, rMicros, result.micros);
     return result;
 }
 
@@ -62,19 +79,49 @@ date_t interval_t::operator+(const date_t& rhs) const {
 
 interval_t interval_t::operator-(const interval_t& rhs) const {
     interval_t result{};
-    result.months = months - rhs.months;
-    result.days = days - rhs.days;
-    result.micros = micros - rhs.micros;
+    int32_t lMonths = months, rMonths = rhs.months;
+    int32_t lDays = days, rDays = rhs.days;
+    int64_t lMicros = micros, rMicros = rhs.micros;
+    function::Subtract::operation(lMonths, rMonths, result.months);
+    function::Subtract::operation(lDays, rDays, result.days);
+    function::Subtract::operation(lMicros, rMicros, result.micros);
     return result;
 }
 
-interval_t interval_t::operator/(const uint64_t& rhs) const {
+interval_t interval_t::negate() const {
     interval_t result{};
-    int32_t monthsRemainder = months % rhs;
-    int32_t daysRemainder = (days + monthsRemainder * Interval::DAYS_PER_MONTH) % rhs;
-    result.months = months / rhs;
-    result.days = (days + monthsRemainder * Interval::DAYS_PER_MONTH) / rhs;
-    result.micros = (micros + daysRemainder * Interval::MICROS_PER_DAY) / rhs;
+    int32_t zeroInt32 = 0;
+    int64_t zeroInt64 = 0;
+    int32_t lMonths = months, lDays = days;
+    int64_t lMicros = micros;
+    function::Subtract::operation(zeroInt32, lMonths, result.months);
+    function::Subtract::operation(zeroInt32, lDays, result.days);
+    function::Subtract::operation(zeroInt64, lMicros, result.micros);
+    return result;
+}
+
+interval_t interval_t::operator/(const int64_t& rhs) const {
+    if (rhs == 0) {
+        throw RuntimeException("Divide by zero.");
+    }
+    // Everything is computed on signed 64-bit values: a negative divisor or operand must not be
+    // converted to unsigned, and the remainder carried down to the next unit can exceed 32 bits.
+    // C++ division truncates toward zero, so each remainder has the sign of its dividend and the
+    // carried parts keep the sign of the interval.
+    interval_t result{};
+    int64_t monthsRemainder = months % rhs;
+    int64_t daysWithCarry = days + monthsRemainder * Interval::DAYS_PER_MONTH;
+    int64_t daysRemainder = daysWithCarry % rhs;
+    result.months = checkedInt32(months / rhs);
+    result.days = checkedInt32(daysWithCarry / rhs);
+    int64_t carriedMicros = 0;
+    int64_t microsPerDay = Interval::MICROS_PER_DAY;
+    function::Multiply::operation(daysRemainder, microsPerDay, carriedMicros);
+    int64_t microsWithCarry = 0;
+    int64_t lMicros = micros;
+    function::Add::operation(lMicros, carriedMicros, microsWithCarry);
+    int64_t divisor = rhs;
+    function::Divide::operation(microsWithCarry, divisor, result.micros);
     return result;
 }
 

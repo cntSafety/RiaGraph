@@ -11,6 +11,8 @@ class LogicalExportDatabase final : public LogicalSimple {
     static constexpr LogicalOperatorType type_ = LogicalOperatorType::EXPORT_DATABASE;
 
 public:
+    bool namespaceAware = false;
+    std::string namespaceImport;
     LogicalExportDatabase(common::FileScanInfo boundFileInfo,
         const std::vector<std::shared_ptr<LogicalOperator>>& plans, bool exportSchemaOnly)
         : LogicalSimple{type_, plans}, boundFileInfo{std::move(boundFileInfo)},
@@ -28,8 +30,11 @@ public:
     bool isSchemaOnly() const { return schemaOnly; }
 
     std::unique_ptr<LogicalOperator> copy() override {
-        return make_unique<LogicalExportDatabase>(boundFileInfo.copy(), copyVector(children),
+        auto result = make_unique<LogicalExportDatabase>(boundFileInfo.copy(), copyVector(children),
             schemaOnly);
+        result->namespaceAware = namespaceAware;
+        result->namespaceImport = namespaceImport;
+        return result;
     }
 
 private:

@@ -1,0 +1,295 @@
+-DATASET CSV empty
+--
+
+# An ART index on a non-key column is changed in place by DELETE (the row's entry is erased) and
+# SET (the entry is moved to the new value). A rollback, asked for or caused by a failing
+# statement, must give the rows back their entries for the values they hold again: otherwise a
+# lookup misses a row that exists, or finds it by a value it no longer has.
+
+-CASE DeleteRolledBackKeepsSecondaryEntry
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX foo_v FOR (f:foo) ON (f.v);
+---- ok
+-STATEMENT CREATE (:foo {id: 1, v: 11}), (:foo {id: 2, v: 22});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) DELETE f;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 0
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 1
+1
+-STATEMENT MATCH (f:foo) WHERE f.v = 22 RETURN f.id;
+---- 1
+2
+-STATEMENT CHECKPOINT;
+---- ok
+-RELOADDB
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 1
+1
+-STATEMENT MATCH (f:foo {id: 1}) RETURN f.v;
+---- 1
+11
+
+-CASE SetRolledBackRestoresOldValue
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX foo_v FOR (f:foo) ON (f.v);
+---- ok
+-STATEMENT CREATE (:foo {id: 1, v: 11}), (:foo {id: 2, v: 22});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) SET f.v = 12;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 12 RETURN f.id;
+---- 1
+1
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 0
+# A second SET of the same row, and a SET to the value another row holds.
+-STATEMENT MATCH (f:foo {id: 1}) SET f.v = 13;
+---- ok
+-STATEMENT MATCH (f:foo {id: 2}) SET f.v = 13;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 13 RETURN f.id ORDER BY f.id;
+---- 2
+1
+2
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 1
+1
+-STATEMENT MATCH (f:foo) WHERE f.v = 22 RETURN f.id;
+---- 1
+2
+-STATEMENT MATCH (f:foo) WHERE f.v = 12 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 13 RETURN f.id;
+---- 0
+-STATEMENT CHECKPOINT;
+---- ok
+-RELOADDB
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 1
+1
+-STATEMENT MATCH (f:foo) WHERE f.v = 13 RETURN f.id;
+---- 0
+
+# The statement fails after its SET or DELETE has run, so its transaction is rolled back.
+-CASE FailingStatementRollsBackSecondaryEntries
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX foo_v FOR (f:foo) ON (f.v);
+---- ok
+-STATEMENT CREATE (:foo {id: 1, v: 11}), (:foo {id: 2, v: 22});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT MATCH (f:foo) SET f.v = f.v + 100 WITH f WHERE f.id = 2 RETURN f.id / 0;
+---- error
+Runtime exception: Divide by zero.
+-STATEMENT MATCH (f:foo) WHERE f.v = 111 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 122 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 1
+1
+-STATEMENT MATCH (f:foo) WHERE f.v = 22 RETURN f.id;
+---- 1
+2
+-STATEMENT MATCH (f:foo) DELETE f WITH count(*) AS c RETURN c / 0;
+---- error
+Runtime exception: Divide by zero.
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 1
+1
+-STATEMENT MATCH (f:foo) WHERE f.v = 22 RETURN f.id;
+---- 1
+2
+# In an explicit transaction a failing statement rolls back the earlier statements too.
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) DELETE f;
+---- ok
+-STATEMENT MATCH (f:foo {id: 2}) SET f.v = 23;
+---- ok
+-STATEMENT CREATE (:foo {id: 2, v: 0});
+---- error
+Runtime exception: Found duplicated primary key value 2, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 1
+1
+-STATEMENT MATCH (f:foo) WHERE f.v = 22 RETURN f.id;
+---- 1
+2
+-STATEMENT MATCH (f:foo) WHERE f.v = 23 RETURN f.id;
+---- 0
+-RELOADDB
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 1
+1
+-STATEMENT MATCH (f:foo) WHERE f.v = 22 RETURN f.id;
+---- 1
+2
+
+# Committed changes are kept, before and after a reload.
+-CASE CommittedDeleteAndSetAreKept
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX foo_v FOR (f:foo) ON (f.v);
+---- ok
+-STATEMENT CREATE (:foo {id: 1, v: 11}), (:foo {id: 2, v: 22});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT MATCH (f:foo {id: 1}) DELETE f;
+---- ok
+-STATEMENT MATCH (f:foo {id: 2}) SET f.v = 23;
+---- ok
+-STATEMENT COMMIT;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 11 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 22 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 23 RETURN f.id;
+---- 1
+2
+-RELOADDB
+-STATEMENT MATCH (f:foo) WHERE f.v = 23 RETURN f.id;
+---- 1
+2
+-STATEMENT MATCH (f:foo) WHERE f.v = 22 RETURN f.id;
+---- 0
+
+# Rows the transaction itself wrote: they are gone after the rollback, and so are their entries.
+-CASE RolledBackSetOfRowsWrittenInTheTransaction
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX foo_v FOR (f:foo) ON (f.v);
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:foo {id: 3, v: 33});
+---- ok
+-STATEMENT MATCH (f:foo {id: 3}) SET f.v = 34;
+---- ok
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 34 RETURN f.id;
+---- 0
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY foo FROM (UNWIND [5, 6] AS i RETURN i, i * 11);
+---- ok
+-STATEMENT MATCH (f:foo {id: 5}) SET f.v = 56;
+---- ok
+-STATEMENT MATCH (f:foo {id: 6}) DELETE f;
+---- ok
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 56 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 55 RETURN f.id;
+---- 0
+-STATEMENT MATCH (f:foo) WHERE f.v = 66 RETURN f.id;
+---- 0
+-STATEMENT CREATE (:foo {id: 7, v: 56});
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 56 RETURN f.id;
+---- 1
+7
+
+-CASE LargeDeleteRolledBack
+-STATEMENT CREATE NODE TABLE foo(id INT64, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX foo_v FOR (f:foo) ON (f.v);
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 5000) AS i RETURN i, i % 7);
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.id > 1000 DELETE f;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.id <= 1000 SET f.v = 100;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 3 RETURN count(*);
+---- 1
+0
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (f:foo) WHERE f.v = 3 RETURN count(*);
+---- 1
+714
+-STATEMENT MATCH (f:foo) WHERE f.v = 100 RETURN count(*);
+---- 1
+0
+-STATEMENT MATCH (f:foo) WHERE f.v = 0 RETURN min(f.id), max(f.id);
+---- 1
+7|4998
+
+# The primary-key indexes keep a deleted row's entry and leave it to visibility, so a rolled-back
+# DELETE needs nothing from them: the key is found again and cannot be inserted twice.
+-CASE PrimaryKeyIndexesAfterDeleteRollback
+-STATEMENT CREATE NODE TABLE h(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE (:h {id: 1});
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT MATCH (x:h {id: 1}) DELETE x;
+---- ok
+-STATEMENT MATCH (x:h {id: 1}) RETURN x.id;
+---- 0
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (x:h {id: 1}) RETURN x.id;
+---- 1
+1
+-STATEMENT CREATE (:h {id: 1});
+---- error
+Runtime exception: Found duplicated primary key value 1, which violates the uniqueness constraint of the primary key column.
+-STATEMENT CALL enable_default_hash_index=false;
+---- ok
+-STATEMENT CREATE NODE TABLE art(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX art_pk FOR (a:art) ON (a.id);
+---- ok
+-STATEMENT CREATE (:art {id: 1});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT MATCH (a:art {id: 1}) DELETE a;
+---- ok
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (a:art {id: 1}) RETURN a.id;
+---- 1
+1
+-STATEMENT MATCH (a:art) WHERE a.id >= 0 AND a.id <= 2 RETURN a.id;
+---- 1
+1
+-STATEMENT CREATE (:art {id: 1});
+---- error
+Runtime exception: Found duplicated primary key value 1, which violates the uniqueness constraint of the primary key column.
+-STATEMENT CALL enable_default_hash_index=true;
+---- ok

@@ -1,10 +1,14 @@
 #pragma once
 
+#include <array>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <type_traits>
 
+#include "common/checksum.h"
 #include "common/constants.h"
 #include "common/system_config.h"
 #include "common/types/types.h"
@@ -86,6 +90,36 @@ public:
     static std::string getPinnedCheckpointMarkerPath(const std::string& path) {
         return std::format("{}.pinned.tmp", path);
     }
+    // Content of the pinned-checkpoint marker: the offset in the active WAL at which the
+    // CHECKPOINT record of the completed checkpoint ends, followed by a checksum of that offset,
+    // so a marker that was only partly written reads as "no offset". The marker exists after any
+    // completed pinned checkpoint and stays while later checkpoints run, so it only vouches for
+    // the CHECKPOINT record that ends at the offset it names.
+    static constexpr uint64_t PINNED_CHECKPOINT_MARKER_SIZE = 2 * sizeof(uint64_t);
+    static std::array<uint8_t, PINNED_CHECKPOINT_MARKER_SIZE> serializePinnedCheckpointMarker(
+        uint64_t walEndOffset) {
+        std::array<uint8_t, PINNED_CHECKPOINT_MARKER_SIZE> content{};
+        std::memcpy(content.data(), &walEndOffset, sizeof(walEndOffset));
+        const auto offsetChecksum = common::checksum(content.data(), sizeof(walEndOffset));
+        std::memcpy(content.data() + sizeof(walEndOffset), &offsetChecksum, sizeof(offsetChecksum));
+        return content;
+    }
+    // The offset the marker names, or nothing for a marker without one (an older format, or
+    // one that was only partly written).
+    static std::optional<uint64_t> parsePinnedCheckpointMarker(
+        std::array<uint8_t, PINNED_CHECKPOINT_MARKER_SIZE> content, uint64_t size) {
+        if (size != PINNED_CHECKPOINT_MARKER_SIZE) {
+            return std::nullopt;
+        }
+        uint64_t walEndOffset = 0;
+        uint64_t storedChecksum = 0;
+        std::memcpy(&walEndOffset, content.data(), sizeof(walEndOffset));
+        std::memcpy(&storedChecksum, content.data() + sizeof(walEndOffset), sizeof(storedChecksum));
+        if (common::checksum(content.data(), sizeof(walEndOffset)) != storedChecksum) {
+            return std::nullopt;
+        }
+        return walEndOffset;
+    }
     static std::string getCheckpointIntentLockFilePath(const std::string& path) {
         return std::format("{}.checkpoint.intent.lock", path);
     }
@@ -95,13 +129,8 @@ public:
     static std::string getTmpFilePath(const std::string& path) {
         return std::format("{}.{}", path, common::StorageConstants::TEMP_FILE_SUFFIX);
     }
-    static std::string getGraphPath(const std::string& dbPath, const std::string& graphName) {
-        auto path = std::filesystem::path(dbPath);
-        auto base = path.stem().string();
-        auto ext = path.extension().string();
-        auto graphFile = std::filesystem::path(base + "." + graphName + ext);
-        return (path.parent_path() / graphFile).string();
-    }
+    // <dir>/<stem>.<graphName><ext> for the database path <dir>/<stem><ext>.
+    static std::string getGraphPath(const std::string& dbPath, const std::string& graphName);
 
     static std::string expandPath(const main::ClientContext* context, const std::string& path);
 

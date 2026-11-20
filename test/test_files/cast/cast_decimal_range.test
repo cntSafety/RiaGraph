@@ -1,0 +1,141 @@
+-DATASET CSV EMPTY
+
+--
+
+# A numeric value that does not fit the target DECIMAL has to be rejected. The conversion used to
+# narrow to the DECIMAL's physical type first and range-check the narrowed value, so anything that
+# wrapped back into range passed: cast(6554 as DECIMAL(4,1)) was 0.4, NaN and infinity were 0.0.
+
+-CASE CastToDecimalOutOfRange
+-LOG IntegerSource
+-STATEMENT RETURN cast(6554 as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: 6554 is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(13108 as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: 13108 is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(429496730 as DECIMAL(9,1))
+---- error
+Overflow exception: To Decimal Cast Failed: 429496730 is not in DECIMAL(9, 1) range
+-STATEMENT RETURN cast(1000 as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: 1000 is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(-100 as DECIMAL(4,2))
+---- error
+Overflow exception: To Decimal Cast Failed: -100 is not in DECIMAL(4, 2) range
+-STATEMENT RETURN cast(18446744073709551615 as DECIMAL(18,0))
+---- error
+Overflow exception: To Decimal Cast Failed: 18446744073709551615 is not in DECIMAL(18, 0) range
+-STATEMENT RETURN cast(cast(255 as UINT8) as DECIMAL(4,2))
+---- error
+Overflow exception: To Decimal Cast Failed: 255 is not in DECIMAL(4, 2) range
+-STATEMENT RETURN cast(cast(65535 as UINT16) as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: 65535 is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(cast(1 as INT64) as DECIMAL(18,18))
+---- error
+Overflow exception: To Decimal Cast Failed: 1 is not in DECIMAL(18, 18) range
+-STATEMENT RETURN cast(cast(100000000000000000000000000000000000000 as INT128) as DECIMAL(38,0))
+---- error
+Overflow exception: To Decimal Cast Failed: 100000000000000000000000000000000000000 is not in DECIMAL(38, 0) range
+-STATEMENT RETURN cast(cast(340282366920938463463374607431768211455 as UINT128) as DECIMAL(38,0))
+---- error
+Overflow exception: To Decimal Cast Failed: 340282366920938463463374607431768211455 is not in DECIMAL(38, 0) range
+
+-LOG FloatingSource
+-STATEMENT RETURN cast(12345.678 as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: 12345.678000 is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(-12345.678 as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: -12345.678000 is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(1e10 as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: 10000000000.000000 is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(999.95 as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: 999.950000 is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(1e19 as DECIMAL(18,0))
+---- error
+Overflow exception: To Decimal Cast Failed: 10000000000000000000.000000 is not in DECIMAL(18, 0) range
+-STATEMENT RETURN cast(1e39 as DECIMAL(38,0))
+---- error
+Overflow exception: To Decimal Cast Failed: 999999999999999939709166371603178586112.000000 is not in DECIMAL(38, 0) range
+-STATEMENT RETURN cast(cast(1e30 as FLOAT) as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: 1000000015047466219876688855040.000000 is not in DECIMAL(4, 1) range
+
+-LOG NanAndInfinity
+-STATEMENT RETURN cast(cast('nan' as DOUBLE) as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: nan is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(cast('inf' as DOUBLE) as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: inf is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(cast('-inf' as DOUBLE) as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: -inf is not in DECIMAL(4, 1) range
+-STATEMENT RETURN cast(cast('nan' as FLOAT) as DECIMAL(4,1))
+---- error
+Overflow exception: To Decimal Cast Failed: nan is not in DECIMAL(4, 1) range
+
+-LOG BoundaryCasesKeepWorking
+-STATEMENT RETURN cast(999.9 as DECIMAL(4,1)), cast(-999.9 as DECIMAL(4,1)), cast(999.94 as DECIMAL(4,1)), cast(0 as DECIMAL(4,1))
+---- 1
+999.9|-999.9|999.9|0.0
+-STATEMENT RETURN cast(999 as DECIMAL(4,1)), cast(99 as DECIMAL(4,2)), cast(-99 as DECIMAL(4,2))
+---- 1
+999.0|99.00|-99.00
+-STATEMENT RETURN cast(cast(100 as INT8) as DECIMAL(4,1)), cast(cast(255 as UINT8) as DECIMAL(5,2)), cast(cast(0 as INT64) as DECIMAL(18,18))
+---- 1
+100.0|255.00|0.000000000000000000
+-STATEMENT RETURN cast(999999999999999999 as DECIMAL(18,0)), cast(-999999999999999999 as DECIMAL(18,0))
+---- 1
+999999999999999999|-999999999999999999
+-STATEMENT RETURN cast(cast(99999999999999999999999999999999999999 as INT128) as DECIMAL(38,0)), cast(cast(99999999999999999999999999999999999999 as UINT128) as DECIMAL(38,0))
+---- 1
+99999999999999999999999999999999999999|99999999999999999999999999999999999999
+-STATEMENT RETURN cast(cast(1.5 as FLOAT) as DECIMAL(4,1))
+---- 1
+1.5
+
+-LOG FloatingSourceRoundsOnce
+# The int128_t conversion from double rounds to nearest, so DECIMAL(38, 0) used to round twice.
+-STATEMENT RETURN cast(0.4 as DECIMAL(38,0)), cast(2.4 as DECIMAL(38,0)), cast(2.6 as DECIMAL(38,0)), cast(-2.4 as DECIMAL(38,0))
+---- 1
+0|2|3|-2
+-STATEMENT RETURN cast(2.4 as DECIMAL(18,0)), cast(2.6 as DECIMAL(18,0)), cast(-2.6 as DECIMAL(18,0))
+---- 1
+2|3|-3
+
+-CASE CastBetweenDecimalOutOfRange
+-LOG NarrowingWrapped
+-STATEMENT RETURN cast(cast(429496730 as DECIMAL(9,0)) as DECIMAL(4,1))
+---- error
+Overflow exception: Decimal Cast Failed: input 429496730 is not in range of DECIMAL(4, 1)
+-STATEMENT RETURN cast(cast(6554 as DECIMAL(9,0)) as DECIMAL(4,1))
+---- error
+Overflow exception: Decimal Cast Failed: input 6554 is not in range of DECIMAL(4, 1)
+-STATEMENT RETURN cast(cast(65536 as DECIMAL(9,1)) as DECIMAL(4,1))
+---- error
+Overflow exception: Decimal Cast Failed: input 65536.0 is not in range of DECIMAL(4, 1)
+-STATEMENT RETURN cast(cast(10 as DECIMAL(18,0)) as DECIMAL(18,18))
+---- error
+Overflow exception: Decimal Cast Failed: input 10 is not in range of DECIMAL(18, 18)
+-STATEMENT RETURN cast(cast(1 as DECIMAL(38,0)) as DECIMAL(38,38))
+---- error
+Overflow exception: Decimal Cast Failed: input 1 is not in range of DECIMAL(38, 38)
+-STATEMENT RETURN cast(cast(99999999999999999999999999999999999999 as DECIMAL(38,0)) as DECIMAL(10,0))
+---- error
+Overflow exception: Decimal Cast Failed: input 99999999999999999999999999999999999999 is not in range of DECIMAL(10, 0)
+-STATEMENT RETURN cast(cast(99.5 as DECIMAL(5,1)) as DECIMAL(2,0))
+---- error
+Overflow exception: Decimal Cast Failed: input 99.5 is not in range of DECIMAL(2, 0)
+
+-LOG BetweenDecimalBoundaryCasesKeepWorking
+-STATEMENT RETURN cast(cast(999 as DECIMAL(9,0)) as DECIMAL(4,1)), cast(cast(99.9 as DECIMAL(4,1)) as DECIMAL(3,1)), cast(cast(999.4 as DECIMAL(4,1)) as DECIMAL(3,0))
+---- 1
+999.0|99.9|999
+-STATEMENT RETURN cast(cast(0 as DECIMAL(18,0)) as DECIMAL(18,18)), cast(cast(0.5 as DECIMAL(18,18)) as DECIMAL(4,1)), cast(cast(-99.4 as DECIMAL(5,1)) as DECIMAL(2,0))
+---- 1
+0.000000000000000000|0.5|-99

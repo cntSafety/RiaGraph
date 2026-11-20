@@ -1,0 +1,684 @@
+-DATASET CSV empty
+
+--
+
+# An extend whose bound node sits in an unflat chunk of an extend further down, with an
+# undirected extend in between: (a)-[r]-(b)-[s]->(c)-[t]-(d). With a filter on s or c the plan is
+# one chain, scan(c) -> extend s -> filter -> extend t -> extend r, and r's bound chunk (b, s) is
+# not rewritten when extend t returns its next batch (t's other direction). The undirected
+# (multi-direction) rel scan flattened that chunk in place and never handed it back, so it read
+# only the last b for every later batch of t. Issue #92: 15 matches, 11 with an always-true WHERE.
+# Expected counts are brute-force walk counts (an undirected hop matches each edge both ways).
+-CASE Issue92MixedDirectionThreeHop
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE T(FROM N TO N, w INT64);
+---- ok
+-STATEMENT UNWIND [1, 2, 4] AS i CREATE (:N {id: i});
+---- ok
+-STATEMENT MATCH (x:N {id: 1}), (y:N {id: 4}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 1}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 1}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-LOG Issue92Reproducer
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) RETURN count(*);
+---- 1
+15
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE s.w >= 0 RETURN count(*);
+---- 1
+15
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE (s.w = 0 OR s.w = 1) RETURN count(*);
+---- 1
+15
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+15
+-LOG Issue92AllUndirected
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]-(c:N)-[t:T]-(d:N) RETURN count(*);
+---- 1
+30
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]-(c:N)-[t:T]-(d:N) WHERE s.w >= 0 RETURN count(*);
+---- 1
+30
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]-(c:N)-[t:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+30
+-STATEMENT CHECKPOINT;
+---- ok
+-LOG Issue92ReproducerAfterCheckpoint
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) RETURN count(*);
+---- 1
+15
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE s.w >= 0 RETURN count(*);
+---- 1
+15
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE (s.w = 0 OR s.w = 1) RETURN count(*);
+---- 1
+15
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+15
+-LOG Issue92AllUndirectedAfterCheckpoint
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]-(c:N)-[t:T]-(d:N) RETURN count(*);
+---- 1
+30
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]-(c:N)-[t:T]-(d:N) WHERE s.w >= 0 RETURN count(*);
+---- 1
+30
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]-(c:N)-[t:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+30
+
+# Not about repeated nodes: two distinct b for one c are enough.
+-CASE UndirectedExtendChainDistinctBoundNodes
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE T(FROM N TO N, w INT64);
+---- ok
+-STATEMENT UNWIND [1, 2, 3, 4] AS i CREATE (:N {id: i});
+---- ok
+-STATEMENT MATCH (x:N {id: 1}), (y:N {id: 3}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 3}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 3}), (y:N {id: 4}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) RETURN count(*);
+---- 1
+9
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE s.w >= 0 RETURN count(*);
+---- 1
+9
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+9
+
+# Uncommitted rels (local storage) take the same operator path.
+-CASE UndirectedExtendChainUncommitted
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE T(FROM N TO N, w INT64);
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT UNWIND [1, 2, 4] AS i CREATE (:N {id: i});
+---- ok
+-STATEMENT MATCH (x:N {id: 1}), (y:N {id: 4}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 1}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 1}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE s.w >= 0 RETURN count(*);
+---- 1
+15
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]-(c:N)-[t:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+30
+-STATEMENT COMMIT;
+---- ok
+-STATEMENT MATCH (a:N)-[r:T]-(b:N)-[s:T]->(c:N)-[t:T]-(d:N) WHERE s.w >= 0 RETURN count(*);
+---- 1
+15
+
+# Every direction mix of a three-hop walk on a multigraph with self loops and parallel edges,
+# plain and with always-true filters that put the plan on the extend chain, in memory and after a
+# checkpoint; then four hops.
+-CASE ExtendChainDirectionMixesMultigraph
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE T(FROM N TO N, w INT64);
+---- ok
+-STATEMENT UNWIND [0, 1, 2, 3, 4] AS i CREATE (:N {id: i});
+---- ok
+-STATEMENT MATCH (x:N {id: 4}), (y:N {id: 1}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 4}), (y:N {id: 1}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 1}), (y:N {id: 1}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 1}), (y:N {id: 1}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 1}), (y:N {id: 1}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 0}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 0}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 0}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 4}), (y:N {id: 0}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 0}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 0}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 4}), (y:N {id: 3}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 2}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 2}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 2}) CREATE (x)-[:T {w: 0}]->(y);
+---- ok
+-STATEMENT MATCH (x:N {id: 4}), (y:N {id: 3}) CREATE (x)-[:T {w: 1}]->(y);
+---- ok
+-LOG ThreeHopInMemory
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+384
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+384
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+384
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+498
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+498
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+498
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+2030
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+2030
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+2030
+-LOG FourHopUndirectedInMemory
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N)-[r3:T]-(e:N) RETURN count(*);
+---- 1
+16956
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N)-[r3:T]-(e:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+16956
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N)-[r3:T]-(e:N) WHERE r2.w >= 0 RETURN count(*);
+---- 1
+16956
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N)-[r3:T]-(e:N) WHERE c.id >= 0 AND d.id >= 0 RETURN count(*);
+---- 1
+16956
+-STATEMENT CHECKPOINT;
+---- ok
+-LOG ThreeHopAfterCheckpoint
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+192
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+384
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+384
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+384
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]->(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+457
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+249
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+117
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+498
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+498
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+498
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+574
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)<-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+366
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+649
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]->(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+706
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+309
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)<-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+1015
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]->(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+1072
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)<-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+958
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) RETURN count(*);
+---- 1
+2030
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+2030
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N) WHERE c.id >= 0 RETURN count(*);
+---- 1
+2030
+-LOG FourHopUndirectedAfterCheckpoint
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N)-[r3:T]-(e:N) RETURN count(*);
+---- 1
+16956
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N)-[r3:T]-(e:N) WHERE r1.w >= 0 RETURN count(*);
+---- 1
+16956
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N)-[r3:T]-(e:N) WHERE r2.w >= 0 RETURN count(*);
+---- 1
+16956
+-STATEMENT MATCH (a:N)-[r0:T]-(b:N)-[r1:T]-(c:N)-[r2:T]-(d:N)-[r3:T]-(e:N) WHERE c.id >= 0 AND d.id >= 0 RETURN count(*);
+---- 1
+16956
+

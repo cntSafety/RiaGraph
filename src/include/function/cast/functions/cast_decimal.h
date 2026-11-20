@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <string>
 #include <type_traits>
 
@@ -28,25 +29,46 @@ struct CastDecimalTo {
     template<typename SRC, typename DST>
     static void operation(SRC& input, DST& output, const ValueVector& inputVec,
         ValueVector& outputVec) {
-        using T = typename pickDecimalPhysicalType<SRC, DST>::RES;
-        constexpr auto pow10s = pow10Sequence<T>();
         auto scale = DecimalType::getScale(inputVec.dataType);
         if constexpr (std::is_floating_point<DST>::value) {
+            using T = typename pickDecimalPhysicalType<SRC, DST>::RES;
+            constexpr auto pow10s = pow10Sequence<T>();
             output = (DST)input / (DST)pow10s[scale];
         } else {
-            auto roundconst = (input < 0 ? -5 : 5);
-            auto tmp = ((scale > 0 ? pow10s[scale - 1] * roundconst : 0) + input) / pow10s[scale];
-            if (tmp < NumericLimits<DST>::minimum() || tmp > NumericLimits<DST>::maximum()) {
+            // The integral part is computed in SRC, the DECIMAL's own (signed) physical type: the
+            // wider of SRC and DST would be unsigned for an unsigned DST of the same size, and
+            // then the quotient of a negative value wraps and no minimum check can see it.
+            // |tmp| <= |input| after the division, and the rounding term cannot overflow SRC
+            // since |input| < 10^precision.
+            constexpr auto pow10s = pow10Sequence<SRC>();
+            SRC tmp = static_cast<SRC>(
+                ((scale > 0 ? pow10s[scale - 1] * (input < 0 ? -5 : 5) : 0) + input) /
+                pow10s[scale]);
+            // Compared in SRC, which is signed, against limits of DST that are cast to SRC only
+            // where DST is the narrower type, so neither side converts to the other's sign.
+            bool outOfRange = false;
+            if constexpr (!NumericLimits<DST>::isSigned()) {
+                outOfRange = tmp < 0;
+            } else if constexpr (sizeof(DST) < sizeof(SRC)) {
+                outOfRange = tmp < static_cast<SRC>(NumericLimits<DST>::minimum());
+            }
+            if constexpr (sizeof(DST) < sizeof(SRC)) {
+                outOfRange = outOfRange || tmp > static_cast<SRC>(NumericLimits<DST>::maximum());
+            }
+            if (outOfRange) {
                 throw OverflowException(std::format("Cast Failed: {} is not in {} range",
                     DecimalType::insertDecimalPoint(TypeUtils::toString(input), scale),
                     outputVec.dataType.toString()));
             }
-            output = (DST)tmp;
+            output = static_cast<DST>(tmp);
         }
     }
 };
 
 struct CastToDecimal {
+    // The range is checked on the source value, before it is scaled and narrowed to the
+    // DECIMAL's physical type: a value that does not fit would otherwise wrap, or be undefined
+    // behaviour for a floating source, and the wrapped result could land back inside the range.
     template<typename SRC, typename DST>
     static void operation(SRC& input, DST& output, const ValueVector&,
         const ValueVector& outputVec) {
@@ -54,15 +76,46 @@ struct CastToDecimal {
         auto precision = DecimalType::getPrecision(outputVec.dataType);
         auto scale = DecimalType::getScale(outputVec.dataType);
         if constexpr (std::is_floating_point<SRC>::value) {
+            // NaN and infinity compare false against everything, so name them.
+            if (std::isnan(input) || std::isinf(input)) {
+                throwOutOfRange(input, outputVec);
+            }
             auto roundconst = (input < 0 ? -0.5 : 0.5);
-            output = (DST)((double)pow10s[scale] * input + roundconst);
+            double rounded = (double)pow10s[scale] * input + roundconst;
+            double limit = (double)pow10s[precision];
+            if (!(rounded > -limit && rounded < limit)) {
+                throwOutOfRange(input, outputVec);
+            }
+            // Truncate explicitly: int128_t's conversion from double rounds to nearest, which
+            // would round a second time on top of roundconst.
+            output = (DST)std::trunc(rounded);
+            // The limit above is exact only up to 2^53; the converted value gets the final say.
+            if (output <= -pow10s[precision] || output >= pow10s[precision]) {
+                throwOutOfRange(input, outputVec);
+            }
         } else {
-            output = (DST)(pow10s[scale] * input);
+            // |input * 10^scale| < 10^precision  <=>  |input| < 10^(precision - scale).
+            if constexpr (common::UnsignedIntegerTypes<SRC>) {
+                if (common::uint128_t(input) >=
+                    pow10Sequence<common::uint128_t>()[precision - scale]) {
+                    throwOutOfRange(input, outputVec);
+                }
+            } else {
+                common::int128_t limit = pow10Sequence<common::int128_t>()[precision - scale];
+                if (common::int128_t(input) <= -limit || common::int128_t(input) >= limit) {
+                    throwOutOfRange(input, outputVec);
+                }
+            }
+            // In range, so neither the narrowing nor the product can overflow DST.
+            output = (DST)(pow10s[scale] * static_cast<DST>(input));
         }
-        if (output <= -pow10s[precision] || output >= pow10s[precision]) {
-            throw OverflowException(std::format("To Decimal Cast Failed: {} is not in {} range",
-                TypeUtils::toString(input), outputVec.dataType.toString()));
-        }
+    }
+
+private:
+    template<typename SRC>
+    [[noreturn]] static void throwOutOfRange(const SRC& input, const ValueVector& outputVec) {
+        throw OverflowException(std::format("To Decimal Cast Failed: {} is not in {} range",
+            TypeUtils::toString(input), outputVec.dataType.toString()));
     }
 };
 
@@ -70,26 +123,47 @@ struct CastBetweenDecimal {
     template<typename SRC, typename DST>
     static void operation(SRC& input, DST& output, const ValueVector& inputVec,
         const ValueVector& outputVec) {
+        // Both sides are DECIMAL physical types, which are signed: the range checks below
+        // compare a signed input against T and negate T's limits.
+        static_assert(NumericLimits<SRC>::isSigned() && NumericLimits<DST>::isSigned());
         using T = typename pickDecimalPhysicalType<SRC, DST>::RES;
         constexpr auto pow10s = pow10Sequence<T>();
         auto outputPrecision = DecimalType::getPrecision(outputVec.dataType);
         auto inputScale = DecimalType::getScale(inputVec.dataType);
         auto outputScale = DecimalType::getScale(outputVec.dataType);
+        // Scale and range-check in T, the wider of the two physical types, and narrow to DST
+        // only once the value is known to fit: narrowing first would wrap it.
+        T scaled;
         if (inputScale == outputScale) {
-            output = (DST)input;
+            scaled = static_cast<T>(input);
         } else if (inputScale < outputScale) {
-            output = (DST)(pow10s[outputScale - inputScale] * input);
+            auto shift = outputScale - inputScale;
+            // Checked on the input, since input * 10^shift may itself overflow T. shift <=
+            // outputScale <= outputPrecision.
+            auto limit = pow10s[outputPrecision - shift];
+            if (input >= limit || input <= -limit) {
+                throwOutOfRange(input, inputVec, outputVec);
+            }
+            scaled = static_cast<T>(pow10s[shift] * input);
         } else {
             auto roundconst = (input < 0 ? -5 : 5);
-            output = (DST)((pow10s[inputScale - outputScale - 1] * roundconst + input) /
-                           pow10s[inputScale - outputScale]);
+            scaled = static_cast<T>((pow10s[inputScale - outputScale - 1] * roundconst + input) /
+                                    pow10s[inputScale - outputScale]);
         }
-        if (pow10s[outputPrecision] <= output || -pow10s[outputPrecision] >= output) {
-            throw OverflowException(std::format(
-                "Decimal Cast Failed: input {} is not in range of {}",
-                DecimalType::insertDecimalPoint(TypeUtils::toString(input, nullptr), inputScale),
-                outputVec.dataType.toString()));
+        if (pow10s[outputPrecision] <= scaled || -pow10s[outputPrecision] >= scaled) {
+            throwOutOfRange(input, inputVec, outputVec);
         }
+        output = static_cast<DST>(scaled);
+    }
+
+private:
+    template<typename SRC>
+    [[noreturn]] static void throwOutOfRange(const SRC& input, const ValueVector& inputVec,
+        const ValueVector& outputVec) {
+        throw OverflowException(std::format("Decimal Cast Failed: input {} is not in range of {}",
+            DecimalType::insertDecimalPoint(TypeUtils::toString(input, nullptr),
+                DecimalType::getScale(inputVec.dataType)),
+            outputVec.dataType.toString()));
     }
 };
 

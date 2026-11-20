@@ -392,8 +392,14 @@ row_idx_t VectorVersionInfo::getNumVisibleRows(transaction_t startTS, transactio
 
 void VectorVersionInfo::rollbackInsertions(row_idx_t startRowInVector, row_idx_t numRows) {
     if (isSameInsertionVersion()) {
-        // This implicitly assumes that all rows are inserted in the same transaction, so regardless
-        // which rows to be rolled back, we just reset the sameInsertionVersion.
+        // All rows of the vector were inserted by the rolling-back transaction. Its inserts are
+        // undone newest first, and the chunked group is truncated at the first undone row, so
+        // the rows before `startRowInVector` belong to an earlier insert of the same transaction
+        // (e.g. the first of two COPYs) whose undo record has not run yet. They stay inserted:
+        // that undo scans them to discard their index entries, and would see nothing otherwise.
+        if (startRowInVector > 0) {
+            return;
+        }
         sameInsertionVersion = INVALID_TRANSACTION;
     } else {
         if (insertedVersions) {

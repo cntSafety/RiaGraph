@@ -13,6 +13,7 @@
 #include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/string_utils.h"
+#include "function/schema/namespace_functions.h"
 #include "main/attached_database.h"
 #include "main/client_context.h"
 #include "main/database_manager.h"
@@ -263,6 +264,13 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
     const std::shared_ptr<LogicalOperator>& op) {
     auto& scan = op->cast<LogicalScanNodeTable>();
     auto nodeID = scan.getNodeID();
+    // Namespace predicates are scalar functions, never equality predicates.
+    // Inspect the existing vector rather than copying every ordinary predicate.
+    for (const auto& predicate : predicateSet.nonEqualityPredicates) {
+        if (auto scope = function::getNamespacePredicateScope(*predicate, *nodeID)) {
+            scan.namespaceScope = scan.namespaceScope.intersect(*scope);
+        }
+    }
     // Apply column predicates.
     if (context->getClientConfig()->enableZoneMap) {
         scan.setPropertyPredicates(
@@ -290,6 +298,8 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
             predicateSet.addPredicate(primaryKeyEqualityComparison);
         } else if (table->tryGetPrimaryKeyIndex() != nullptr && isConstantExpression(rhs)) {
             auto extraInfo = std::make_unique<PrimaryKeyScanInfo>(rhs);
+            extraInfo->nonUnique =
+                table->hasLocalPrimaryKey() && !scan.namespaceScope.getSingleton();
             scan.setScanType(LogicalScanNodeTableType::PRIMARY_KEY_SCAN);
             scan.setExtraInfo(std::move(extraInfo));
             scan.computeFlatSchema();

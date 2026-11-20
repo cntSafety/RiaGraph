@@ -1,4 +1,5 @@
 #include "binder/binder.h"
+#include "binder/expression/case_expression.h"
 #include "binder/expression/expression_util.h"
 #include "binder/expression/scalar_function_expression.h"
 #include "binder/expression_binder.h"
@@ -44,6 +45,18 @@ static bool isNodeOrRelPattern(const Expression& expression) {
     }
 }
 
+static bool haveSameKeys(const LogicalType& left, const LogicalType& right) {
+    if (StructType::getNumFields(left) != StructType::getNumFields(right)) {
+        return false;
+    }
+    for (const auto& field : StructType::getFields(left)) {
+        if (!StructType::hasField(right, field.getName())) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::shared_ptr<Expression> ExpressionBinder::bindComparisonExpression(
     ExpressionType expressionType, const expression_vector& children) {
     // Rewrite node or rel comparison
@@ -60,6 +73,28 @@ std::shared_ptr<Expression> ExpressionBinder::bindComparisonExpression(
     auto catalog = Catalog::Get(*context);
     auto transaction = transaction::Transaction::Get(*context);
     auto functionName = ExpressionTypeUtil::toString(expressionType);
+    // Two maps with different key sets are never equal, as in Neo4j: {a: 1} = {a: 1, b: NULL}
+    // is false, not a comparison of {a: 1, b: NULL} with itself after the key sets were merged
+    // (see tryCombineStructTypes). The answer is NULL if either map is NULL, else a constant:
+    // CASE WHEN l IS NULL OR r IS NULL THEN NULL ELSE <false for =, true for <>> END.
+    // Only the top-level maps are checked; maps nested in lists are combined to one type first.
+    if ((expressionType == ExpressionType::EQUALS ||
+            expressionType == ExpressionType::NOT_EQUALS) &&
+        children[0]->dataType.getLogicalTypeID() == LogicalTypeID::STRUCT &&
+        children[1]->dataType.getLogicalTypeID() == LogicalTypeID::STRUCT &&
+        !haveSameKeys(children[0]->dataType, children[1]->dataType)) {
+        auto anyNull = bindBooleanExpression(ExpressionType::OR,
+            expression_vector{
+                bindNullOperatorExpression(ExpressionType::IS_NULL, expression_vector{children[0]}),
+                bindNullOperatorExpression(ExpressionType::IS_NULL,
+                    expression_vector{children[1]})});
+        auto result = std::make_shared<CaseExpression>(LogicalType::BOOL(),
+            createLiteralExpression(Value(expressionType == ExpressionType::NOT_EQUALS)),
+            ScalarFunctionExpression::getUniqueName(functionName, children));
+        result->addCaseAlternative(std::move(anyNull),
+            createNullLiteralExpression(Value::createNullValue(LogicalType::BOOL())));
+        return result;
+    }
     LogicalType combinedType(LogicalTypeID::ANY);
     if (!ExpressionUtil::tryCombineDataType(children, combinedType)) {
         throw BinderException(std::format("Type Mismatch: Cannot compare types {} and {}",

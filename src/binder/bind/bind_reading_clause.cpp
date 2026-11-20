@@ -21,6 +21,9 @@ std::unique_ptr<BoundReadingClause> Binder::bindReadingClause(const ReadingClaus
     case ClauseType::LOAD_FROM: {
         return bindLoadFrom(readingClause);
     }
+    case ClauseType::ASSERT: {
+        return bindAssertClause(readingClause);
+    }
     default:
         UNREACHABLE_CODE;
     }

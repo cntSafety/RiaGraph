@@ -24,6 +24,7 @@ src/include/common/exception/internal.h
 src/include/common/exception/overflow.h
 src/include/common/in_mem_overflow_buffer.h
 src/include/common/mask.h
+src/include/common/namespace_set.h
 src/include/common/null_mask.h
 src/include/common/timer.h
 src/include/common/type_utils.h

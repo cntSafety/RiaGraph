@@ -36,6 +36,12 @@ SingleQuery Transformer::transformSinglePartQuery(CypherParser::OC_SinglePartQue
     for (auto& readingClause : ctx.oC_ReadingClause()) {
         singleQuery.addReadingClause(transformReadingClause(*readingClause));
     }
+    // A query may end with ASSERT instead of RETURN or an update. The trailing ASSERT is one more
+    // reading clause; it is a separate grammar element only so that a query cannot end with any
+    // other reading clause.
+    if (ctx.iC_Assert()) {
+        singleQuery.addReadingClause(transformAssert(*ctx.iC_Assert()));
+    }
     for (auto& updatingClause : ctx.oC_UpdatingClause()) {
         singleQuery.addUpdatingClause(transformUpdatingClause(*updatingClause));
     }

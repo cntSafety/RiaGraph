@@ -18,6 +18,7 @@ add_library(riag_table_function
         show_connection.cpp
         show_functions.cpp
         show_graphs.cpp
+        namespace_info.cpp
         show_indexes.cpp
         show_loaded_extensions.cpp
         show_macros.cpp

@@ -40,6 +40,11 @@ public:
         ScanNodeTableProgressSharedState& progressSharedState);
 
     common::SemiMask* getSemiMask() const { return semiMask.get(); }
+    common::SemiMask* getEffectiveMask() const {
+        return namespaceMask ? namespaceMask.get() : semiMask.get();
+    }
+    void initializeNamespace(const transaction::Transaction* transaction,
+        const common::NamespaceSet& scope);
 
 private:
     std::mutex mtx;
@@ -60,6 +65,7 @@ private:
     std::vector<common::row_idx_t> committedGroupNumRows;
     // Next row (within the current committed node group) to hand out as a morsel.
     common::row_idx_t currentGroupNextRow = 0;
+    std::unique_ptr<common::SemiMask> namespaceMask;
 };
 
 struct ScanNodeTablePrintInfo final : OPPrintInfo {
@@ -85,6 +91,9 @@ private:
 };
 
 struct ScanNodeTableInfo : ScanTableInfo {
+    // Null keeps unrestricted scans on their existing path. Scoped plan clones
+    // share immutable IDs instead of copying a set into every scan descriptor.
+    std::shared_ptr<const common::NamespaceSet> namespaceScope;
     ScanNodeTableInfo(storage::Table* table,
         std::vector<storage::ColumnPredicateSet> columnPredicates)
         : ScanTableInfo{table, std::move(columnPredicates)} {}
@@ -94,7 +103,8 @@ struct ScanNodeTableInfo : ScanTableInfo {
         const std::vector<common::ValueVector*>& outVectors, main::ClientContext* context) override;
 
 private:
-    ScanNodeTableInfo(const ScanNodeTableInfo& other) : ScanTableInfo{other} {}
+    ScanNodeTableInfo(const ScanNodeTableInfo& other)
+        : ScanTableInfo{other}, namespaceScope{other.namespaceScope} {}
 };
 
 class ScanNodeTable final : public ScanTable {

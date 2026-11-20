@@ -129,6 +129,9 @@ LogicalPlan Planner::planStatement(const BoundStatement& statement) {
     case StatementType::USE_GRAPH: {
         return planUseGraph(statement);
     }
+    case StatementType::NAMESPACE: {
+        return planNamespace(statement);
+    }
     case StatementType::EXTENSION_CLAUSE: {
         return planExtensionClause(statement);
     }

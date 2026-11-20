@@ -14,6 +14,9 @@ union CatalogEntryPayload {
     typeEntry: TypeCatalogEntryPayload,
     index: IndexCatalogEntryPayload,
     graph: GraphCatalogEntryPayload,
+    namespaceDefinition: NamespaceCatalogEntryPayload,
+    namespacePolicy: NamespaceCatalogEntryPayload,
+    namespaceMembership: NamespaceCatalogEntryPayload,
 }
 
 model TableCatalogEntryPayload {
@@ -45,6 +48,13 @@ model GraphCatalogEntryPayload {
     entryType: CatalogEntryType;
     name: string;
     isAnyGraph: boolean;
+}
+
+// NamespaceCatalogEntry owns the tagged definition/policy/sparse membership
+// payload and validates it in its custom C++ serializer/deserializer.
+model NamespaceCatalogEntryPayload {
+    entryType: CatalogEntryType;
+    name: string;
 }
 
 model CreateCatalogEntryRecord extends WalRecordBase {

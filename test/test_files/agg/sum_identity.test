@@ -1,0 +1,213 @@
+-DATASET CSV empty
+
+--
+
+# Regression tests for cntSafety/RiaGraph#192: sum() has an identity element. Over no input,
+# or over input that is all NULL, it returns the argument's zero (0 for the integer types, 0.0 for
+# FLOAT/DOUBLE), as in openCypher and Neo4j. avg, min and max stay NULL; count stays 0.
+
+-CASE SumIdentityIssueTable
+-STATEMENT CREATE NODE TABLE Nope(id INT64 PRIMARY KEY, x INT64)
+---- ok
+-STATEMENT CREATE NODE TABLE T(id INT64 PRIMARY KEY, g STRING, v INT64, d DOUBLE)
+---- ok
+-STATEMENT CREATE (:T {id: 1, g: 'a', v: NULL, d: NULL}), (:T {id: 2, g: 'b', v: 2, d: 2.5})
+---- ok
+
+-LOG SumOverAllNullUnwind
+-STATEMENT UNWIND [null, null] AS x RETURN sum(x)
+---- 1
+0
+
+-LOG SumOverEmptyTable
+-STATEMENT MATCH (n:Nope) RETURN sum(n.x), avg(n.x), min(n.x), count(n.x)
+---- 1
+0|||0
+
+-LOG SumOverFilteredToNull
+-STATEMENT UNWIND [null, 1.5] AS x WITH x WHERE x IS NULL RETURN sum(x)
+---- 1
+0.000000
+
+-LOG SumGroupedAllNullGroup
+-STATEMENT MATCH (t:T) RETURN t.g, sum(t.v), sum(t.d) ORDER BY t.g
+-CHECK_ORDER
+---- 2
+a|0|0.000000
+b|2|2.500000
+
+-LOG SumAndSumDistinctOverAllNull
+-STATEMENT MATCH (t:T) WHERE t.v IS NULL RETURN sum(t.v), sum(DISTINCT t.v)
+---- 1
+0|0
+
+-CASE SumIdentityBoundaries
+-STATEMENT CREATE NODE TABLE Nope(id INT64 PRIMARY KEY, x INT64, d DOUBLE)
+---- ok
+-STATEMENT CREATE NODE TABLE T(id INT64 PRIMARY KEY, g STRING, v INT64)
+---- ok
+-STATEMENT CREATE (:T {id: 1, g: 'a', v: NULL}), (:T {id: 2, g: 'a', v: NULL}), (:T {id: 3, g: 'b', v: 4})
+---- ok
+
+-LOG OtherAggregatesStayNull
+-STATEMENT UNWIND [null, null] AS x RETURN sum(x), avg(x), min(x), max(x), count(x)
+---- 1
+0||||0
+
+-LOG OtherAggregatesStayNullOverEmptyTable
+-STATEMENT MATCH (n:Nope) RETURN sum(n.d), avg(n.d), min(n.d), max(n.d), count(n.d), count(*)
+---- 1
+0.000000||||0|0
+
+-LOG SumSkipsNulls
+-STATEMENT UNWIND [1, NULL, 2] AS x RETURN sum(x)
+---- 1
+3
+
+-LOG SumOverEmptyTypedList
+-STATEMENT UNWIND CAST([], 'INT64[]') AS x RETURN sum(x), avg(x), count(x)
+---- 1
+0||0
+
+-LOG SumOverFoldedFalseFilter
+-STATEMENT MATCH (t:T) WHERE false RETURN sum(t.v), max(t.v)
+---- 1
+0|
+
+-LOG SumOverEmptyResultUsableInExpression
+-STATEMENT MATCH (n:Nope) WITH sum(n.x) AS s RETURN s + 1, s = 0
+---- 1
+1|True
+
+-LOG SumGroupedHashAggregate
+-STATEMENT MATCH (t:T) RETURN t.g, sum(t.v), sum(DISTINCT t.v), avg(t.v), min(t.v), max(t.v), count(t.v) ORDER BY t.g
+-CHECK_ORDER
+---- 2
+a|0|0||||0
+b|4|4|4.000000|4|4|1
+
+-LOG SumGroupedOverOptionalMatchWithoutMatch
+-STATEMENT MATCH (t:T) OPTIONAL MATCH (n:Nope) WHERE n.id = t.id RETURN t.id, sum(n.x) ORDER BY t.id
+-CHECK_ORDER
+---- 3
+1|0
+2|0
+3|0
+
+-LOG SumDistinctOverAllNullAndEmpty
+-STATEMENT UNWIND [null, null] AS x RETURN sum(DISTINCT x), count(DISTINCT x)
+---- 1
+0|0
+-STATEMENT MATCH (n:Nope) RETURN sum(DISTINCT n.x), sum(DISTINCT n.d)
+---- 1
+0|0.000000
+
+-CASE SumIdentityTypes
+-STATEMENT CREATE NODE TABLE Num(id INT64 PRIMARY KEY, g INT64, i8 INT8, i16 INT16, i32 INT32, i64 INT64, i128 INT128, u8 UINT8, u16 UINT16, u32 UINT32, u64 UINT64, u128 UINT128, f FLOAT, d DOUBLE)
+---- ok
+
+-LOG SumResultTypesOverEmptyTable
+-STATEMENT MATCH (n:Num) RETURN typeof(sum(n.i8)), typeof(sum(n.u8)), typeof(sum(n.f)), typeof(sum(n.d))
+---- 1
+INT128|UINT128|DOUBLE|DOUBLE
+
+-LOG SumEachTypeOverEmptyTable
+-STATEMENT MATCH (n:Num) RETURN sum(n.i8), sum(n.i16), sum(n.i32), sum(n.i64), sum(n.i128), sum(n.u8), sum(n.u16), sum(n.u32), sum(n.u64), sum(n.u128), sum(n.f), sum(n.d)
+---- 1
+0|0|0|0|0|0|0|0|0|0|0.000000|0.000000
+
+-LOG SumEachTypeDistinctOverEmptyTable
+-STATEMENT MATCH (n:Num) RETURN sum(DISTINCT n.i8), sum(DISTINCT n.i128), sum(DISTINCT n.u64), sum(DISTINCT n.u128), sum(DISTINCT n.f), sum(DISTINCT n.d)
+---- 1
+0|0|0|0|0.000000|0.000000
+
+-STATEMENT CREATE (:Num {id: 1, g: 1}), (:Num {id: 2, g: 1}), (:Num {id: 3, g: 2, i8: 1, i16: 2, i32: 3, i64: 4, i128: 5, u8: 6, u16: 7, u32: 8, u64: 9, u128: 10, f: 1.5, d: 2.5})
+---- ok
+
+-LOG SumEachTypeOverAllNull
+-STATEMENT MATCH (n:Num) WHERE n.g = 1 RETURN sum(n.i8), sum(n.i16), sum(n.i32), sum(n.i64), sum(n.i128), sum(n.u8), sum(n.u16), sum(n.u32), sum(n.u64), sum(n.u128), sum(n.f), sum(n.d)
+---- 1
+0|0|0|0|0|0|0|0|0|0|0.000000|0.000000
+
+-LOG SumEachTypeGrouped
+-STATEMENT MATCH (n:Num) RETURN n.g, sum(n.i8), sum(n.i16), sum(n.i32), sum(n.i64), sum(n.i128), sum(n.u8), sum(n.u16), sum(n.u32), sum(n.u64), sum(n.u128), sum(n.f), sum(n.d) ORDER BY n.g
+-CHECK_ORDER
+---- 2
+1|0|0|0|0|0|0|0|0|0|0|0.000000|0.000000
+2|1|2|3|4|5|6|7|8|9|10|1.500000|2.500000
+
+-LOG SumEachTypeDistinctGrouped
+-STATEMENT MATCH (n:Num) RETURN n.g, sum(DISTINCT n.i32), sum(DISTINCT n.u32), sum(DISTINCT n.d) ORDER BY n.g
+-CHECK_ORDER
+---- 2
+1|0|0|0.000000
+2|3|8|2.500000
+
+-CASE SumIdentityParallel
+-LOG ParallelSetup
+-STATEMENT CALL threads=4
+---- ok
+-STATEMENT CREATE NODE TABLE Big(id INT64 PRIMARY KEY, v INT64, d DOUBLE)
+---- ok
+# Three node groups, so the scan is split into several morsels and combine merges the threads'
+# partial states, all of them still untouched.
+-STATEMENT COPY Big FROM (UNWIND range(0, 299999) AS i RETURN i, CAST(NULL AS INT64), CAST(NULL AS DOUBLE))
+---- ok
+
+-LOG ParallelSimpleAggregateAllNull
+-STATEMENT MATCH (n:Big) RETURN sum(n.v), sum(n.d), sum(DISTINCT n.v), avg(n.v), min(n.v), max(n.d), count(n.v), count(*)
+---- 1
+0|0.000000|0||||0|300000
+
+-LOG ParallelHashAggregateAllNull
+-STATEMENT MATCH (n:Big) RETURN n.id % 3 AS g, sum(n.v), sum(n.d), sum(DISTINCT n.v), avg(n.v), count(n.v) ORDER BY g
+-CHECK_ORDER
+---- 3
+0|0|0.000000|0||0
+1|0|0.000000|0||0
+2|0|0.000000|0||0
+
+-LOG ParallelSimpleAggregateEmptyFilter
+-STATEMENT MATCH (n:Big) WHERE n.id < 0 RETURN sum(n.id), sum(DISTINCT n.id), min(n.id)
+---- 1
+0|0|
+
+-LOG ParallelOneNonNullValue
+-STATEMENT MATCH (n:Big) WHERE n.id = 299999 SET n.v = 5, n.d = 0.5
+---- ok
+-STATEMENT MATCH (n:Big) RETURN sum(n.v), sum(n.d), sum(DISTINCT n.v), avg(n.v), count(n.v)
+---- 1
+5|0.500000|5|5.000000|1
+-STATEMENT MATCH (n:Big) RETURN n.id % 3 AS g, sum(n.v), sum(n.d) ORDER BY g
+-CHECK_ORDER
+---- 3
+0|0|0.000000
+1|0|0.000000
+2|5|0.500000
+
+-CASE SumIdentityConstantSumOverEmptyRelTable
+# MATCH ()-[r]->() RETURN sum(c) is answered from the rel table's metadata count
+# (COUNT_REL_TABLE); over an empty rel table it must give sum's zero as well.
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY)
+---- ok
+-STATEMENT CREATE REL TABLE E(FROM P TO P)
+---- ok
+-STATEMENT CREATE (:P {id: 1}), (:P {id: 2})
+---- ok
+-STATEMENT MATCH (a:P)-[:E]->(b:P) RETURN sum(1)
+---- 1
+0
+-STATEMENT MATCH (a:P)-[:E]->(b:P) RETURN sum(10)
+---- 1
+0
+-STATEMENT MATCH (a:P)-[:E]->(b:P) RETURN sum(2.5)
+---- 1
+0.000000
+-STATEMENT MATCH (a:P), (b:P) WHERE a.id = 1 AND b.id = 2 CREATE (a)-[:E]->(b)
+---- ok
+-STATEMENT MATCH (a:P)-[:E]->(b:P) RETURN sum(10)
+---- 1
+10
+-STATEMENT MATCH (a:P)-[:E]->(b:P) RETURN sum(2.5)
+---- 1
+2.500000

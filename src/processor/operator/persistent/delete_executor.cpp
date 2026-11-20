@@ -2,6 +2,8 @@
 
 #include <memory>
 
+#include "catalog/catalog.h"
+#include "catalog/namespace_catalog.h"
 #include "common/assert.h"
 #include "common/exception/message.h"
 #include "common/vector/value_vector.h"
@@ -73,6 +75,55 @@ void NodeDeleteExecutor::appendToBatch(internalID_t nodeID) {
     batchNodeIDs.push_back(nodeID);
 }
 
+void NodeDeleteExecutor::validateNamespaceScope(ExecutionContext* context,
+    const NodeTableDeleteInfo& tableInfo) {
+    if (info.deleteType != DeleteNodeType::DETACH_DELETE || info.namespaceScope.isUnrestricted()) {
+        return;
+    }
+    const auto position = info.nodeIDVector->state->getSelVector()[0];
+    if (info.nodeIDVector->isNull(position)) {
+        return;
+    }
+    auto* transaction = Transaction::Get(*context->clientContext);
+    auto* owner = tableInfo.table->getOwningCatalog();
+    auto* namespaces = owner->getNamespaces();
+    catalog::NamespaceReadState targetReader(namespaces, transaction,
+        tableInfo.table->getTableID());
+    if (!info.namespaceScope.contains(
+            targetReader.get(info.nodeIDVector->readNodeOffset(position)))) {
+        throw RuntimeException("DETACH DELETE target is outside its MATCH namespace scope.");
+    }
+    const auto check = [&](RelTable* table, RelDataDirection direction) {
+        catalog::NamespaceReadState relReader(namespaces, transaction, table->getTableID());
+        const auto neighborTable = direction == RelDataDirection::FWD ? table->getToNodeTableID() :
+                                                                        table->getFromNodeTableID();
+        catalog::NamespaceReadState nodeReader(namespaces, transaction, neighborTable);
+        RelTableScanState scan(*MemoryManager::Get(*context->clientContext), info.nodeIDVector,
+            {dstNodeIDVector.get(), relIDVector.get()}, dstNodeIDVector->state, true);
+        scan.setToTable(transaction, table, {NBR_ID_COLUMN_ID, REL_ID_COLUMN_ID}, {}, direction);
+        table->initScanState(transaction, scan);
+        while (table->scan(transaction, scan)) {
+            const auto& selected = dstNodeIDVector->state->getSelVector();
+            for (sel_t row = 0; row < selected.getSelSize(); ++row) {
+                const auto pos = selected[row];
+                if (!info.namespaceScope.contains(
+                        relReader.get(relIDVector->readNodeOffset(pos))) ||
+                    !info.namespaceScope.contains(
+                        nodeReader.get(dstNodeIDVector->readNodeOffset(pos)))) {
+                    throw RuntimeException("DETACH DELETE would remove an incident relationship or "
+                                           "endpoint outside its MATCH namespace scope.");
+                }
+            }
+        }
+    };
+    for (auto* table : tableInfo.fwdRelTables) {
+        check(table, RelDataDirection::FWD);
+    }
+    for (auto* table : tableInfo.bwdRelTables) {
+        check(table, RelDataDirection::BWD);
+    }
+}
+
 void NodeDeleteExecutor::flushBatch(const std::vector<internalID_t>& nodeIDs,
     ValueVector& srcNodeIDVector, const std::unordered_set<RelTable*>& fwdRelTables,
     const std::unordered_set<RelTable*>& bwdRelTables, Transaction* transaction) {
@@ -116,6 +167,7 @@ void SingleLabelNodeDeleteExecutor::finalize(ExecutionContext* context) {
 }
 
 void SingleLabelNodeDeleteExecutor::delete_(ExecutionContext* context) {
+    validateNamespaceScope(context, tableInfo);
     DASSERT(tableInfo.pkVector->state == info.nodeIDVector->state);
     auto deleteState =
         std::make_unique<NodeTableDeleteState>(*info.nodeIDVector, *tableInfo.pkVector);
@@ -178,6 +230,7 @@ void MultiLabelNodeDeleteExecutor::delete_(ExecutionContext* context) {
     }
     const auto nodeID = info.nodeIDVector->getValue<internalID_t>(pos);
     const auto& tableInfo = tableInfos.at(nodeID.tableID);
+    validateNamespaceScope(context, tableInfo);
     auto deleteState =
         std::make_unique<NodeTableDeleteState>(*info.nodeIDVector, *tableInfo.pkVector);
     auto transaction = Transaction::Get(*context->clientContext);

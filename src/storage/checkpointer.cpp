@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "catalog/catalog.h"
+#include "catalog/namespace_catalog.h"
 #include "common/constants.h"
 #include "common/exception/io.h"
 #include "common/exception/runtime.h"
@@ -140,10 +141,20 @@ void Checkpointer::releaseCheckpointLocks() noexcept {
 
 std::vector<Checkpointer::CheckpointTarget> Checkpointer::collectCheckpointTargets() const {
     std::vector<CheckpointTarget> result;
-    result.push_back({clientContext.getDatabase()->getCatalog(), mainStorageManager});
+    auto* mainCatalog = clientContext.getDatabase()->getCatalog();
+    const auto requiredVersion = [&](catalog::Catalog* catalog, StorageManager* manager) {
+        const auto* namespaces = catalog->getNamespaces();
+        return std::max(manager->getOrInitDatabaseHeader(clientContext)->storageVersion,
+            namespaces && namespaces->hasAllocatedEntries() ?
+                StorageVersionInfo::STORAGE_VERSION_50 :
+                StorageVersionInfo::getStorageVersion());
+    };
+    result.push_back(
+        {mainCatalog, mainStorageManager, requiredVersion(mainCatalog, mainStorageManager)});
     for (auto* graphCatalog : clientContext.getDatabase()->getDatabaseManager()->getGraphs()) {
         if (auto* graphStorageManager = graphCatalog->getStorageManager()) {
-            result.push_back({graphCatalog, graphStorageManager});
+            result.push_back({graphCatalog, graphStorageManager,
+                requiredVersion(graphCatalog, graphStorageManager)});
         }
     }
     return result;
@@ -154,6 +165,12 @@ PageRange Checkpointer::serializeCatalog(const catalog::Catalog& catalog,
     auto catalogWriter =
         std::make_shared<common::InMemFileWriter>(*MemoryManager::Get(clientContext));
     common::Serializer catalogSerializer(catalogWriter);
+    for (const auto& target : checkpointTargets) {
+        if (target.catalog == &catalog) {
+            catalogSerializer.setStorageVersion(target.storageVersion);
+            break;
+        }
+    }
     catalog.serialize(catalogSerializer);
     auto pageAllocator = storageManager.getDataFH()->getPageManager();
     return catalogWriter->flush(*pageAllocator, storageManager.getShadowFile());
@@ -164,6 +181,12 @@ PageRange Checkpointer::serializeCatalogSnapshot(const catalog::Catalog& catalog
     auto catalogWriter =
         std::make_shared<common::InMemFileWriter>(*MemoryManager::Get(clientContext));
     common::Serializer catalogSerializer(catalogWriter);
+    for (const auto& target : checkpointTargets) {
+        if (target.catalog == &catalog) {
+            catalogSerializer.setStorageVersion(target.storageVersion);
+            break;
+        }
+    }
     catalog.serializeSnapshot(catalogSerializer, snapshotTS);
     auto pageAllocator = storageManager.getDataFH()->getPageManager();
     return catalogWriter->flush(*pageAllocator, storageManager.getShadowFile());
@@ -234,8 +257,12 @@ void Checkpointer::writeCheckpoint() {
     }
 
     auto databaseHeader = *mainStorageManager->getOrInitDatabaseHeader(clientContext);
-    const auto oldStorageVersion = databaseHeader.storageVersion;
-    databaseHeader.storageVersion = StorageVersionInfo::getStorageVersion();
+    const auto oldStorageVersion = databaseHeader.getCatalogStorageVersion();
+    databaseHeader.storageVersion = checkpointTargets.front().storageVersion;
+    databaseHeader.catalogStorageVersion =
+        databaseHeader.storageVersion >= StorageVersionInfo::STORAGE_VERSION_50 ?
+            databaseHeader.storageVersion :
+            0;
     hasStorageVersionUpgrade = oldStorageVersion != databaseHeader.storageVersion;
     bool localHasStorageChanges = checkpointStorage();
     serializeCatalogAndMetadata(databaseHeader, localHasStorageChanges);
@@ -294,8 +321,12 @@ void Checkpointer::beginCheckpoint(common::transaction_t snapshotTimestamp,
     }
 
     checkpointHeader = *mainStorageManager->getOrInitDatabaseHeader(clientContext);
-    const auto oldStorageVersion = checkpointHeader.storageVersion;
-    checkpointHeader.storageVersion = StorageVersionInfo::getStorageVersion();
+    const auto oldStorageVersion = checkpointHeader.getCatalogStorageVersion();
+    checkpointHeader.storageVersion = checkpointTargets.front().storageVersion;
+    checkpointHeader.catalogStorageVersion =
+        checkpointHeader.storageVersion >= StorageVersionInfo::STORAGE_VERSION_50 ?
+            checkpointHeader.storageVersion :
+            0;
     hasStorageVersionUpgrade = oldStorageVersion != checkpointHeader.storageVersion;
 
     // Capture versions while the write gate is still held.
@@ -443,6 +474,30 @@ void Checkpointer::postCheckpointCleanup(bool canResetPageManagerToCurrent) try 
         }
         onWALRetired(mainWALRotated);
     }
+    // Durability marker for pinned checkpoints: the active WAL holds CHECKPOINT records with no
+    // rotation. Written before the shadow files are removed so that no crash leaves the WAL
+    // ending in this CHECKPOINT record without a shadow file and without the marker, which
+    // recovery has to treat as an out-of-band loss and refuse. It records where this checkpoint's
+    // record ends: that is what tells recovery, once a later checkpoint has created its own
+    // shadow file behind the record, that the record's checkpoint is complete and the shadow
+    // belongs to another one. An unpinned checkpoint retires the WAL and removes the marker last.
+    const auto markerPath =
+        StorageUtils::getPinnedCheckpointMarkerPath(mainStorageManager->getDatabasePath());
+    auto* vfs = common::VirtualFileSystem::GetUnsafe(clientContext);
+    if (pinWALRetirement) {
+        auto markerFile = vfs->openFile(markerPath,
+            common::FileOpenFlags(
+                common::FileFlags::WRITE | common::FileFlags::CREATE_IF_NOT_EXISTS),
+            &clientContext);
+        const auto markerContent = StorageUtils::serializePinnedCheckpointMarker(
+            mainStorageManager->getWAL().getFileSize());
+        markerFile->writeFile(markerContent.data(), markerContent.size(), 0);
+        markerFile->truncate(markerContent.size());
+        markerFile->syncFile();
+        markerFile.reset();
+        vfs->syncParentDirectory(markerPath);
+    }
+    beforeShadowCleanup();
     for (const auto& target : checkpointTargets) {
         target.storageManager->getShadowFile().clear(*bufferManager, false);
         target.storageManager->getShadowFile().reset();
@@ -455,32 +510,12 @@ void Checkpointer::postCheckpointCleanup(bool canResetPageManagerToCurrent) try 
             }
         }
     }
-    common::VirtualFileSystem::GetUnsafe(clientContext)
-        ->syncParentDirectory(
-            StorageUtils::getShadowFilePath(mainStorageManager->getDatabasePath()));
-    // Durability marker for pinned checkpoints: the active WAL holds CHECKPOINT records
-    // with no rotation, and cleanup above removed the shadow. Recovery treats such
-    // CHECKPOINTs as durable only when this marker exists; a missing shadow without the
-    // marker is an out-of-band loss and must throw, never silently delete the WAL.
-    if (!isInMemory) {
-        auto* vfs = common::VirtualFileSystem::GetUnsafe(clientContext);
-        const auto markerPath =
-            StorageUtils::getPinnedCheckpointMarkerPath(mainStorageManager->getDatabasePath());
-        if (pinWALRetirement) {
-            auto markerFile = vfs->openFile(markerPath,
-                common::FileOpenFlags(
-                    common::FileFlags::WRITE | common::FileFlags::CREATE_IF_NOT_EXISTS),
-                &clientContext);
-            const uint8_t done = 1;
-            markerFile->writeFile(&done, 1, 0);
-            markerFile->truncate(1);
-            markerFile->syncFile();
-            markerFile.reset();
-            vfs->syncParentDirectory(markerPath);
-        } else {
-            vfs->removeFileIfExists(markerPath, &clientContext);
-            vfs->syncParentDirectory(markerPath);
-        }
+    vfs->syncParentDirectory(
+        StorageUtils::getShadowFilePath(mainStorageManager->getDatabasePath()));
+    afterShadowCleanup();
+    if (!pinWALRetirement) {
+        vfs->removeFileIfExists(markerPath, &clientContext);
+        vfs->syncParentDirectory(markerPath);
     }
     bufferManager->removeEvictedCandidates();
     releaseCheckpointLocks();
@@ -547,10 +582,18 @@ void Checkpointer::serializeCatalogAndMetadata(DatabaseHeader& databaseHeader,
             continue;
         }
         auto graphHeader = *target.storageManager->getOrInitDatabaseHeader(clientContext);
+        const bool graphVersionUpgrade =
+            graphHeader.getCatalogStorageVersion() != target.storageVersion;
+        graphHeader.storageVersion = target.storageVersion;
+        graphHeader.catalogStorageVersion =
+            graphHeader.storageVersion >= StorageVersionInfo::STORAGE_VERSION_50 ?
+                graphHeader.storageVersion :
+                0;
         auto* graphDataFH = target.storageManager->getDataFH();
         const auto graphStorageChanges = storageChangesByManager.at(target.storageManager);
         if (graphHeader.catalogPageRange.startPageIdx == common::INVALID_PAGE_IDX ||
-            target.catalog->changedSinceLastCheckpoint() || hasStorageVersionUpgrade) {
+            target.catalog->changedSinceLastCheckpoint() || hasStorageVersionUpgrade ||
+            graphVersionUpgrade) {
             graphHeader.updateCatalogPageRange(*graphDataFH->getPageManager(),
                 useSnapshot ? serializeCatalogSnapshot(*target.catalog, *target.storageManager) :
                               serializeCatalog(*target.catalog, *target.storageManager));
@@ -575,6 +618,10 @@ void Checkpointer::writeDatabaseHeader(const DatabaseHeader& header) {
 void Checkpointer::beforeWALRetirement(bool) {}
 
 void Checkpointer::onWALRetired(bool) {}
+
+void Checkpointer::beforeShadowCleanup() {}
+
+void Checkpointer::afterShadowCleanup() {}
 
 void Checkpointer::beforeGraphShadowApply(StorageManager&) {}
 
@@ -674,6 +721,13 @@ bool Checkpointer::canAutoCheckpoint(const main::ClientContext& clientContext,
     if (transaction.isRecovery()) {
         // Recovery transactions are not allowed to trigger auto checkpoint.
         return false;
+    }
+    if (transaction.hasDroppedTableStorage()) {
+        // A dropped table keeps its storage, and the buffer-pool memory behind it, until a
+        // checkpoint reclaims it (StorageManager::reclaimDroppedTables). The WAL a DROP writes
+        // is tiny, so the size threshold below would let DROP/CREATE cycles fill the buffer pool
+        // long before it triggers.
+        return true;
     }
     auto wal = &clientContext.getDatabase()->getStorageManager()->getWAL();
     const auto expectedSize = transaction.getLocalWAL().getSize() + wal->getFileSize();

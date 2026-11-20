@@ -21,7 +21,8 @@ on very large databases and provides a set of retrieval features, such as a full
 RiaGraph's emphasis is **quality and reliability**. It is a fork of
 [ladybug](https://github.com/ladybugdb/ladybug), whose emphasis is feature breadth, and <!-- riag-rename:skip lineage, plan section 1 -->
 ladybug is itself a fork of [Kùzu](https://github.com/kuzudb/kuzu). RiaGraph inherits the <!-- riag-rename:skip lineage, plan section 1 -->
-engine from both and diverges on what it prioritises, not on what it is.
+engine from both and diverges on what it prioritises, not on what it is. It is developed
+independently: changes made in either project after the fork are not carried over.
 
 RiaGraph is available under a permissive license. Try it out and help us make it better --
 feedback and feature requests are welcome.

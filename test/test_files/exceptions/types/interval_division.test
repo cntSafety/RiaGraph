@@ -1,0 +1,56 @@
+-DATASET CSV empty
+
+--
+
+# Interval division: a zero divisor used to raise SIGFPE and a negative divisor or operand was
+# converted to unsigned. Results are shown through CAST ... AS STRING.
+
+-CASE IntervalDivision
+
+-LOG DivideByZero
+-STATEMENT RETURN to_days(5) / 0;
+---- error
+Runtime exception: Divide by zero.
+-STATEMENT RETURN to_years(1) / 0;
+---- error
+Runtime exception: Divide by zero.
+-STATEMENT UNWIND [0] AS d RETURN to_hours(3) / d;
+---- error
+Runtime exception: Divide by zero.
+
+-LOG NegativeDivisorAndOperand
+-STATEMENT RETURN cast(to_days(10) / -2 AS STRING);
+---- 1
+-5 days
+-STATEMENT RETURN cast(to_hours(-10) / 2 AS STRING);
+---- 1
+-05:00:00
+-STATEMENT RETURN cast(to_months(-10) / 5 AS STRING);
+---- 1
+-2 months
+-STATEMENT RETURN cast(to_days(-10) / -2 AS STRING);
+---- 1
+5 days
+
+-LOG StillWorks
+-STATEMENT RETURN cast(to_days(10) / 2 AS STRING), cast(to_hours(10) / 4 AS STRING), cast(to_days(-10) / 2 AS STRING);
+---- 1
+5 days|02:30:00|-5 days
+-STATEMENT RETURN cast(to_days(1) / 2 AS STRING);
+---- 1
+12:00:00
+-STATEMENT RETURN cast(to_months(11) / 5 AS STRING);
+---- 1
+2 months 6 days
+-STATEMENT RETURN cast(to_microseconds(-9223372036854775807) / 1 AS STRING);
+---- 1
+-2562047788:00:54.775807
+
+-LOG QuotientDoesNotFit
+-STATEMENT RETURN cast(to_months(-2147483648) / -1 AS STRING);
+---- error
+Overflow exception: Value 2147483648 is not within INT32 range.
+-STATEMENT RETURN cast(to_microseconds(-9223372036854775807 - 1) / -1 AS STRING);
+---- error
+Overflow exception: Value -9223372036854775808 / -1 is not within INT64 range.
+

@@ -128,6 +128,7 @@ public:
     std::unique_ptr<PhysicalOperator> mapExtension(const planner::LogicalOperator* logicalOperator);
     std::unique_ptr<PhysicalOperator> mapExportDatabase(
         const planner::LogicalOperator* logicalOperator);
+    std::unique_ptr<PhysicalOperator> mapAssert(const planner::LogicalOperator* logicalOperator);
     std::unique_ptr<PhysicalOperator> mapFilter(const planner::LogicalOperator* logicalOperator);
     std::unique_ptr<PhysicalOperator> mapFlatten(const planner::LogicalOperator* logicalOperator);
     std::unique_ptr<PhysicalOperator> mapHashJoin(const planner::LogicalOperator* logicalOperator);
@@ -186,6 +187,9 @@ public:
     std::unique_ptr<PhysicalOperator> mapCreateGraph(
         const planner::LogicalOperator* logicalOperator);
     std::unique_ptr<PhysicalOperator> mapUseGraph(const planner::LogicalOperator* logicalOperator);
+    std::unique_ptr<PhysicalOperator> mapNamespace(const planner::LogicalOperator* logicalOperator);
+    std::unique_ptr<PhysicalOperator> mapNamespaceMutation(
+        const planner::LogicalOperator* logicalOperator);
     std::unique_ptr<PhysicalOperator> mapExtensionClause(
         const planner::LogicalOperator* logicalOperator);
 
@@ -242,6 +246,9 @@ public:
         const binder::BoundSetPropertyInfo& boundInfo, const planner::Schema& schema) const;
     std::unique_ptr<RelSetExecutor> getRelSetExecutor(const binder::BoundSetPropertyInfo& boundInfo,
         const planner::Schema& schema) const;
+    // Per SET item, the items whose target property it reads and must read again from storage.
+    static std::vector<std::vector<common::idx_t>> getColumnsToRefresh(
+        const std::vector<binder::BoundSetPropertyInfo>& infos, const planner::Schema& schema);
     std::unique_ptr<NodeDeleteExecutor> getNodeDeleteExecutor(
         const binder::BoundDeleteInfo& boundInfo, const planner::Schema& schema) const;
     std::unique_ptr<RelDeleteExecutor> getRelDeleteExecutor(

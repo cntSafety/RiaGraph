@@ -20,6 +20,7 @@ enum class LogicalOperatorType : uint8_t {
     AGGREGATE,
     ALTER,
     ANALYZE,
+    ASSERT,
     ATTACH_DATABASE,
     COPY_FROM,
     COPY_TO,
@@ -56,6 +57,8 @@ enum class LogicalOperatorType : uint8_t {
     LIMIT,
     MERGE,
     MULTIPLICITY_REDUCER,
+    NAMESPACE_COMMAND,
+    NAMESPACE_MUTATION,
     NODE_LABEL_FILTER,
     NOOP,
     ORDER_BY,
@@ -119,6 +122,10 @@ public:
     // Operator type.
     LogicalOperatorType getOperatorType() const { return operatorType; }
     bool hasUpdateRecursive();
+    // Whether an update runs in the same pipeline as this operator, so that it only applies to
+    // the rows pulled through this operator. An operator that may stop pulling early (LIMIT, a
+    // capped DISTINCT, a cross product with an empty build side) must not sit above one.
+    bool hasUpdateInPipeline() const;
 
     // Schema
     Schema* getSchema() const { return schema.get(); }

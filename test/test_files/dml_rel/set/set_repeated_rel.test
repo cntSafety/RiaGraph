@@ -1,0 +1,98 @@
+-DATASET CSV empty
+
+--
+
+# One SET statement that writes the same rel from several rows. The input is accumulated before
+# the SET, so the properties the right-hand sides read were scanned before any row was written;
+# each row must still see what the earlier rows stored.
+
+-CASE SetRepeatedRelReadsEarlierRows
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N, v INT64, s STRING);
+---- ok
+-STATEMENT CREATE (:N {id: 1}), (:N {id: 2}), (:N {id: 3});
+---- ok
+-STATEMENT MATCH (a:N {id: 1}), (b:N {id: 2}) CREATE (a)-[:R {v: 1, s: ''}]->(b);
+---- ok
+# A second rel on the same source node: the read must pick the rel being written.
+-STATEMENT MATCH (a:N {id: 1}), (b:N {id: 3}) CREATE (a)-[:R {v: 100, s: ''}]->(b);
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) SET r.v = r.v + 1 RETURN k, r.v;
+---- 3
+1|2
+2|3
+3|4
+-STATEMENT MATCH (:N {id: 1})-[r:R]->(b:N) RETURN b.id, r.v;
+---- 2
+2|4
+3|100
+-STATEMENT UNWIND ['x', 'y', 'z'] AS t MATCH (:N {id: 1})-[r:R]->(:N {id: 3}) SET r.s = r.s + t RETURN t, r.s;
+---- 3
+x|x
+y|xy
+z|xyz
+-STATEMENT UNWIND range(1, 3000) AS k MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) SET r.v = r.v + 1 WITH r.v AS v RETURN count(*), count(DISTINCT v), min(v), max(v);
+---- 1
+3000|3000|5|3004
+-STATEMENT MATCH (:N {id: 1})-[r:R]->(b:N) RETURN b.id, r.v, r.s;
+---- 2
+2|3004|
+3|100|xyz
+
+-CASE SetRepeatedRelCreatedInStatement
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N, v INT64);
+---- ok
+-STATEMENT CREATE (:N {id: 1}), (:N {id: 2});
+---- ok
+-STATEMENT MATCH (a:N {id: 1}), (b:N {id: 2}) CREATE (a)-[r:R {v: 1}]->(b) WITH r UNWIND [1, 2, 3] AS k SET r.v = r.v + 1 RETURN k, r.v;
+---- 3
+1|2
+2|3
+3|4
+-STATEMENT MATCH ()-[r:R]->() RETURN r.v;
+---- 1
+4
+
+-CASE SetRepeatedRelMultiLabel
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N, v INT64);
+---- ok
+-STATEMENT CREATE REL TABLE S(FROM N TO N, v INT64);
+---- ok
+-STATEMENT CREATE (:N {id: 1}), (:N {id: 2});
+---- ok
+-STATEMENT MATCH (a:N {id: 1}), (b:N {id: 2}) CREATE (a)-[:R {v: 1}]->(b), (a)-[:S {v: 10}]->(b);
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH ()-[r:R|S]->() SET r.v = r.v + 1 RETURN r.v;
+---- 6
+11
+12
+13
+2
+3
+4
+-STATEMENT MATCH ()-[r:R|S]->() RETURN label(r), r.v;
+---- 2
+R|4
+S|13
+
+# Boundary: distinct rels per row behave as before.
+-CASE SetDistinctRelsUnchanged
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N, v INT64);
+---- ok
+-STATEMENT CREATE (:N {id: 1}), (:N {id: 2});
+---- ok
+-STATEMENT MATCH (a:N {id: 1}), (b:N {id: 2}) UNWIND range(1, 3000) AS k CREATE (a)-[:R {v: k}]->(b);
+---- ok
+-STATEMENT MATCH ()-[r:R]->() SET r.v = r.v * 2 RETURN sum(r.v);
+---- 1
+9003000
+-STATEMENT MATCH ()-[r:R]->() RETURN sum(r.v), count(*);
+---- 1
+9003000|3000

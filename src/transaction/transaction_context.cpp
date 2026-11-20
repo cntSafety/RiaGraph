@@ -18,14 +18,12 @@ TransactionContext::~TransactionContext() = default;
 
 void TransactionContext::beginReadTransaction() {
     std::unique_lock lck{mtx};
-    mode = TransactionMode::MANUAL;
-    beginTransactionInternal(TransactionType::READ_ONLY);
+    beginManualTransaction(TransactionType::READ_ONLY);
 }
 
 void TransactionContext::beginWriteTransaction() {
     std::unique_lock lck{mtx};
-    mode = TransactionMode::MANUAL;
-    beginTransactionInternal(TransactionType::WRITE);
+    beginManualTransaction(TransactionType::WRITE);
 }
 
 void TransactionContext::beginAutoTransaction(bool readOnlyStatement) {
@@ -41,8 +39,7 @@ void TransactionContext::beginAutoTransaction(bool readOnlyStatement) {
 
 void TransactionContext::beginRecoveryTransaction() {
     std::unique_lock lck{mtx};
-    mode = TransactionMode::MANUAL;
-    beginTransactionInternal(TransactionType::RECOVERY);
+    beginManualTransaction(TransactionType::RECOVERY);
 }
 
 void TransactionContext::validateManualTransaction(bool readOnlyStatement) const {
@@ -85,6 +82,21 @@ void TransactionContext::clearTransaction() {
 
 TransactionContext* TransactionContext::Get(const main::ClientContext& context) {
     return context.transactionContext.get();
+}
+
+void TransactionContext::beginManualTransaction(TransactionType transactionType) {
+    // The mode must not outlive a refused begin: the transaction manager throws when it cannot
+    // admit the transaction (e.g. a second concurrent write transaction), and a context left in
+    // MANUAL mode without an active transaction violates the invariant every statement relies on
+    // (auto mode or an active transaction), so its next table statement runs with no transaction.
+    const auto previousMode = mode;
+    mode = TransactionMode::MANUAL;
+    try {
+        beginTransactionInternal(transactionType);
+    } catch (...) {
+        mode = previousMode;
+        throw;
+    }
 }
 
 void TransactionContext::beginTransactionInternal(TransactionType transactionType) {

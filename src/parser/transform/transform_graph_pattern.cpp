@@ -56,7 +56,12 @@ NodePattern Transformer::transformNodePattern(CypherParser::OC_NodePatternContex
     if (ctx.iC_Properties()) {
         properties = transformProperties(*ctx.iC_Properties());
     }
-    return NodePattern(std::move(variable), std::move(nodeLabels), std::move(properties));
+    auto pattern = NodePattern(std::move(variable), std::move(nodeLabels), std::move(properties));
+    if (ctx.iC_NamespaceScope()) {
+        pattern.setNamespaceSelector(
+            transformNamespaceList(*ctx.iC_NamespaceScope()->iC_NamespaceList()));
+    }
+    return pattern;
 }
 
 PatternElementChain Transformer::transformPatternElementChain(
@@ -168,8 +173,13 @@ RelPattern Transformer::transformRelationshipPattern(
             }
         }
     }
-    return RelPattern(variable, relTypes, relType, arrowDirection, std::move(properties),
+    auto pattern = RelPattern(variable, relTypes, relType, arrowDirection, std::move(properties),
         std::move(recursiveInfo));
+    if (relDetail && relDetail->iC_NamespaceScope()) {
+        pattern.setNamespaceSelector(
+            transformNamespaceList(*relDetail->iC_NamespaceScope()->iC_NamespaceList()));
+    }
+    return pattern;
 }
 
 std::vector<s_parsed_expr_pair> Transformer::transformProperties(

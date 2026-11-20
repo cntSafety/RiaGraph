@@ -15,9 +15,17 @@ public:
         common::string_t& result, common::ValueVector& resultValueVector) {
         std::string srcStr = src.getAsString();
         bool isAscii = true;
+        // A start before the first character or a length below one selects nothing. Rejecting
+        // them first keeps start - 1 and startPos + len from overflowing, and keeps a negative
+        // length from being read as a huge unsigned end position that runs off the string.
+        if (start < 1 || len < 1) {
+            result.len = 0;
+            return;
+        }
         int64_t startPos = start - 1;
-        int64_t endPos = std::min(srcStr.size(), (size_t)(startPos + len));
-        if (startPos >= endPos || startPos < 0 || startPos >= (int64_t)srcStr.size()) {
+        int64_t size = srcStr.size();
+        int64_t endPos = len > size - startPos ? size : startPos + len;
+        if (startPos >= endPos || startPos >= size) {
             result.len = 0;
             return;
         }

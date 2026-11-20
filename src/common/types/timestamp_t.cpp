@@ -4,6 +4,7 @@
 #include <string>
 
 #include "common/exception/conversion.h"
+#include "function/arithmetic/add.h"
 #include "function/arithmetic/multiply.h"
 #include <format>
 
@@ -92,16 +93,16 @@ timestamp_t timestamp_t::operator+(const interval_t& interval) const {
 }
 
 timestamp_t timestamp_t::operator-(const interval_t& interval) const {
-    interval_t inverseRight{};
-    inverseRight.months = -interval.months;
-    inverseRight.days = -interval.days;
-    inverseRight.micros = -interval.micros;
-    return (*this) + inverseRight;
+    return (*this) + interval.negate();
 }
 
 interval_t timestamp_t::operator-(const timestamp_t& rhs) const {
     interval_t result{};
-    uint64_t diff = std::abs(value - rhs.value);
+    // The difference of two timestamps can exceed INT64_MAX (e.g. max - min), so it is taken on the
+    // unsigned values. It always fits an interval: at most ~2.1e8 days.
+    auto lhsBits = static_cast<uint64_t>(value);
+    auto rhsBits = static_cast<uint64_t>(rhs.value);
+    uint64_t diff = value >= rhs.value ? lhsBits - rhsBits : rhsBits - lhsBits;
     result.months = 0;
     result.days = diff / Interval::MICROS_PER_DAY;
     result.micros = diff % Interval::MICROS_PER_DAY;
@@ -317,7 +318,14 @@ timestamp_t Timestamp::fromDateTime(date_t date, dtime_t time) {
     int32_t year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0, microsecond = -1;
     Date::convert(date, year, month, day);
     Time::convert(time, hour, minute, second, microsecond);
-    result.value = date.days * Interval::MICROS_PER_DAY + time.micros;
+    // Non-const copies: the checked Multiply/Add specializations only match plain int64_t&, a
+    // const operand silently selects the unchecked generic template (see fromEpochMilliSeconds).
+    int64_t days = date.days;
+    int64_t microsPerDay = Interval::MICROS_PER_DAY;
+    int64_t dayMicros = 0;
+    int64_t timeMicros = time.micros;
+    function::Multiply::operation(days, microsPerDay, dayMicros);
+    function::Add::operation(dayMicros, timeMicros, result.value);
     return result;
 }
 
@@ -332,7 +340,10 @@ timestamp_t Timestamp::fromEpochMicroSeconds(int64_t micros) {
 
 timestamp_t Timestamp::fromEpochMilliSeconds(int64_t ms) {
     int64_t microSeconds = 0;
-    function::Multiply::operation(ms, Interval::MICROS_PER_MSEC, microSeconds);
+    // The factor must be a non-const lvalue copy: the checked Multiply specializations only match
+    // plain int64_t&, and a const argument silently selects the unchecked generic template.
+    auto factor = Interval::MICROS_PER_MSEC;
+    function::Multiply::operation(ms, factor, microSeconds);
     return fromEpochMicroSeconds(microSeconds);
 }
 
@@ -340,7 +351,8 @@ timestamp_t Timestamp::fromEpochMilliSeconds(int64_t ms) {
 // TODO(Kebing): will add the tests in the timestamp PR
 timestamp_t Timestamp::fromEpochSeconds(int64_t sec) {
     int64_t microSeconds = 0;
-    function::Multiply::operation(sec, Interval::MICROS_PER_SEC, microSeconds);
+    auto factor = Interval::MICROS_PER_SEC; // non-const, see fromEpochMilliSeconds
+    function::Multiply::operation(sec, factor, microSeconds);
     return fromEpochMicroSeconds(microSeconds);
 }
 // LCOV_EXCL_STOP
@@ -398,7 +410,11 @@ timestamp_t Timestamp::trunc(DatePartSpecifier specifier, timestamp_t timestamp)
 
 int64_t Timestamp::getEpochNanoSeconds(const timestamp_t& timestamp) {
     int64_t result = 0;
-    function::Multiply::operation(timestamp.value, Interval::NANOS_PER_MICRO, result);
+    // Non-const copies, see fromEpochMilliSeconds. A TIMESTAMP_NS only spans roughly the years
+    // 1677 to 2262, so a larger timestamp must raise an overflow error rather than wrap.
+    auto micros = timestamp.value;
+    auto factor = Interval::NANOS_PER_MICRO;
+    function::Multiply::operation(micros, factor, result);
     return result;
 }
 

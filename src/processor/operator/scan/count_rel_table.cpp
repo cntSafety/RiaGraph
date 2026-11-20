@@ -50,10 +50,6 @@ bool CountRelTable::getNextTuplesInternal(ExecutionContext* context) {
 
     // Write the count to the output vector (single value)
     countVector->state->getSelVectorUnsafe().setToUnfiltered(1);
-    if (returnNullOnZero && totalCount == 0) {
-        countVector->setNull(0, true);
-        return true;
-    }
     countVector->setNull(0, false);
     switch (countVector->dataType.getPhysicalType()) {
     case PhysicalTypeID::INT64:

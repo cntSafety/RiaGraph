@@ -1,0 +1,294 @@
+-DATASET CSV empty
+
+--
+
+# An updating clause applies to every row of its query part, whatever comes after it. SET, CREATE,
+# MERGE and DELETE stream: they write the rows their consumer pulls through them. A LIMIT above a
+# write used to stop pulling after limit + 1 rows, and a cross product whose build side was empty
+# (an empty LOAD FROM or CALL) never pulled the write at all, so the statement succeeded and most
+# of its writes were never made (cntSafety/RiaGraph#120, #121).
+#
+# Every statement is followed by a second one that counts the stored state: the rows a write query
+# returns are right either way. Which rows survive an unordered LIMIT is not defined, so the
+# statements return values that every row shares.
+
+-CASE WriteBeforeLimitAppliesToEveryRow
+-STATEMENT CREATE NODE TABLE T(id INT64, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:T {id: i, v: 0});
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a LIMIT 1 RETURN a.v;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 RETURN a.v LIMIT 1;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 RETURN a.v LIMIT 0;
+---- 0
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 RETURN a.v LIMIT 2;
+---- 2
+1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 RETURN a.v SKIP 1 LIMIT 1;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a LIMIT 1 RETURN count(*);
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a LIMIT 3 RETURN a.v LIMIT 1;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 RETURN a.v AS v LIMIT 1 UNION ALL RETURN 0 AS v;
+---- 2
+0
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+# The limit push-down used to cap the DISTINCT, which then stopped pulling from the write.
+-STATEMENT MATCH (a:T) SET a.v = 1 RETURN DISTINCT a.v LIMIT 1;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH DISTINCT a.v AS v RETURN v LIMIT 1;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+# A non-empty CALL puts the write on the probe side of a cross product, which the LIMIT stops.
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a CALL show_tables() RETURN a.v LIMIT 1;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT CALL enable_plan_optimizer=false;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a LIMIT 1 RETURN a.v;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+
+-CASE OtherWritesBeforeLimitApplyToEveryRow
+-STATEMENT CREATE NODE TABLE T(id INT64, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:T {id: i, v: 0});
+---- ok
+-STATEMENT UNWIND range(1001, 1003) AS i CREATE (n:T {id: i, v: 7}) RETURN n.v LIMIT 0;
+---- 0
+-STATEMENT MATCH (n:T) RETURN count(*);
+---- 1
+8
+-STATEMENT MATCH (n:T) WHERE n.id > 1000 DELETE n;
+---- ok
+-STATEMENT UNWIND range(1001, 1003) AS i CREATE (n:T {id: i, v: 7}) RETURN n.v LIMIT 1;
+---- 1
+7
+-STATEMENT MATCH (n:T) RETURN count(*);
+---- 1
+8
+-STATEMENT MATCH (n:T) WHERE n.id > 1000 DELETE n;
+---- ok
+-STATEMENT UNWIND range(1001, 1003) AS i MERGE (n:T {id: i}) ON CREATE SET n.v = 7 RETURN n.v LIMIT 1;
+---- 1
+7
+-STATEMENT MATCH (n:T) RETURN count(*);
+---- 1
+8
+-STATEMENT MATCH (n:T) WHERE n.id > 1000 DELETE n;
+---- ok
+-STATEMENT MATCH (a:T), (b:T) WHERE a.id = 1 AND b.id >= 2 CREATE (a)-[:R]->(b) RETURN b.v LIMIT 1;
+---- 1
+0
+-STATEMENT MATCH ()-[r:R]->() RETURN count(*);
+---- 1
+4
+-STATEMENT MATCH (a:T) WITH a, a.id AS id DETACH DELETE a RETURN id * 0 LIMIT 1;
+---- 1
+0
+-STATEMENT MATCH (n:T) RETURN count(*);
+---- 1
+0
+-STATEMENT MATCH ()-[r:R]->() RETURN count(*);
+---- 1
+0
+
+-CASE WriteBeforeEmptyLoadFromOrCallAppliesToEveryRow
+-STATEMENT CREATE NODE TABLE T(id INT64, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:T {id: i, v: 0});
+---- ok
+# The file holds only a header line.
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a LOAD FROM "${RIAG_ROOT_DIRECTORY}/dataset/copy-fault-tests/invalid-row/emptyMovie.csv" (header=true) RETURN a.v;
+---- 0
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+# No sequence exists.
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a CALL show_sequences() RETURN a.v;
+---- 0
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a CALL show_tables() WHERE name = 'Nope' RETURN a.v;
+---- 0
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT UNWIND range(1001, 1003) AS i CREATE (n:T {id: i, v: 7}) WITH n LOAD FROM "${RIAG_ROOT_DIRECTORY}/dataset/copy-fault-tests/invalid-row/emptyMovie.csv" (header=true) RETURN n.v;
+---- 0
+-STATEMENT MATCH (n:T) RETURN count(*);
+---- 1
+8
+-STATEMENT MATCH (n:T) WHERE n.id > 1000 DELETE n;
+---- ok
+-STATEMENT UNWIND range(1001, 1003) AS i MERGE (n:T {id: i}) WITH n LOAD FROM "${RIAG_ROOT_DIRECTORY}/dataset/copy-fault-tests/invalid-row/emptyMovie.csv" (header=true) RETURN n.v;
+---- 0
+-STATEMENT MATCH (n:T) RETURN count(*);
+---- 1
+8
+-STATEMENT MATCH (n:T) WHERE n.id > 1000 DELETE n;
+---- ok
+-STATEMENT MATCH (a:T) WITH a, a.id AS k DETACH DELETE a WITH k LOAD FROM "${RIAG_ROOT_DIRECTORY}/dataset/copy-fault-tests/invalid-row/emptyMovie.csv" (header=true) RETURN k;
+---- 0
+-STATEMENT MATCH (n:T) RETURN count(*);
+---- 1
+0
+
+# Shapes that already applied every write, and must keep doing so.
+-CASE WriteEarlyTerminationControls
+-STATEMENT CREATE NODE TABLE T(id INT64, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE U(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:T {id: i, v: 0});
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 RETURN a.v ORDER BY a.id LIMIT 1;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH count(*) AS c RETURN c LIMIT 1;
+---- 1
+5
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 RETURN a.v SKIP 2;
+---- 3
+1
+1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a UNWIND [] AS x RETURN x;
+---- 0
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a MATCH (b:U) RETURN b.id;
+---- 0
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a OPTIONAL MATCH (b:U) RETURN a.v;
+---- 5
+1
+1
+1
+1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a WHERE false RETURN a.v;
+---- 0
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+# A LIMIT before the write still limits the rows it writes.
+-STATEMENT MATCH (a:T) WITH a ORDER BY a.id LIMIT 2 SET a.v = 1 RETURN count(*);
+---- 1
+2
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN a.id;
+---- 2
+1
+2
+-STATEMENT MATCH (a:T) WITH a LIMIT 2 SET a.v = 2 RETURN count(*);
+---- 1
+2
+-STATEMENT MATCH (a:T) WHERE a.v = 2 RETURN count(*);
+---- 1
+2

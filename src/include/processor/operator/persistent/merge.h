@@ -1,6 +1,9 @@
 #pragma once
 
+#include <unordered_map>
+
 #include "insert_executor.h"
+#include "namespace_mutation.h"
 #include "processor/operator/physical_operator.h"
 #include "processor/result/pattern_creation_info_table.h"
 #include "set_executor.h"
@@ -9,28 +12,54 @@ namespace riag {
 namespace processor {
 
 struct MergeInfo {
+    std::vector<NamespaceMutationInfo> onMatchNamespaceMoves;
+    std::vector<NamespaceMutationInfo> onCreateNamespaceMoves;
     std::vector<std::unique_ptr<evaluator::ExpressionEvaluator>> keyEvaluators;
     FactorizedTableSchema tableSchema;
     common::executor_info executorInfo;
-    bool storeInsertedPatternIDs;
     bool suppressDuplicateCreatedOutput;
     DataPos existenceMark;
+    // Per ON MATCH SET executor: the executors whose target property it reads, read again from
+    // storage before it runs (see NodeSetExecutor::refreshColumn).
+    std::vector<std::vector<common::idx_t>> onMatchNodeColumnsToRefresh;
+    std::vector<std::vector<common::idx_t>> onMatchRelColumnsToRefresh;
+    // Set when an ON CREATE SET (ON MATCH SET) can change a property the MERGE pattern gives a
+    // value, e.g. MERGE (a:A {v: 5}) ON CREATE SET a.v = k. A pattern an earlier row created then
+    // no longer matches the key it was created for, or matches another row's key, so the key
+    // hash table cannot tell which created patterns a row matches. Merge::mergeCreatedPatterns
+    // tracks them by their stored values instead.
+    bool onCreateChangesPattern = false;
+    bool onMatchChangesPattern = false;
+    // Only used when one of the above is set. Per insert executor (nodes, then rels), the columns
+    // the pattern gives a value; patternValueEvaluators evaluate those values in the same order.
+    // fixedKeys are the keys a SET cannot change (bound node IDs), as indexes into keyEvaluators.
+    std::vector<std::vector<common::idx_t>> patternColumns;
+    std::vector<std::unique_ptr<evaluator::ExpressionEvaluator>> patternValueEvaluators;
+    std::vector<common::idx_t> fixedKeys;
 
     MergeInfo(std::vector<std::unique_ptr<evaluator::ExpressionEvaluator>> keyEvaluators,
         FactorizedTableSchema tableSchema, common::executor_info executorInfo,
-        bool storeInsertedPatternIDs, bool suppressDuplicateCreatedOutput, DataPos existenceMark)
+        bool suppressDuplicateCreatedOutput, DataPos existenceMark)
         : keyEvaluators{std::move(keyEvaluators)}, tableSchema{std::move(tableSchema)},
-          executorInfo{std::move(executorInfo)}, storeInsertedPatternIDs{storeInsertedPatternIDs},
+          executorInfo{std::move(executorInfo)},
           suppressDuplicateCreatedOutput{suppressDuplicateCreatedOutput},
           existenceMark{existenceMark} {}
     EXPLICIT_COPY_DEFAULT_MOVE(MergeInfo);
 
 private:
     MergeInfo(const MergeInfo& other)
-        : keyEvaluators{copyVector(other.keyEvaluators)}, tableSchema{other.tableSchema.copy()},
-          executorInfo{other.executorInfo}, storeInsertedPatternIDs{other.storeInsertedPatternIDs},
+        : onMatchNamespaceMoves{other.onMatchNamespaceMoves},
+          onCreateNamespaceMoves{other.onCreateNamespaceMoves},
+          keyEvaluators{copyVector(other.keyEvaluators)}, tableSchema{other.tableSchema.copy()},
+          executorInfo{other.executorInfo},
           suppressDuplicateCreatedOutput{other.suppressDuplicateCreatedOutput},
-          existenceMark{other.existenceMark} {}
+          existenceMark{other.existenceMark},
+          onMatchNodeColumnsToRefresh{other.onMatchNodeColumnsToRefresh},
+          onMatchRelColumnsToRefresh{other.onMatchRelColumnsToRefresh},
+          onCreateChangesPattern{other.onCreateChangesPattern},
+          onMatchChangesPattern{other.onMatchChangesPattern}, patternColumns{other.patternColumns},
+          patternValueEvaluators{copyVector(other.patternValueEvaluators)},
+          fixedKeys{other.fixedKeys} {}
 };
 
 struct MergePrintInfo final : OPPrintInfo {
@@ -54,10 +83,24 @@ private:
           onMatch(other.onMatch) {}
 };
 
+// A pattern this MERGE created, when a SET can change the values its properties were created with
+// (see MergeInfo::onCreateChangesPattern).
+struct CreatedPattern {
+    // One per insert executor.
+    std::vector<common::internalID_t> ids;
+    // The fixed keys it was created with, then the stored values of its pattern columns.
+    std::vector<common::Value> key;
+};
+
 struct MergeLocalState {
     std::vector<common::ValueVector*> keyVectors;
     std::unique_ptr<PatternCreationInfoTable> hashTable;
     common::ValueVector* existenceVector = nullptr;
+    // Only used when a SET can change a pattern property.
+    std::vector<CreatedPattern> createdPatterns;
+    std::unordered_multimap<common::hash_t, common::idx_t> createdPatternsByKey;
+    // The created patterns the current input row matches and that are not output yet.
+    std::vector<common::idx_t> pendingMatches;
 
     void init(ResultSet& resultSet, main::ClientContext* context, MergeInfo& info);
 
@@ -105,11 +148,21 @@ public:
 private:
     void executeOnMatch(ExecutionContext* context);
 
-    void executeOnCreatedPattern(PatternCreationInfo& info, ExecutionContext* context);
+    template<typename GetID>
+    void executeOnCreatedPattern(const GetID& getPatternID, ExecutionContext* context);
 
-    void executeOnNewPattern(PatternCreationInfo& info, ExecutionContext* context);
+    template<typename SetID>
+    void executeOnNewPattern(const SetID& setPatternID, ExecutionContext* context);
 
     bool executeNoMatch(ExecutionContext* context);
+
+    // executeNoMatch for a MERGE whose SET can change a pattern property.
+    void mergeCreatedPatterns(ExecutionContext* context);
+    bool outputPendingMatch(ExecutionContext* context);
+    std::vector<common::Value> readPatternKey(const CreatedPattern& pattern,
+        ExecutionContext* context) const;
+    void addCreatedPatternKey(common::idx_t idx);
+    void removeCreatedPatternKey(common::idx_t idx);
 
 private:
     std::vector<NodeInsertExecutor> nodeInsertExecutors;
@@ -123,6 +176,8 @@ private:
 
     MergeInfo info;
     MergeLocalState localState;
+    std::unique_ptr<NamespaceMutationExecutor> onMatchNamespaceExecutor;
+    std::unique_ptr<NamespaceMutationExecutor> onCreateNamespaceExecutor;
 };
 
 } // namespace processor

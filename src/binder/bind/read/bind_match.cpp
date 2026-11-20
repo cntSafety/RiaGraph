@@ -60,9 +60,13 @@ static bool isAnyGraphNodePattern(const NodeOrRelExpression& pattern,
 
 std::unique_ptr<BoundReadingClause> Binder::bindMatchClause(const ReadingClause& readingClause) {
     auto& matchClause = readingClause.constCast<MatchClause>();
+    namespaceReadBase = matchClause.getNamespaceSelector() ?
+                            bindNamespaceSelector(*matchClause.getNamespaceSelector()) :
+                            clientContext->getNamespaceSelection();
     auto boundGraphPattern = bindGraphPattern(matchClause.getPatternElementsRef());
     if (matchClause.hasWherePredicate()) {
-        boundGraphPattern.where = bindWhereExpression(*matchClause.getWherePredicate());
+        boundGraphPattern.where = expressionBinder.combineBooleanExpressions(ExpressionType::AND,
+            boundGraphPattern.where, bindWhereExpression(*matchClause.getWherePredicate()));
     }
     rewriteMatchPattern(boundGraphPattern);
     auto boundMatch = std::make_unique<BoundMatchClause>(

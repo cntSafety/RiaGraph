@@ -2,6 +2,7 @@
 
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/sequence_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/exception/runtime.h"
 #include "main/client_context.h"
 #include "main/database.h"
@@ -9,6 +10,7 @@
 #include "main/db_config.h"
 #include "storage/local_storage/local_node_table.h"
 #include "storage/local_storage/local_storage.h"
+#include "storage/partition_storage_registry.h"
 #include "storage/storage_manager.h"
 #include "storage/undo_buffer.h"
 #include "storage/wal/local_wal.h"
@@ -75,10 +77,48 @@ void Transaction::commit(storage::WAL* wal) {
 
 void Transaction::writeCommitToWAL(storage::WAL* wal, uint64_t& walCommitSequence) {
     walCommitSequence = 0;
+    auto* namespaces = namespaceState.load(std::memory_order_acquire);
+    const auto hasNamespaceData = namespaces && !namespaces->dataCatalogs.empty();
+    if (shouldLogToWAL() && (!changedCatalogs.empty() || hasNamespaceData)) {
+        auto owners = changedCatalogs;
+        if (hasNamespaceData) {
+            owners.insert(namespaces->dataCatalogs.begin(), namespaces->dataCatalogs.end());
+        }
+        for (auto* owner : owners) {
+            if (const auto* namespaces = owner->getNamespaces();
+                namespaces && namespaces->hasAllocatedEntries()) {
+                clientContext->getDatabase()->getStorageManager()->ensureNamespaceStorageVersion(
+                    *clientContext);
+                storage::PartitionStorageRegistry::resolveOwnerStorageManager(clientContext, owner)
+                    ->ensureNamespaceStorageVersion(*clientContext);
+            }
+        }
+    }
+    if (hasNamespaceData) {
+        // Finalizing local edge IDs may add destination groups to this set.
+        // Visit a snapshot of this transaction's groups, never the whole catalog.
+        const std::vector<catalog::CatalogEntry*> stagedGroups(namespaces->groups.begin(),
+            namespaces->groups.end());
+        for (const auto* entry : stagedGroups) {
+            if (entry->getNext() == nullptr && !entry->isDeleted()) {
+                entry->getOwningCatalog()->getNamespaces()->finalizeLocalRelationshipGroup(this,
+                    entry->constCast<catalog::NamespaceCatalogEntry>());
+            }
+        }
+    }
     if (!shouldLogToWAL()) {
         return;
     }
     DASSERT(localWAL && wal);
+    if (namespaces) {
+        for (auto* entry : namespaces->groups) {
+            // A later DROP/replace may have superseded the staged group. Only the
+            // final live version is written, after its row updates are complete.
+            if (entry->getNext() == nullptr && !entry->isDeleted()) {
+                localWAL->logCreateCatalogEntryRecord(entry->getOwningCatalogName(), entry, false);
+            }
+        }
+    }
     localWAL->logCommit();
     wal->logCommittedWAL(*localWAL, clientContext, walCommitSequence);
     localWAL->clear();
@@ -90,6 +130,18 @@ void Transaction::publishCommit() {
     }
     localStorage->commit();
     undoBuffer->commit(clientContext, commitTS);
+    if (auto* namespaces = namespaceState.load(std::memory_order_acquire);
+        namespaces && !namespaces->dataCatalogs.empty()) {
+        auto* mainCatalog = clientContext->getDatabase()->getCatalog();
+        if (namespaces->dataCatalogs.erase(mainCatalog)) {
+            mainCatalog->incrementVersion(false);
+        }
+        if (!namespaces->dataCatalogs.empty()) {
+            main::DatabaseManager::Get(*clientContext)
+                ->bumpGraphCatalogVersions(namespaces->dataCatalogs, false);
+        }
+        namespaces->dataCatalogs.clear();
+    }
     std::unordered_set<catalog::Catalog*> graphCatalogsToBump;
     catalog::Catalog* mainCatalogToBump = nullptr;
     {
@@ -185,13 +237,25 @@ std::optional<common::row_idx_t> Transaction::tryGetLocalRowIdx(const storage::T
 void Transaction::pushCreateDropCatalogEntry(CatalogSet& catalogSet, CatalogEntry& catalogEntry,
     bool isInternal, bool skipLoggingToWAL) {
     undoBuffer->createCatalogEntry(catalogSet, catalogEntry);
-    recordCatalogChange(catalogSet.getCatalog());
+    if (catalogEntry.getType() == CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY ||
+        catalogEntry.getNext()->getType() == CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY) {
+        std::lock_guard lock{changedCatalogsMutex};
+        getOrCreateNamespaceStateNoLock().dataCatalogs.insert(catalogSet.getCatalog());
+    } else {
+        recordCatalogChange(catalogSet.getCatalog());
+    }
     if (!shouldLogToWAL() || skipLoggingToWAL) {
         return;
     }
     DASSERT(localWAL);
     const auto newCatalogEntry = catalogEntry.getNext();
     switch (newCatalogEntry->getType()) {
+    case CatalogEntryType::NAMESPACE_ENTRY:
+    case CatalogEntryType::NAMESPACE_POLICY_ENTRY:
+    case CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY: {
+        localWAL->logCreateCatalogEntryRecord(catalogSet.getOwnerCatalogName(), newCatalogEntry,
+            isInternal);
+    } break;
     case CatalogEntryType::INDEX_ENTRY:
     case CatalogEntryType::NODE_TABLE_ENTRY:
     case CatalogEntryType::REL_GROUP_ENTRY: {
@@ -233,6 +297,12 @@ void Transaction::pushCreateDropCatalogEntry(CatalogSet& catalogSet, CatalogEntr
         case CatalogEntryType::REL_GROUP_ENTRY:
         case CatalogEntryType::SEQUENCE_ENTRY:
         case CatalogEntryType::GRAPH_ENTRY: {
+            localWAL->logDropCatalogEntryRecord(catalogSet.getOwnerCatalogName(),
+                catalogEntry.getOID(), catalogEntry.getType());
+        } break;
+        case CatalogEntryType::NAMESPACE_ENTRY:
+        case CatalogEntryType::NAMESPACE_POLICY_ENTRY:
+        case CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY: {
             localWAL->logDropCatalogEntryRecord(catalogSet.getOwnerCatalogName(),
                 catalogEntry.getOID(), catalogEntry.getType());
         } break;
@@ -319,6 +389,28 @@ common::offset_t Transaction::getMinUncommittedNodeOffset(common::table_id_t tab
         }
     }
     return 0;
+}
+
+Transaction::NamespaceState& Transaction::getOrCreateNamespaceStateNoLock() {
+    if (!namespaceStateOwner) {
+        namespaceStateOwner = std::make_unique<NamespaceState>();
+        namespaceState.store(namespaceStateOwner.get(), std::memory_order_release);
+    }
+    return *namespaceStateOwner;
+}
+
+void Transaction::recordNamespaceGroup(catalog::CatalogEntry* entry) {
+    std::lock_guard lock{changedCatalogsMutex};
+    getOrCreateNamespaceStateNoLock().groups.insert(entry);
+}
+
+void Transaction::incrementNamespaceGeneration() {
+    auto* state = namespaceState.load(std::memory_order_acquire);
+    if (!state) {
+        std::lock_guard lock{changedCatalogsMutex};
+        state = &getOrCreateNamespaceStateNoLock();
+    }
+    state->generation.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Transaction::recordCatalogChange(catalog::Catalog* catalog) {

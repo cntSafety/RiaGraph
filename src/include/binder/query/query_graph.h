@@ -126,6 +126,10 @@ public:
         return queryRelNameToPosMap.at(queryRelName);
     }
     void addQueryRel(std::shared_ptr<RelExpression> queryRel);
+    // Replace the query rel with the same unique name.
+    void replaceQueryRel(std::shared_ptr<RelExpression> queryRel) {
+        queryRels[getQueryRelIdx(queryRel->getUniqueName())] = std::move(queryRel);
+    }
 
     bool canProjectExpression(const std::shared_ptr<Expression>& expression) const;
 

@@ -9,7 +9,8 @@ using namespace riag::main;
 
 void riag_prepared_statement_bind_cpp_value(riag_prepared_statement* prepared_statement,
     const char* param_name, std::unique_ptr<Value> value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -71,7 +72,8 @@ char* riag_prepared_statement_get_error_message(riag_prepared_statement* prepare
 
 riag_state riag_prepared_statement_bind_bool(riag_prepared_statement* prepared_statement,
     const char* param_name, bool value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -88,7 +90,8 @@ riag_state riag_prepared_statement_bind_bool(riag_prepared_statement* prepared_s
 
 riag_state riag_prepared_statement_bind_int64(riag_prepared_statement* prepared_statement,
     const char* param_name, int64_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -105,7 +108,8 @@ riag_state riag_prepared_statement_bind_int64(riag_prepared_statement* prepared_
 
 riag_state riag_prepared_statement_bind_int32(riag_prepared_statement* prepared_statement,
     const char* param_name, int32_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -122,7 +126,8 @@ riag_state riag_prepared_statement_bind_int32(riag_prepared_statement* prepared_
 
 riag_state riag_prepared_statement_bind_int16(riag_prepared_statement* prepared_statement,
     const char* param_name, int16_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -139,7 +144,8 @@ riag_state riag_prepared_statement_bind_int16(riag_prepared_statement* prepared_
 
 riag_state riag_prepared_statement_bind_int8(riag_prepared_statement* prepared_statement,
     const char* param_name, int8_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -156,7 +162,8 @@ riag_state riag_prepared_statement_bind_int8(riag_prepared_statement* prepared_s
 
 riag_state riag_prepared_statement_bind_uint64(riag_prepared_statement* prepared_statement,
     const char* param_name, uint64_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -173,7 +180,8 @@ riag_state riag_prepared_statement_bind_uint64(riag_prepared_statement* prepared
 
 riag_state riag_prepared_statement_bind_uint32(riag_prepared_statement* prepared_statement,
     const char* param_name, uint32_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -190,7 +198,8 @@ riag_state riag_prepared_statement_bind_uint32(riag_prepared_statement* prepared
 
 riag_state riag_prepared_statement_bind_uint16(riag_prepared_statement* prepared_statement,
     const char* param_name, uint16_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -207,7 +216,8 @@ riag_state riag_prepared_statement_bind_uint16(riag_prepared_statement* prepared
 
 riag_state riag_prepared_statement_bind_uint8(riag_prepared_statement* prepared_statement,
     const char* param_name, uint8_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -224,7 +234,8 @@ riag_state riag_prepared_statement_bind_uint8(riag_prepared_statement* prepared_
 
 riag_state riag_prepared_statement_bind_double(riag_prepared_statement* prepared_statement,
     const char* param_name, double value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -241,7 +252,8 @@ riag_state riag_prepared_statement_bind_double(riag_prepared_statement* prepared
 
 riag_state riag_prepared_statement_bind_float(riag_prepared_statement* prepared_statement,
     const char* param_name, float value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -258,7 +270,8 @@ riag_state riag_prepared_statement_bind_float(riag_prepared_statement* prepared_
 
 riag_state riag_prepared_statement_bind_date(riag_prepared_statement* prepared_statement,
     const char* param_name, riag_date_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -275,7 +288,8 @@ riag_state riag_prepared_statement_bind_date(riag_prepared_statement* prepared_s
 
 riag_state riag_prepared_statement_bind_timestamp_ns(riag_prepared_statement* prepared_statement,
     const char* param_name, riag_timestamp_ns_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -292,7 +306,8 @@ riag_state riag_prepared_statement_bind_timestamp_ns(riag_prepared_statement* pr
 
 riag_state riag_prepared_statement_bind_timestamp_ms(riag_prepared_statement* prepared_statement,
     const char* param_name, riag_timestamp_ms_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -309,7 +324,8 @@ riag_state riag_prepared_statement_bind_timestamp_ms(riag_prepared_statement* pr
 
 riag_state riag_prepared_statement_bind_timestamp_sec(riag_prepared_statement* prepared_statement,
     const char* param_name, riag_timestamp_sec_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -326,7 +342,8 @@ riag_state riag_prepared_statement_bind_timestamp_sec(riag_prepared_statement* p
 
 riag_state riag_prepared_statement_bind_timestamp_tz(riag_prepared_statement* prepared_statement,
     const char* param_name, riag_timestamp_tz_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -343,7 +360,8 @@ riag_state riag_prepared_statement_bind_timestamp_tz(riag_prepared_statement* pr
 
 riag_state riag_prepared_statement_bind_timestamp(riag_prepared_statement* prepared_statement,
     const char* param_name, riag_timestamp_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -360,7 +378,8 @@ riag_state riag_prepared_statement_bind_timestamp(riag_prepared_statement* prepa
 
 riag_state riag_prepared_statement_bind_interval(riag_prepared_statement* prepared_statement,
     const char* param_name, riag_interval_t value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -378,7 +397,11 @@ riag_state riag_prepared_statement_bind_interval(riag_prepared_statement* prepar
 
 riag_state riag_prepared_statement_bind_string(riag_prepared_statement* prepared_statement,
     const char* param_name, const char* value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
+        return RiaGError;
+    }
+    if (value == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN
@@ -395,7 +418,11 @@ riag_state riag_prepared_statement_bind_string(riag_prepared_statement* prepared
 
 riag_state riag_prepared_statement_bind_value(riag_prepared_statement* prepared_statement,
     const char* param_name, riag_value* value) {
-    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr) {
+    if (prepared_statement == nullptr || prepared_statement->_prepared_statement == nullptr ||
+        param_name == nullptr) {
+        return RiaGError;
+    }
+    if (value == nullptr || value->_value == nullptr) {
         return RiaGError;
     }
     RIAG_C_API_GUARD_BEGIN

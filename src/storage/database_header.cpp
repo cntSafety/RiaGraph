@@ -4,6 +4,7 @@
 
 #include "common/exception/runtime.h"
 #include "common/file_system/file_info.h"
+#include "common/serializer/buffer_writer.h"
 #include "common/serializer/buffered_file.h"
 #include "common/serializer/deserializer.h"
 #include "common/serializer/serializer.h"
@@ -63,6 +64,7 @@ void DatabaseHeader::freeMetadataPageRange(PageManager& pageManager) const {
 }
 
 static constexpr uint8_t HEADER_FORMAT_VERSION_WITH_DATAFILE_NUM_PAGES = 2;
+static constexpr uint8_t HEADER_FORMAT_VERSION_WITH_CATALOG_VERSION = 3;
 
 static void writeMagicBytes(common::Serializer& serializer) {
     serializer.writeDebuggingInfo("magic");
@@ -86,8 +88,15 @@ void DatabaseHeader::serialize(common::Serializer& ser) const {
     ser.writeDebuggingInfo("databaseID");
     ser.serializeValue(databaseID.value);
     // No debugging info so old readers can stop here; new readers read 9 bytes (version + size).
-    ser.serializeValue(static_cast<uint8_t>(HEADER_FORMAT_VERSION_WITH_DATAFILE_NUM_PAGES));
+    const auto splitVersion =
+        storageVersion >= StorageVersionInfo::STORAGE_VERSION_50 || catalogStorageVersion != 0;
+    ser.serializeValue(
+        static_cast<uint8_t>(splitVersion ? HEADER_FORMAT_VERSION_WITH_CATALOG_VERSION :
+                                            HEADER_FORMAT_VERSION_WITH_DATAFILE_NUM_PAGES));
     ser.serializeValue(dataFileNumPages);
+    if (splitVersion) {
+        ser.serializeValue(getCatalogStorageVersion());
+    }
 }
 
 DatabaseHeader DatabaseHeader::deserialize(common::Deserializer& deSer) {
@@ -106,13 +115,44 @@ DatabaseHeader DatabaseHeader::deserialize(common::Deserializer& deSer) {
     deSer.deserializeValue(databaseID.value);
     common::page_idx_t dataFileNumPages = 0;
     uint8_t headerFormatVersion = 0;
+    storage_version_t catalogVersion = savedStorageVersion;
     // Old format (e.g. riag-0.14.1) ends here; reading 9 bytes would read beyond logical header.
     // Read one byte: only if it matches our format version do we read the following 8 bytes.
     deSer.deserializeValue(headerFormatVersion);
-    if (headerFormatVersion == HEADER_FORMAT_VERSION_WITH_DATAFILE_NUM_PAGES) {
+    if (headerFormatVersion == HEADER_FORMAT_VERSION_WITH_DATAFILE_NUM_PAGES ||
+        headerFormatVersion == HEADER_FORMAT_VERSION_WITH_CATALOG_VERSION) {
         deSer.deserializeValue(dataFileNumPages);
     }
-    return {catalogPageRange, metaPageRange, dataFileNumPages, databaseID, savedStorageVersion};
+    if (headerFormatVersion == HEADER_FORMAT_VERSION_WITH_CATALOG_VERSION) {
+        storage_version_t value = 0;
+        deSer.deserializeValue(value);
+        if (savedStorageVersion >= StorageVersionInfo::STORAGE_VERSION_50) {
+            catalogVersion = value;
+        }
+    }
+    if (!StorageVersionInfo::canReadStorageVersion(catalogVersion) ||
+        catalogVersion > savedStorageVersion) {
+        throw common::RuntimeException("Unsupported catalog payload version in database header.");
+    }
+    deSer.setStorageVersion(catalogVersion);
+    return {catalogPageRange, metaPageRange, dataFileNumPages, databaseID, savedStorageVersion,
+        headerFormatVersion == HEADER_FORMAT_VERSION_WITH_CATALOG_VERSION ? catalogVersion : 0};
+}
+
+uint64_t DatabaseHeader::storageVersionOffset() {
+    auto buffer = std::make_shared<common::BufferWriter>();
+    common::Serializer serializer(buffer);
+    writeMagicBytes(serializer);
+    serializer.writeDebuggingInfo("storage_version");
+    return buffer->getSize();
+}
+
+uint64_t DatabaseHeader::extensionOffset() {
+    auto buffer = std::make_shared<common::BufferWriter>();
+    common::Serializer serializer(buffer);
+    DatabaseHeader header;
+    header.serialize(serializer);
+    return buffer->getSize() - sizeof(uint8_t) - sizeof(common::page_idx_t);
 }
 
 DatabaseHeader DatabaseHeader::createInitialHeader(common::RandomEngine* randomEngine) {

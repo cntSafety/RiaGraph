@@ -257,7 +257,19 @@ Copy exception: Found duplicated primary key value 0, which violates the uniquen
 ---- ok
 -STATEMENT CREATE (p:person {ID: 100000});
 ---- ok
+# A COPY after a CREATE into the same table in one transaction is refused, and the failed COPY
+# rolls the transaction back (copy_transaction_index.test). COPY first, then CREATE, is supported.
 -STATEMENT COPY person FROM "${RIAG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv";
+---- error
+Copy exception: Cannot COPY into node table person after rows were inserted into it by CREATE or MERGE in the same transaction. Commit the transaction before the COPY.
+-STATEMENT MATCH (p:person) RETURN COUNT(*);
+---- 1
+0
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY person FROM "${RIAG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv";
+---- ok
+-STATEMENT CREATE (p:person {ID: 100000});
 ---- ok
 -STATEMENT MATCH (p:person) RETURN COUNT(*);
 ---- 1
@@ -280,7 +292,19 @@ Copy exception: Found duplicated primary key value 0, which violates the uniquen
 ---- ok
 -STATEMENT CREATE (p:person {ID: 100000});
 ---- ok
+# A COPY after a CREATE into the same table in one transaction is refused, and the failed COPY
+# rolls the transaction back (copy_transaction_index.test). COPY first, then CREATE, is supported.
 -STATEMENT COPY person FROM "${RIAG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv";
+---- error
+Copy exception: Cannot COPY into node table person after rows were inserted into it by CREATE or MERGE in the same transaction. Commit the transaction before the COPY.
+-STATEMENT MATCH (p:person) RETURN COUNT(*);
+---- 1
+0
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY person FROM "${RIAG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv";
+---- ok
+-STATEMENT CREATE (p:person {ID: 100000});
 ---- ok
 -STATEMENT MATCH (p:person) RETURN COUNT(*);
 ---- 1
@@ -298,7 +322,19 @@ Copy exception: Found duplicated primary key value 0, which violates the uniquen
 ---- ok
 -STATEMENT CREATE (p:person {ID: 100000});
 ---- ok
+# A COPY after a CREATE into the same table in one transaction is refused, and the failed COPY
+# rolls the transaction back (copy_transaction_index.test). COPY first, then CREATE, is supported.
 -STATEMENT COPY person FROM "${RIAG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv";
+---- error
+Copy exception: Cannot COPY into node table person after rows were inserted into it by CREATE or MERGE in the same transaction. Commit the transaction before the COPY.
+-STATEMENT MATCH (p:person) RETURN COUNT(*);
+---- 1
+0
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY person FROM "${RIAG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv";
+---- ok
+-STATEMENT CREATE (p:person {ID: 100000});
 ---- ok
 -STATEMENT MATCH (p:person) RETURN COUNT(*);
 ---- 1
@@ -330,7 +366,19 @@ Copy exception: Found duplicated primary key value 0, which violates the uniquen
 ---- ok
 -STATEMENT CREATE (p:person {ID: 100000});
 ---- ok
+# A COPY after a CREATE into the same table in one transaction is refused, and the failed COPY
+# rolls the transaction back (copy_transaction_index.test). COPY first, then CREATE, is supported.
 -STATEMENT COPY person FROM "${RIAG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv";
+---- error
+Copy exception: Cannot COPY into node table person after rows were inserted into it by CREATE or MERGE in the same transaction. Commit the transaction before the COPY.
+-STATEMENT MATCH (p:person) RETURN COUNT(*);
+---- 1
+0
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT COPY person FROM "${RIAG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv";
+---- ok
+-STATEMENT CREATE (p:person {ID: 100000});
 ---- ok
 -STATEMENT MATCH (p:person) RETURN COUNT(*);
 ---- 1

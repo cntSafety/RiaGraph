@@ -14,6 +14,12 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapCrossProduct(
     auto& logicalCrossProduct = logicalOperator->constCast<LogicalCrossProduct>();
     auto outSchema = logicalCrossProduct.getSchema();
     auto buildChild = logicalCrossProduct.getChild(1);
+    // A build side that scans the probe side's materialized rows back (an aggregating ASSERT)
+    // needs the probe side's accumulate mapped first, see PlanMapper::mapExpressionsScan.
+    std::unique_ptr<PhysicalOperator> probeSidePrevOperator;
+    if (logicalCrossProduct.getSIPInfo().dependency == SIPDependency::BUILD_DEPENDS_ON_PROBE) {
+        probeSidePrevOperator = mapOperator(logicalCrossProduct.getChild(0).get());
+    }
     // map build side
     auto buildSchema = buildChild->getSchema();
     auto buildSidePrevOperator = mapOperator(buildChild.get());
@@ -21,7 +27,9 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapCrossProduct(
     auto resultCollector = createResultCollector(logicalCrossProduct.getAccumulateType(),
         expressions, buildSchema, std::move(buildSidePrevOperator));
     // map probe side
-    auto probeSidePrevOperator = mapOperator(logicalCrossProduct.getChild(0).get());
+    if (probeSidePrevOperator == nullptr) {
+        probeSidePrevOperator = mapOperator(logicalCrossProduct.getChild(0).get());
+    }
     std::vector<DataPos> outVecPos;
     std::vector<uint32_t> colIndicesToScan;
     if (logicalCrossProduct.hasMark()) {

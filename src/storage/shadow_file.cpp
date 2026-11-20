@@ -409,17 +409,19 @@ void ShadowFile::clear(BufferManager& bm, bool syncParentDirectory) {
     DASSERT(shadowingFH);
     // Concurrent readers may be reading shadow pages (see readShadowVersionIfExists).
     std::unique_lock lck{mtx};
-    // Evict pages, truncate to zero pages (which also truncates the on-disk file), then unlink
-    // the path and drop the stale fd so no leftover .shadow file exists at rest (a present
-    // .shadow is treated as "checkpoint in progress" by recovery/startup probes). The
-    // retained FileHandle keeps its VM frame groups (see reset()); the file is re-created
-    // lazily by getOrCreateShadowingFH on the next checkpoint, which also re-reserves the
-    // header page.
+    // Evict pages, forget all pages, then drop the stale fd and unlink the path so no leftover
+    // .shadow file exists at rest (a present .shadow is treated as "checkpoint in progress" by
+    // recovery/startup probes). The file is not truncated before it is unlinked: after a
+    // checkpoint that committed, a crash between the two would leave an empty shadow file behind
+    // a durable CHECKPOINT record, which recovery cannot tell from a lost shadow file, while a
+    // complete one is harmless (its pages are applied again). The retained FileHandle keeps its
+    // VM frame groups (see reset()); the file is re-created lazily by getOrCreateShadowingFH on
+    // the next checkpoint, which also re-reserves the header page.
     bm.removeFilePagesFromFrames(*shadowingFH);
     shadowPagesMap.clear();
     shadowPageRecords.clear();
     hasShadowPages.store(false, std::memory_order_release);
-    shadowingFH->resetToZeroPagesAndPageCapacity();
+    shadowingFH->removePageIdxAndTruncateIfNecessary(0 /* pageIdx */);
     shadowingFH->resetFileInfo();
     vfs->removeFileIfExists(shadowFilePath);
     if (syncParentDirectory) {
@@ -444,7 +446,7 @@ void ShadowFile::reset() {
     shadowPagesMap.clear();
     shadowPageRecords.clear();
     hasShadowPages.store(false, std::memory_order_release);
-    // If clear() already ran (the normal checkpoint flow calls both), the file was truncated,
+    // If clear() already ran (the normal checkpoint flow calls both), the file was
     // unlinked and the fd dropped; just make sure the in-memory maps are empty.
     if (shadowingFH->getFileInfo() != nullptr) {
         bm.removeFilePagesFromFrames(*shadowingFH);

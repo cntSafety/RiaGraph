@@ -12,6 +12,7 @@ public:
         : BoundUpdatingClause{common::ClauseType::INSERT}, infos{std::move(infos)} {}
 
     const std::vector<BoundInsertInfo>& getInfos() const { return infos; }
+    expression_vector namespaceAssertions;
 
     bool hasNodeInfo() const {
         return hasInfo(

@@ -257,18 +257,21 @@ struct IntervalToStringCast {
                 // space if there is already something in the buffer
                 buffer[length++] = ' ';
             }
-            int64_t micros = interval.micros;
-            if (micros < 0) {
+            // Work on the magnitude in unsigned arithmetic: negating INT64_MIN as int64_t leaves it
+            // negative, so hour/min/sec stayed negative and indexed the digit table out of bounds.
+            uint64_t magnitude = static_cast<uint64_t>(interval.micros);
+            if (interval.micros < 0) {
                 // negative time: append negative sign
                 buffer[length++] = '-';
-                micros = -micros;
+                magnitude = 0 - magnitude;
             }
-            int64_t hour = micros / Interval::MICROS_PER_HOUR;
-            micros -= hour * Interval::MICROS_PER_HOUR;
-            int64_t min = micros / Interval::MICROS_PER_MINUTE;
-            micros -= min * Interval::MICROS_PER_MINUTE;
-            int64_t sec = micros / Interval::MICROS_PER_SEC;
-            micros -= sec * Interval::MICROS_PER_SEC;
+            int64_t hour = static_cast<int64_t>(magnitude / Interval::MICROS_PER_HOUR);
+            magnitude -= static_cast<uint64_t>(hour) * Interval::MICROS_PER_HOUR;
+            int64_t min = static_cast<int64_t>(magnitude / Interval::MICROS_PER_MINUTE);
+            magnitude -= static_cast<uint64_t>(min) * Interval::MICROS_PER_MINUTE;
+            int64_t sec = static_cast<int64_t>(magnitude / Interval::MICROS_PER_SEC);
+            magnitude -= static_cast<uint64_t>(sec) * Interval::MICROS_PER_SEC;
+            int64_t micros = static_cast<int64_t>(magnitude);
 
             if (hour < 10) {
                 buffer[length++] = '0';

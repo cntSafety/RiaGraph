@@ -54,3 +54,39 @@ True
 -STATEMENT WITH gen_random_uuid() AS u RETURN u = u
 ---- 1
 True
+
+-CASE SetSeedRange
+-STATEMENT RETURN setseed(0)
+---- ok
+-STATEMENT RETURN setseed(0.5)
+---- ok
+-STATEMENT RETURN setseed(0.9999999999999999)
+---- ok
+-STATEMENT RETURN setseed(1)
+---- error
+Runtime exception: Invalid seed 1: setseed expects a value in the range [0, 1).
+-STATEMENT RETURN setseed(2.2)
+---- error
+Runtime exception: Invalid seed 2.2: setseed expects a value in the range [0, 1).
+-STATEMENT RETURN setseed(-1)
+---- error
+Runtime exception: Invalid seed -1: setseed expects a value in the range [0, 1).
+-STATEMENT RETURN setseed(1e30)
+---- error
+Runtime exception: Invalid seed 1e+30: setseed expects a value in the range [0, 1).
+
+-CASE SetSeedNull
+-LOG NullSeedIsSkippedAndDoesNotReseed
+-STATEMENT RETURN setseed(0.2)
+---- ok
+-STATEMENT RETURN setseed(NULL)
+---- 1
+
+-STATEMENT RETURN setseed(CAST(NULL AS DOUBLE))
+---- 1
+
+-STATEMENT RETURN random()
+---- 1
+0.910543
+-STATEMENT UNWIND [CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE)] AS s RETURN setseed(s)
+---- 2

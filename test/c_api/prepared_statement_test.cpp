@@ -524,3 +524,79 @@ TEST_F(CApiPreparedStatementTest, BindBlobValue) {
     riag_query_result_destroy(&result);
     riag_prepared_statement_destroy(&preparedStatement);
 }
+
+// The JNI bind path hands riag_prepared_statement_bind_value the result of riag_value_clone, which
+// is nullptr when the Java Value no longer owns a native value. Binding must fail with RiaGError
+// rather than dereference it.
+TEST_F(CApiPreparedStatementTest, BindNullArgumentsAreRejected) {
+    riag_prepared_statement preparedStatement;
+    auto connection = getConnection();
+    ASSERT_EQ(riag_connection_prepare(connection, "RETURN $1", &preparedStatement), RiaGSuccess);
+    ASSERT_TRUE(riag_prepared_statement_is_success(&preparedStatement));
+
+    // A null value, and a value handle that holds no native value (what riag_value_clone(nullptr)
+    // and a closed Java Value produce).
+    ASSERT_EQ(riag_prepared_statement_bind_value(&preparedStatement, "1", nullptr), RiaGError);
+    riag_value emptyValue;
+    emptyValue._value = nullptr;
+    emptyValue._is_owned_by_cpp = false;
+    ASSERT_EQ(riag_prepared_statement_bind_value(&preparedStatement, "1", &emptyValue), RiaGError);
+    ASSERT_EQ(riag_value_clone(&emptyValue), nullptr);
+
+    // A null string and a null parameter name.
+    ASSERT_EQ(riag_prepared_statement_bind_string(&preparedStatement, "1", nullptr), RiaGError);
+    ASSERT_EQ(riag_prepared_statement_bind_string(&preparedStatement, nullptr, "x"), RiaGError);
+    ASSERT_EQ(riag_prepared_statement_bind_int64(&preparedStatement, nullptr, 1), RiaGError);
+    auto int64Value = riag_value_create_int64(1);
+    ASSERT_EQ(riag_prepared_statement_bind_value(&preparedStatement, nullptr, int64Value),
+        RiaGError);
+    riag_value_destroy(int64Value);
+
+    // Rejected binds leave the statement usable.
+    ASSERT_EQ(riag_prepared_statement_bind_int64(&preparedStatement, "1", 7), RiaGSuccess);
+    riag_query_result result;
+    ASSERT_EQ(riag_connection_execute(connection, &preparedStatement, &result), RiaGSuccess);
+    ASSERT_TRUE(riag_query_result_is_success(&result));
+    riag_query_result_destroy(&result);
+    riag_prepared_statement_destroy(&preparedStatement);
+}
+
+// A node Value fetched from an earlier query is a supported parameter: the statement binds and runs
+// instead of crashing the caller, both for the Value borrowed from the tuple and for a clone of it
+// (which is what the JNI bind path passes).
+TEST_F(CApiPreparedStatementTest, BindNodeValue) {
+    auto connection = getConnection();
+    riag_query_result nodeResult;
+    ASSERT_EQ(
+        riag_connection_query(connection, "MATCH (a:person) WHERE a.ID = 0 RETURN a", &nodeResult),
+        RiaGSuccess);
+    riag_flat_tuple tuple;
+    ASSERT_EQ(riag_query_result_get_next(&nodeResult, &tuple), RiaGSuccess);
+    riag_value nodeValue;
+    ASSERT_EQ(riag_flat_tuple_get_value(&tuple, 0, &nodeValue), RiaGSuccess);
+    auto clonedNodeValue = riag_value_clone(&nodeValue);
+    ASSERT_NE(clonedNodeValue, nullptr);
+
+    for (auto* value : {&nodeValue, clonedNodeValue}) {
+        riag_prepared_statement preparedStatement;
+        ASSERT_EQ(riag_connection_prepare(connection,
+                      "MATCH (a:person) WHERE a = $1 RETURN a.fName", &preparedStatement),
+            RiaGSuccess);
+        ASSERT_TRUE(riag_prepared_statement_is_success(&preparedStatement));
+        ASSERT_EQ(riag_prepared_statement_bind_value(&preparedStatement, "1", value), RiaGSuccess);
+        riag_query_result result;
+        ASSERT_EQ(riag_connection_execute(connection, &preparedStatement, &result), RiaGSuccess);
+        ASSERT_TRUE(riag_query_result_is_success(&result));
+        ASSERT_EQ(riag_query_result_get_num_tuples(&result), 1);
+        riag_flat_tuple resultTuple;
+        ASSERT_EQ(riag_query_result_get_next(&result, &resultTuple), RiaGSuccess);
+        riag_value fName;
+        ASSERT_EQ(riag_flat_tuple_get_value(&resultTuple, 0, &fName), RiaGSuccess);
+        ASSERT_EQ(static_cast<riag::common::Value*>(fName._value)->getValue<std::string>(),
+            "Alice");
+        riag_query_result_destroy(&result);
+        riag_prepared_statement_destroy(&preparedStatement);
+    }
+    riag_value_destroy(clonedNodeValue);
+    riag_query_result_destroy(&nodeResult);
+}

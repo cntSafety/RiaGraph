@@ -15,8 +15,11 @@ bool SetNodeProperty::getNextTuplesInternal(ExecutionContext* context) {
     if (!children[0]->getNextTuple(context)) {
         return false;
     }
-    for (auto& executor : executors) {
-        executor->set(context);
+    for (auto i = 0u; i < executors.size(); ++i) {
+        for (const auto j : columnsToRefresh[i]) {
+            executors[j]->refreshColumn(context);
+        }
+        executors[i]->set(context);
     }
     return true;
 }
@@ -31,8 +34,11 @@ bool SetRelProperty::getNextTuplesInternal(ExecutionContext* context) {
     if (!children[0]->getNextTuple(context)) {
         return false;
     }
-    for (auto& executor : executors) {
-        executor->set(context);
+    for (auto i = 0u; i < executors.size(); ++i) {
+        for (const auto j : columnsToRefresh[i]) {
+            executors[j]->refreshColumn(context);
+        }
+        executors[i]->set(context);
     }
     return true;
 }

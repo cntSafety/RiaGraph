@@ -321,6 +321,10 @@ private:
     std::mutex relOffsetMtx;
     common::offset_t nextRelOffset;
     std::vector<std::unique_ptr<RelTableData>> directedRelData;
+    catalog::Catalog* namespaceOwner;
+
+public:
+    catalog::Catalog* getOwningCatalog() const { return namespaceOwner; }
 };
 
 } // namespace storage

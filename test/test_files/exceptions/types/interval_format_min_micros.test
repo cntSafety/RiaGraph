@@ -1,0 +1,24 @@
+-DATASET CSV empty
+
+--
+
+# An interval whose microseconds are INT64_MIN used to crash IntervalToStringCast::Format.
+
+-CASE IntervalFormatting
+
+-LOG MinimumMicroseconds
+-STATEMENT RETURN cast(to_microseconds(-9223372036854775807 - 1) AS STRING);
+---- 1
+-2562047788:00:54.775808
+-STATEMENT RETURN cast(to_microseconds(-9223372036854775807) - to_microseconds(1) AS STRING);
+---- 1
+-2562047788:00:54.775808
+-STATEMENT RETURN to_microseconds(-9223372036854775807 - 1) < to_microseconds(0);
+---- 1
+True
+
+-LOG NegativeAndMaximum
+-STATEMENT RETURN cast(to_microseconds(9223372036854775807) AS STRING), cast(to_microseconds(-9223372036854775807) AS STRING), cast(to_hours(-1) AS STRING);
+---- 1
+2562047788:00:54.775807|-2562047788:00:54.775807|-01:00:00
+

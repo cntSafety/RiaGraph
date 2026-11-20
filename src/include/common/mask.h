@@ -5,6 +5,11 @@
 namespace riag {
 namespace common {
 
+struct MaskRange {
+    offset_vec_t offsets;
+    bool allSelected = false;
+};
+
 // Note that this class is NOT thread-safe.
 class SemiMask {
 public:
@@ -18,11 +23,15 @@ public:
     virtual bool isMasked(offset_t startNodeOffset) = 0;
 
     // include&exclude
-    virtual offset_vec_t range(uint32_t start, uint32_t end) = 0;
+    virtual offset_vec_t range(offset_t start, offset_t end) = 0;
 
     virtual uint64_t getNumMaskedNodes() const = 0;
 
     virtual offset_vec_t collectMaskedNodes(uint64_t size) const = 0;
+
+    // Preserve a dense input selection when a range is entirely covered, without
+    // allocating and enumerating one offset for every selected row.
+    virtual MaskRange getRange(offset_t start, offset_t end) { return {range(start, end), false}; }
 
     offset_t getMaxOffset() const { return maxOffset; }
 

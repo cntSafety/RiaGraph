@@ -88,14 +88,17 @@ std::unique_ptr<ParsedExpression> Transformer::transformNotExpression(
 
 std::unique_ptr<ParsedExpression> Transformer::transformComparisonExpression(
     CypherParser::OC_ComparisonExpressionContext& ctx) {
-    if (1 == ctx.iC_BitwiseOrOperatorExpression().size()) {
-        return transformBitwiseOrOperatorExpression(*ctx.iC_BitwiseOrOperatorExpression(0));
+    if (1 == ctx.oC_StringListNullOperatorExpression().size()) {
+        return transformStringListNullOperatorExpression(
+            *ctx.oC_StringListNullOperatorExpression(0));
     }
     // Antlr parser throws error for conjunctive comparison.
     // Transformer should only handle the case of single comparison operator.
     DASSERT(ctx.iC_ComparisonOperator().size() == 1);
-    auto left = transformBitwiseOrOperatorExpression(*ctx.iC_BitwiseOrOperatorExpression(0));
-    auto right = transformBitwiseOrOperatorExpression(*ctx.iC_BitwiseOrOperatorExpression(1));
+    auto left =
+        transformStringListNullOperatorExpression(*ctx.oC_StringListNullOperatorExpression(0));
+    auto right =
+        transformStringListNullOperatorExpression(*ctx.oC_StringListNullOperatorExpression(1));
     auto comparisonOperator = ctx.iC_ComparisonOperator()[0]->getText();
     if (comparisonOperator == "=") {
         return std::make_unique<ParsedExpression>(ExpressionType::EQUALS, std::move(left),
@@ -215,8 +218,8 @@ std::unique_ptr<ParsedExpression> Transformer::transformMultiplyDivideModuloExpr
 std::unique_ptr<ParsedExpression> Transformer::transformPowerOfExpression(
     CypherParser::OC_PowerOfExpressionContext& ctx) {
     std::unique_ptr<ParsedExpression> expression;
-    for (auto& stringListNullOperatorExpression : ctx.oC_StringListNullOperatorExpression()) {
-        auto next = transformStringListNullOperatorExpression(*stringListNullOperatorExpression);
+    for (auto& unaryExpression : ctx.oC_UnaryAddSubtractOrFactorialExpression()) {
+        auto next = transformUnaryAddSubtractOrFactorialExpression(*unaryExpression);
         if (!expression) {
             expression = std::move(next);
         } else {
@@ -230,8 +233,12 @@ std::unique_ptr<ParsedExpression> Transformer::transformPowerOfExpression(
 
 std::unique_ptr<ParsedExpression> Transformer::transformUnaryAddSubtractOrFactorialExpression(
     CypherParser::OC_UnaryAddSubtractOrFactorialExpressionContext& ctx) {
-    auto atomCtx = ctx.oC_PropertyOrLabelsExpression()->oC_Atom();
-    bool isNumberLiteral = atomCtx->oC_Literal() && atomCtx->oC_Literal()->oC_NumberLiteral();
+    auto& propertyOrLabelsCtx = *ctx.oC_PropertyOrLabelsExpression();
+    auto atomCtx = propertyOrLabelsCtx.oC_Atom();
+    // Only a bare number literal takes the signed-literal path below: a property lookup or a
+    // subscript after it (e.g. -123[1]) binds tighter than the minus and must not be dropped.
+    bool isNumberLiteral = atomCtx->oC_Literal() && atomCtx->oC_Literal()->oC_NumberLiteral() &&
+                           propertyOrLabelsCtx.children.size() == 1;
     std::unique_ptr<ParsedExpression> result;
     if (isNumberLiteral) {
         // Try parse -number as a signed literal. This is to avoid
@@ -240,7 +247,7 @@ std::unique_ptr<ParsedExpression> Transformer::transformUnaryAddSubtractOrFactor
         result = transformNumberLiteral(*atomCtx->oC_Literal()->oC_NumberLiteral(),
             ctx.MINUS().size() % 2 == 1);
     } else {
-        result = transformPropertyOrLabelsExpression(*ctx.oC_PropertyOrLabelsExpression());
+        result = transformPropertyOrLabelsExpression(propertyOrLabelsCtx);
     }
     if (ctx.FACTORIAL()) { // Factorial has a higher precedence
         auto raw = result->toString() + "!";
@@ -259,33 +266,30 @@ std::unique_ptr<ParsedExpression> Transformer::transformUnaryAddSubtractOrFactor
 
 std::unique_ptr<ParsedExpression> Transformer::transformStringListNullOperatorExpression(
     CypherParser::OC_StringListNullOperatorExpressionContext& ctx) {
-    auto unaryAddSubtractOrFactorialExpression = transformUnaryAddSubtractOrFactorialExpression(
-        *ctx.oC_UnaryAddSubtractOrFactorialExpression());
-    if (ctx.oC_NullOperatorExpression()) {
-        return transformNullOperatorExpression(*ctx.oC_NullOperatorExpression(),
-            std::move(unaryAddSubtractOrFactorialExpression));
-    }
-    if (!ctx.oC_ListOperatorExpression().empty()) {
-        auto result = transformListOperatorExpression(*ctx.oC_ListOperatorExpression(0),
-            std::move(unaryAddSubtractOrFactorialExpression));
-        for (auto i = 1u; i < ctx.oC_ListOperatorExpression().size(); ++i) {
-            result = transformListOperatorExpression(*ctx.oC_ListOperatorExpression(i),
-                std::move(result));
+    auto result = transformBitwiseOrOperatorExpression(*ctx.iC_BitwiseOrOperatorExpression());
+    // The string, list and null predicates bind looser than arithmetic, so their operands are
+    // whole arithmetic expressions (1 + 2 IN [3] is (1 + 2) IN [3]). Apply them left to right as
+    // written, e.g. x IN l IS NULL is (x IN l) IS NULL.
+    for (auto child : ctx.children) {
+        if (auto stringCtx =
+                dynamic_cast<CypherParser::OC_StringOperatorExpressionContext*>(child)) {
+            result = transformStringOperatorExpression(*stringCtx, std::move(result));
+        } else if (auto listCtx =
+                       dynamic_cast<CypherParser::OC_ListPredicateExpressionContext*>(child)) {
+            result = transformListPredicateExpression(*listCtx, std::move(result));
+        } else if (auto nullCtx =
+                       dynamic_cast<CypherParser::OC_NullOperatorExpressionContext*>(child)) {
+            result = transformNullOperatorExpression(*nullCtx, std::move(result));
         }
-        return result;
     }
-    if (ctx.oC_StringOperatorExpression()) {
-        return transformStringOperatorExpression(*ctx.oC_StringOperatorExpression(),
-            std::move(unaryAddSubtractOrFactorialExpression));
-    }
-    return unaryAddSubtractOrFactorialExpression;
+    return result;
 }
 
 std::unique_ptr<ParsedExpression> Transformer::transformStringOperatorExpression(
     CypherParser::OC_StringOperatorExpressionContext& ctx,
     std::unique_ptr<ParsedExpression> propertyExpression) {
     auto rawExpression = propertyExpression->getRawName() + " " + ctx.getText();
-    auto right = transformPropertyOrLabelsExpression(*ctx.oC_PropertyOrLabelsExpression());
+    auto right = transformBitwiseOrOperatorExpression(*ctx.iC_BitwiseOrOperatorExpression());
     if (ctx.STARTS()) {
         return std::make_unique<ParsedFunctionExpression>(StartsWithFunction::name,
             std::move(propertyExpression), std::move(right), rawExpression);
@@ -302,17 +306,21 @@ std::unique_ptr<ParsedExpression> Transformer::transformStringOperatorExpression
     }
 }
 
+std::unique_ptr<ParsedExpression> Transformer::transformListPredicateExpression(
+    CypherParser::OC_ListPredicateExpressionContext& ctx, std::unique_ptr<ParsedExpression> child) {
+    // x IN y
+    auto raw = child->getRawName() + ctx.getText();
+    auto listContains =
+        std::make_unique<ParsedFunctionExpression>(ListContainsFunction::name, std::move(raw));
+    auto right = transformBitwiseOrOperatorExpression(*ctx.iC_BitwiseOrOperatorExpression());
+    listContains->addChild(std::move(right));
+    listContains->addChild(std::move(child));
+    return listContains;
+}
+
 std::unique_ptr<ParsedExpression> Transformer::transformListOperatorExpression(
     CypherParser::OC_ListOperatorExpressionContext& ctx, std::unique_ptr<ParsedExpression> child) {
     auto raw = child->getRawName() + ctx.getText();
-    if (ctx.IN()) { // x IN y
-        auto listContains =
-            std::make_unique<ParsedFunctionExpression>(ListContainsFunction::name, std::move(raw));
-        auto right = transformPropertyOrLabelsExpression(*ctx.oC_PropertyOrLabelsExpression());
-        listContains->addChild(std::move(right));
-        listContains->addChild(std::move(child));
-        return listContains;
-    }
     if (ctx.COLON() || ctx.DOTDOT()) { // x[:]/x[..]
         auto listSlice =
             std::make_unique<ParsedFunctionExpression>(ListSliceFunction::name, std::move(raw));
@@ -361,17 +369,19 @@ std::unique_ptr<ParsedExpression> Transformer::transformNullOperatorExpression(
 
 std::unique_ptr<ParsedExpression> Transformer::transformPropertyOrLabelsExpression(
     CypherParser::OC_PropertyOrLabelsExpressionContext& ctx) {
-    auto atom = transformAtom(*ctx.oC_Atom());
-    if (!ctx.oC_PropertyLookup().empty()) {
-        auto lookUpCtx = ctx.oC_PropertyLookup(0);
-        auto result = createPropertyExpression(*lookUpCtx, std::move(atom));
-        for (auto i = 1u; i < ctx.oC_PropertyLookup().size(); ++i) {
-            lookUpCtx = ctx.oC_PropertyLookup(i);
+    auto result = transformAtom(*ctx.oC_Atom());
+    // Property lookups and list subscripts/slices are postfix operators of the same precedence,
+    // tighter than IN and the string/null predicates. Apply them left to right as written, e.g.
+    // nodes(p)[1].name.
+    for (auto child : ctx.children) {
+        if (auto lookUpCtx = dynamic_cast<CypherParser::OC_PropertyLookupContext*>(child)) {
             result = createPropertyExpression(*lookUpCtx, std::move(result));
+        } else if (auto listOperatorCtx =
+                       dynamic_cast<CypherParser::OC_ListOperatorExpressionContext*>(child)) {
+            result = transformListOperatorExpression(*listOperatorCtx, std::move(result));
         }
-        return result;
     }
-    return atom;
+    return result;
 }
 
 std::unique_ptr<ParsedExpression> Transformer::transformAtom(CypherParser::OC_AtomContext& ctx) {

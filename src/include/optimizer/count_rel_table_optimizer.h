@@ -60,7 +60,7 @@ private:
     bool isSimpleCount(planner::LogicalOperator* op) const;
 
     // Check if the aggregate is SUM(non-NULL literal) without DISTINCT or grouping keys.
-    // Only safe for rewrites whose output can carry SUM's type and NULL-on-empty semantics
+    // Only safe for rewrites whose output can carry SUM's type and constant multiplier
     // (i.e. COUNT_REL_TABLE); must not be treated as a plain row count.
     bool isConstantSum(planner::LogicalOperator* op) const;
     static bool isLiteralOne(const binder::Expression& expression);

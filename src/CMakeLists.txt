@@ -43,6 +43,12 @@ endif()
 
 if(TARGET riag_shared)
         target_link_libraries(riag_shared PUBLIC riag_link_deps)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+                # Keep calls between engine functions direct: namespace symbols must not
+                # change PLT dispatch/cache behavior in the legacy query loops. Bind only
+                # functions, preserving interposable data and RTTI for extension consumers.
+                target_link_options(riag_shared PRIVATE "LINKER:-Bsymbolic-functions")
+        endif()
 endif()
 if(TARGET riag)
         target_link_libraries(riag PUBLIC riag_link_deps)

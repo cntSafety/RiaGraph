@@ -4,6 +4,8 @@
 #include <unordered_map>
 
 #include "binder/expression/expression_util.h"
+#include "catalog/catalog.h"
+#include "catalog/namespace_catalog.h"
 #include "common/assert.h"
 #include "common/exception/message.h"
 #include "common/type_utils.h"
@@ -185,7 +187,7 @@ struct OffsetVectorManager {
     offset_t insertOffset;
 };
 
-template<bool hasNoNullsGuarantee>
+template<bool hasNoNullsGuarantee, bool namespaceAware>
 void fillOffsetArraysFromVectorInternal(transaction::Transaction* transaction,
     const IndexLookupInfo& info, ValueVector* keyVector, ValueVector* resultVector,
     const std::vector<ValueVector*>& warningDataVectors, BatchInsertErrorHandler* errorHandler,
@@ -194,6 +196,15 @@ void fillOffsetArraysFromVectorInternal(transaction::Transaction* transaction,
         keyVector->dataType.getPhysicalType(),
         [&]<IndexHashable T>(T) {
             OffsetVectorManager resultManager{resultVector, errorHandler};
+            auto namespaces = [&]() {
+                if constexpr (namespaceAware) {
+                    return catalog::NamespaceReadState(
+                        info.nodeTable->getOwningCatalog()->getNamespaces(), transaction,
+                        info.nodeTable->getTableID());
+                } else {
+                    return false;
+                }
+            }();
             for (sel_t i = 0u; i < numKeys; i++) {
                 auto pos = selVector ? selVector[i] : i;
                 if constexpr (!hasNoNullsGuarantee) {
@@ -206,7 +217,17 @@ void fillOffsetArraysFromVectorInternal(transaction::Transaction* transaction,
                                  info.noIndexLookupCache->lookup(keyVector, pos, lookupOffset) :
                                  false;
                 if (!found) {
-                    found = info.nodeTable->lookupPK(transaction, keyVector, pos, lookupOffset);
+                    if constexpr (namespaceAware) {
+                        found = info.nodeTable->lookupPKInNamespace(transaction, keyVector, pos,
+                            info.namespaceTarget, lookupOffset);
+                    } else {
+                        found = info.nodeTable->lookupPK(transaction, keyVector, pos, lookupOffset);
+                    }
+                }
+                if constexpr (namespaceAware) {
+                    if (found && namespaces.get(lookupOffset) != info.namespaceTarget) {
+                        found = false;
+                    }
                 }
                 if (!found) {
                     errorHandler->handleError(ExceptionMessage::nonExistentPKException(
@@ -220,7 +241,7 @@ void fillOffsetArraysFromVectorInternal(transaction::Transaction* transaction,
         [&](auto) { UNREACHABLE_CODE; });
 }
 
-template<bool hasNoNullsGuarantee>
+template<bool hasNoNullsGuarantee, bool namespaceAware>
 void fillOffsetArraysFromVector(transaction::Transaction* transaction, const IndexLookupInfo& info,
     ValueVector* keyVector, ValueVector* resultVector,
     const std::vector<ValueVector*>& warningDataVectors, BatchInsertErrorHandler* errorHandler) {
@@ -229,16 +250,17 @@ void fillOffsetArraysFromVector(transaction::Transaction* transaction, const Ind
     auto numKeys = selVector.getSelSize();
     if (selVector.isUnfiltered()) {
         // Fast path: selection vector is unfiltered - pass a null selection vector
-        fillOffsetArraysFromVectorInternal<hasNoNullsGuarantee>(transaction, info, keyVector,
-            resultVector, warningDataVectors, errorHandler, nullptr /* selVector */, numKeys);
+        fillOffsetArraysFromVectorInternal<hasNoNullsGuarantee, namespaceAware>(transaction, info,
+            keyVector, resultVector, warningDataVectors, errorHandler, nullptr /* selVector */,
+            numKeys);
     } else {
         // Filtered case: copy selection positions since we may modify the selection vector
         std::vector<sel_t> lookupPos(numKeys);
         for (idx_t i = 0; i < numKeys; ++i) {
             lookupPos[i] = selVector[i];
         }
-        fillOffsetArraysFromVectorInternal<hasNoNullsGuarantee>(transaction, info, keyVector,
-            resultVector, warningDataVectors, errorHandler, lookupPos.data(), numKeys);
+        fillOffsetArraysFromVectorInternal<hasNoNullsGuarantee, namespaceAware>(transaction, info,
+            keyVector, resultVector, warningDataVectors, errorHandler, lookupPos.data(), numKeys);
     }
 }
 } // namespace
@@ -299,12 +321,19 @@ void IndexLookup::lookup(transaction::Transaction* transaction, const IndexLooku
     auto keyVector = info.keyEvaluator->resultVector.get();
     auto resultVector = resultSet->getValueVector(info.resultVectorPos).get();
 
-    if (keyVector->hasNoNullsGuarantee()) {
-        fillOffsetArraysFromVector<true>(transaction, info, keyVector, resultVector,
-            localState->warningDataVectors, localState->errorHandler.get());
+    const auto execute = [&]<bool namespaceAware>() {
+        if (keyVector->hasNoNullsGuarantee()) {
+            fillOffsetArraysFromVector<true, namespaceAware>(transaction, info, keyVector,
+                resultVector, localState->warningDataVectors, localState->errorHandler.get());
+        } else {
+            fillOffsetArraysFromVector<false, namespaceAware>(transaction, info, keyVector,
+                resultVector, localState->warningDataVectors, localState->errorHandler.get());
+        }
+    };
+    if (info.namespaceAware) {
+        execute.template operator()<true>();
     } else {
-        fillOffsetArraysFromVector<false>(transaction, info, keyVector, resultVector,
-            localState->warningDataVectors, localState->errorHandler.get());
+        execute.template operator()<false>();
     }
 }
 

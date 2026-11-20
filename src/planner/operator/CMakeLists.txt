@@ -9,6 +9,7 @@ add_library(riag_planner_operator
         OBJECT
         logical_accumulate.cpp
         logical_aggregate.cpp
+        logical_assert.cpp
         logical_create_macro.cpp
         logical_cross_product.cpp
         logical_distinct.cpp

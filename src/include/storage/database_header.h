@@ -21,6 +21,14 @@ struct DatabaseHeader {
     common::uuid databaseID{0};
 
     storage_version_t storageVersion{StorageVersionInfo::getStorageVersion()};
+    // A capability upgrade may precede rewriting the catalog at checkpoint. Zero
+    // means the catalog uses storageVersion (the unchanged legacy header layout).
+    storage_version_t catalogStorageVersion{0};
+    storage_version_t getCatalogStorageVersion() const {
+        return catalogStorageVersion == 0 ? storageVersion : catalogStorageVersion;
+    }
+    static uint64_t storageVersionOffset();
+    static uint64_t extensionOffset();
 
     void updateCatalogPageRange(PageManager& pageManager, PageRange newPageRange);
     void freeMetadataPageRange(PageManager& pageManager) const;

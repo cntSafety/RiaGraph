@@ -38,6 +38,15 @@ public:
 
     bool lookupPK(const transaction::Transaction* transaction, const common::ValueVector* keyVector,
         common::sel_t pos, common::offset_t& result) const;
+    bool lookupPKInNamespace(const transaction::Transaction* transaction,
+        const common::ValueVector* keyVector, common::sel_t pos, common::namespace_id_t namespaceID,
+        common::offset_t& result) const;
+    void lookupPKInNamespaces(const transaction::Transaction* transaction,
+        const common::ValueVector* keyVector, common::sel_t pos, const common::NamespaceSet& scope,
+        std::vector<common::offset_t>& results) const;
+    void insertNamespaceKey(const transaction::Transaction* transaction,
+        const common::ValueVector& key, common::offset_t offset,
+        common::namespace_id_t namespaceID);
 
     TableStats getStats() const { return nodeGroups.getStats(); }
     common::offset_t getStartOffset() const { return startOffset; }
@@ -48,6 +57,7 @@ public:
 
 private:
     void initLocalHashIndex(MemoryManager& mm);
+    LocalHashIndex& namespaceIndex(common::namespace_id_t namespaceID);
 
 private:
     // This is equivalent to the num of committed nodes in the table.
@@ -57,6 +67,12 @@ private:
     OverflowFileHandle* overflowFileHandle;
     std::unique_ptr<LocalHashIndex> hashIndex;
     NodeGroupCollection nodeGroups;
+    struct NamespaceIndexes {
+        explicit NamespaceIndexes(MemoryManager& memory) : memory{memory} {}
+        MemoryManager& memory;
+        std::unordered_map<common::namespace_id_t, std::unique_ptr<LocalHashIndex>> indexes;
+    };
+    std::unique_ptr<NamespaceIndexes> namespaceIndexes;
 };
 
 } // namespace storage

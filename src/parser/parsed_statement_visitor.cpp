@@ -77,6 +77,9 @@ void StatementVisitor::visit(const Statement& statement) {
     case StatementType::USE_GRAPH: {
         visitUseGraph(statement);
     } break;
+    case StatementType::NAMESPACE: {
+        visitNamespace(statement);
+    } break;
     case StatementType::STANDALONE_CALL_FUNCTION: {
         visitStandaloneCallFunction(statement);
     } break;
@@ -138,6 +141,9 @@ void StatementVisitor::visitReadingClause(const ReadingClause* readingClause) {
     } break;
     case ClauseType::LOAD_FROM: {
         visitLoadFrom(readingClause);
+    } break;
+    case ClauseType::ASSERT: {
+        visitAssert(readingClause);
     } break;
     default:
         UNREACHABLE_CODE;

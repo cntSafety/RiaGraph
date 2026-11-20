@@ -1,0 +1,114 @@
+-DATASET CSV empty
+
+--
+
+-CASE AssertAutoCommitRollsBackEarlierClauses
+-STATEMENT CREATE NODE TABLE T(id INT64 PRIMARY KEY, name STRING)
+---- ok
+-STATEMENT CREATE (n:T {id: 1, name: 'one'}) WITH n ASSERT n.id = 2 AS 'id shall be 2'
+---- error
+Assertion failed: id shall be 2
+-STATEMENT MATCH (n:T) RETURN count(*)
+---- 1
+0
+-STATEMENT CREATE (n:T {id: 1, name: 'one'}) WITH n ASSERT n.id = 1 AS 'id shall be 1'
+---- ok
+-STATEMENT MATCH (n:T) RETURN n.name
+---- 1
+one
+-LOG PostConditionAfterSet
+-STATEMENT MATCH (n:T {id: 1}) SET n.name = '' WITH n ASSERT size(n.name) > 0 AS 'name shall not be empty' RETURN n.name
+---- error
+Assertion failed: name shall not be empty
+-STATEMENT MATCH (n:T) RETURN n.name
+---- 1
+one
+-STATEMENT MATCH (n:T {id: 1}) SET n.name = 'uno' WITH n ASSERT size(n.name) > 0 RETURN n.name
+---- 1
+uno
+-LOG AggregatePostCondition
+-STATEMENT UNWIND [2, 3, 3] AS i MERGE (n:T {id: i}) WITH DISTINCT n ASSERT count(n) = 3 AS 'three distinct nodes'
+---- error
+Assertion failed: three distinct nodes
+-STATEMENT MATCH (n:T) RETURN count(*)
+---- 1
+1
+-STATEMENT UNWIND [2, 3, 3] AS i MERGE (n:T {id: i}) WITH DISTINCT n ASSERT count(n) = 2
+---- ok
+-STATEMENT MATCH (n:T) RETURN count(*)
+---- 1
+3
+
+-CASE AssertExplicitTransactionCommits
+-STATEMENT CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING)
+---- ok
+-STATEMENT BEGIN TRANSACTION
+---- ok
+-STATEMENT CREATE (:Person {id: 42, name: 'klaus'})
+---- ok
+-STATEMENT ASSERT EXISTS { MATCH (a:Person {id: 42}) } AS 'Person 42 shall exist'
+---- ok
+-STATEMENT COMMIT
+---- ok
+-STATEMENT MATCH (a:Person) RETURN a.name
+---- 1
+klaus
+
+-CASE AssertExplicitTransactionRollsBack
+-STATEMENT CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING)
+---- ok
+-STATEMENT BEGIN TRANSACTION
+---- ok
+-STATEMENT CREATE (:Person {id: 42, name: 'klaus'})
+---- ok
+-STATEMENT CREATE (:Person {id: 43, name: 'klaus'})
+---- ok
+-STATEMENT MATCH (a:Person) RETURN count(*)
+---- 1
+2
+-STATEMENT MATCH (a:Person) ASSERT count(DISTINCT a.name) = count(*) AS 'Names shall be unique'
+---- error
+Assertion failed: Names shall be unique
+-LOG TheWholeTransactionIsGone
+-STATEMENT COMMIT
+---- error
+No active transaction for COMMIT.
+-STATEMENT MATCH (a:Person) RETURN count(*)
+---- 1
+0
+
+-CASE AssertReadOnlyTransaction
+-STATEMENT CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING)
+---- ok
+-STATEMENT CREATE (:Person {id: 1, name: 'a'})
+---- ok
+-STATEMENT BEGIN TRANSACTION READ ONLY
+---- ok
+-STATEMENT MATCH (a:Person) ASSERT a.id > 0 RETURN a.name
+---- 1
+a
+-STATEMENT ASSERT COUNT { MATCH (a:Person) } = 1
+---- ok
+-STATEMENT COMMIT
+---- ok
+-STATEMENT BEGIN TRANSACTION READ ONLY
+---- ok
+-STATEMENT ASSERT COUNT { MATCH (a:Person) } = 2 AS 'two people'
+---- error
+Assertion failed: two people
+-STATEMENT COMMIT
+---- error
+No active transaction for COMMIT.
+
+-CASE AssertOnEmptyGraph
+-STATEMENT CREATE NODE TABLE Person(id INT64 PRIMARY KEY)
+---- ok
+-STATEMENT ASSERT EXISTS { MATCH (a) } AS 'Graph shall contain at least one node'
+---- error
+Assertion failed: Graph shall contain at least one node
+-STATEMENT MATCH (b:Person) ASSERT count(b) > 0 AS 'Graph shall not be empty' RETURN b
+---- error
+Assertion failed: Graph shall not be empty
+-STATEMENT MATCH (b:Person) ASSERT b.id > 0 RETURN count(*)
+---- 1
+0

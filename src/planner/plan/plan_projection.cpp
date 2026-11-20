@@ -1,5 +1,6 @@
 #include "binder/expression_visitor.h"
 #include "binder/query/return_with_clause/bound_projection_body.h"
+#include "planner/operator/scan/logical_dummy_scan.h"
 #include "planner/planner.h"
 
 using namespace riag::binder;
@@ -23,7 +24,16 @@ void Planner::planProjectionBody(const BoundProjectionBody* projectionBody, Logi
         appendDummyScan(plan);
     }
     if (expressionsToProject.empty()) {
-        return;
+        // The binder drops constants from a WITH projection list (consumers evaluate them
+        // themselves), so WITH DISTINCT 1 AS x and WITH 1 AS x LIMIT 1 can arrive here with nothing
+        // to project. Their DISTINCT, SKIP and LIMIT still count rows -- skipping them let
+        // MATCH (a) WITH 1 AS x LIMIT 1 ... go on with every a, and WITH 5 AS x LIMIT 0 CREATE ...
+        // write a row. Project a placeholder, so that they have a column to act on. The binder
+        // keeps the list as is when there is an ORDER BY or an aggregate.
+        if (!projectionBody->isDistinct() && !projectionBody->hasSkipOrLimit()) {
+            return;
+        }
+        expressionsToProject.push_back(LogicalDummyScan::getDummyExpression());
     }
     auto expressionsToAggregate = projectionBody->getAggregateExpressions();
     auto expressionsToGroupBy = projectionBody->getGroupByExpressions();
@@ -53,6 +63,13 @@ void Planner::planProjectionBody(const BoundProjectionBody* projectionBody, Logi
         appendProjection(expressionsToProject, plan);
     }
     if (projectionBody->hasSkipOrLimit()) {
+        // A LIMIT stops pulling once it has its rows, so a write in its pipeline would apply to
+        // only the first limit + 1 of them: MATCH (a) SET a.v = 1 RETURN a LIMIT 1 set two rows.
+        // The write's clause completes before the LIMIT applies, so materialize its output. An
+        // aggregate, DISTINCT or ORDER BY in this projection body already consumes every row.
+        if (projectionBody->hasLimit() && plan.hasUpdateInPipeline()) {
+            appendAccumulate(plan);
+        }
         appendMultiplicityReducer(plan);
         appendLimit(projectionBody->getSkipNumber(), projectionBody->getLimitNumber(), plan);
     }

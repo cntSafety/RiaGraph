@@ -1,6 +1,7 @@
 #pragma once
 
 #include "binder/expression/expression.h"
+#include "common/namespace_set.h"
 #include "expression_evaluator/expression_evaluator.h"
 #include "processor/operator/persistent/batch_insert_error_handler.h"
 #include "processor/operator/physical_operator.h"
@@ -30,6 +31,8 @@ struct NoIndexLookupCache {
 };
 
 struct IndexLookupInfo {
+    bool namespaceAware = false;
+    common::namespace_id_t namespaceTarget = common::GLOBAL_NAMESPACE_ID;
     storage::NodeTable* nodeTable;
     std::unique_ptr<evaluator::ExpressionEvaluator> keyEvaluator;
     DataPos resultVectorPos;
@@ -44,7 +47,8 @@ struct IndexLookupInfo {
 
 private:
     IndexLookupInfo(const IndexLookupInfo& other)
-        : nodeTable{other.nodeTable}, keyEvaluator{other.keyEvaluator->copy()},
+        : namespaceAware{other.namespaceAware}, namespaceTarget{other.namespaceTarget},
+          nodeTable{other.nodeTable}, keyEvaluator{other.keyEvaluator->copy()},
           resultVectorPos{other.resultVectorPos}, noIndexLookupCache{other.noIndexLookupCache} {}
 };
 

@@ -19,6 +19,7 @@
 #include "storage/buffer_manager/memory_manager.h"
 #include "storage/checkpointer.h"
 #include "storage/index/art_index.h"
+#include "storage/index/namespace_primary_key_index.h"
 #include "storage/partition_storage_registry.h"
 #include "storage/storage_utils.h"
 #include "storage/table/arrow_node_table.h"
@@ -74,6 +75,7 @@ StorageManager::StorageManager(const std::string& databasePath, bool readOnly, b
     // clientContext.getDatabasePath().  The Checkpointer creates these files on demand
     // (with CREATE_IF_NOT_EXISTS) when a checkpoint starts via acquireCheckpointLocks().
     registerIndexType(PrimaryKeyIndex::getIndexType());
+    registerIndexType(NamespacePrimaryKeyIndex::getIndexType());
     registerIndexType(ArtPrimaryKeyIndex::getIndexType());
 }
 
@@ -235,6 +237,16 @@ void StorageManager::createNodeTable(NodeTableCatalogEntry* entry, main::ClientC
     } else {
         // Create regular node table
         tables[entry->getTableID()] = std::make_unique<NodeTable>(this, entry, &memoryManager);
+        if (const auto* namespaces = entry->getOwningCatalog()->getNamespaces()) {
+            const auto* transaction = context ? transaction::Transaction::Get(*context) : nullptr;
+            if (!transaction) {
+                transaction = &transaction::DUMMY_TRANSACTION;
+            }
+            const auto* policy = namespaces->getPolicy(transaction, entry->getTableID());
+            if (policy && policy->localPrimaryKey) {
+                tables[entry->getTableID()]->cast<NodeTable>().enableLocalPrimaryKey();
+            }
+        }
     }
 }
 
@@ -503,7 +515,13 @@ bool StorageManager::checkpoint(main::ClientContext* context, const Catalog& cat
     }
     lck.unlock();
     reclaimDroppedIndexes();
-    reclaimDroppedTables(catalog);
+    // A reader that began before the checkpoint may still see a table dropped since: its
+    // snapshot catalog still binds the table, and its scans read this storage. Keep dropped
+    // tables until a checkpoint that no such reader overlaps; nothing serialized references them,
+    // so a later checkpoint reclaims them the same way.
+    if (openStartTSs.empty()) {
+        reclaimDroppedTables(catalog);
+    }
     // See the other overload: registry sweeps are main-storage-manager only.
     if (this == context->getDatabase()->getStorageManager()) {
         PartitionStorageRegistry::Get(context)->dropAllNotInCatalog(context, catalog);
@@ -736,8 +754,11 @@ common::uuid StorageManager::getOrInitDatabaseID(const main::ClientContext& clie
 const storage::DatabaseHeader* StorageManager::getOrInitDatabaseHeader(
     const main::ClientContext& clientContext) {
     if (databaseHeader == nullptr) {
-        // We should only create the database header if a persistent one doesn't exist
-        DASSERT(std::nullopt == DatabaseHeader::readDatabaseHeader(*dataFH->getFileInfo()));
+        // We should only create the database header if a persistent one doesn't exist. An
+        // in-memory database has no data file to hold one, and its file handle carries no file
+        // system to read through.
+        DASSERT(
+            inMemory || std::nullopt == DatabaseHeader::readDatabaseHeader(*dataFH->getFileInfo()));
         databaseHeader = std::make_unique<DatabaseHeader>(
             DatabaseHeader::createInitialHeader(RandomEngine::Get(clientContext)));
     }
@@ -747,6 +768,33 @@ const storage::DatabaseHeader* StorageManager::getOrInitDatabaseHeader(
 void StorageManager::setDatabaseHeader(std::unique_ptr<storage::DatabaseHeader> header) {
     DASSERT(!databaseHeader || header->databaseID.value == databaseHeader->databaseID.value);
     databaseHeader = std::move(header);
+}
+
+void StorageManager::ensureNamespaceStorageVersion(main::ClientContext& context) {
+    if (inMemory) {
+        return;
+    }
+    std::lock_guard lock{namespaceFormatMutex};
+    auto header = *getOrInitDatabaseHeader(context);
+    if (header.storageVersion >= StorageVersionInfo::STORAGE_VERSION_50) {
+        return;
+    }
+    header.catalogStorageVersion = header.storageVersion;
+    // Persist the payload-version extension while the capability is still legacy.
+    // A crash here leaves an ordinary legacy catalog readable by both engines.
+    auto buffer = std::make_shared<BufferWriter>();
+    Serializer serializer(buffer);
+    header.serialize(serializer);
+    const auto extension = DatabaseHeader::extensionOffset();
+    auto* file = dataFH->getFileInfo();
+    file->writeFile(buffer->getBlobData() + extension, buffer->getSize() - extension, extension);
+    file->syncFile();
+    const storage_version_t capability = StorageVersionInfo::STORAGE_VERSION_50;
+    file->writeFile(reinterpret_cast<const uint8_t*>(&capability), sizeof(capability),
+        DatabaseHeader::storageVersionOffset());
+    file->syncFile();
+    header.storageVersion = capability;
+    setDatabaseHeader(std::make_unique<DatabaseHeader>(header));
 }
 
 StorageManager* StorageManager::Get(const main::ClientContext& context) {

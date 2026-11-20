@@ -22,7 +22,8 @@ std::shared_ptr<Expression> ExpressionBinder::bindSubqueryExpression(
     auto prevScope = binder->saveScope();
     auto boundGraphPattern = binder->bindGraphPattern(subqueryExpr.getPatternElements());
     if (subqueryExpr.hasWhereClause()) {
-        boundGraphPattern.where = binder->bindWhereExpression(*subqueryExpr.getWhereClause());
+        boundGraphPattern.where = combineBooleanExpressions(ExpressionType::AND,
+            boundGraphPattern.where, binder->bindWhereExpression(*subqueryExpr.getWhereClause()));
     }
     binder->rewriteMatchPattern(boundGraphPattern);
     auto subqueryType = subqueryExpr.getSubqueryType();

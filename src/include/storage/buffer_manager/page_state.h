@@ -44,26 +44,44 @@ public:
     static uint64_t updateStateAndIncrementVersion(uint64_t oldStateAndVersion, uint64_t newState) {
         return (((oldStateAndVersion << 8) >> 8) + 1) | (newState << NUM_BITS_TO_SHIFT_FOR_STATE);
     }
-    void spinLock(uint64_t oldStateAndVersion) {
+    // Takes the lock of a page that is in a frame. If another thread holds the lock, waits for it
+    // to be released: unlike a compare-exchange from the state that was just read, which also
+    // succeeds from LOCKED (LOCKED -> LOCKED) and would leave two threads believing they own the
+    // lock. Returns false without locking if the page is not in a frame (EVICTED).
+    bool spinLockUnlessEvicted() {
         while (true) {
-            if (stateAndVersion.compare_exchange_strong(oldStateAndVersion,
-                    updateStateWithSameVersion(oldStateAndVersion, LOCKED))) {
-                return;
+            auto oldStateAndVersion = stateAndVersion.load();
+            switch (getState(oldStateAndVersion)) {
+            case EVICTED: {
+                return false;
+            }
+            case LOCKED: {
+                continue;
+            }
+            default: {
+                if (stateAndVersion.compare_exchange_strong(oldStateAndVersion,
+                        updateStateWithSameVersion(oldStateAndVersion, LOCKED))) {
+                    fenceAfterLock();
+                    return true;
+                }
+            }
             }
         }
     }
     bool tryLock(uint64_t oldStateAndVersion) {
-        return stateAndVersion.compare_exchange_strong(oldStateAndVersion,
-            updateStateWithSameVersion(oldStateAndVersion, LOCKED));
+        if (stateAndVersion.compare_exchange_strong(oldStateAndVersion,
+                updateStateWithSameVersion(oldStateAndVersion, LOCKED))) {
+            fenceAfterLock();
+            return true;
+        }
+        return false;
     }
     void unlock() {
-        // TODO(Keenan / Guodong): Track down this rare bug and re-enable the assert. Ref #2289.
-        // DASSERT(getState(stateAndVersion.load()) == LOCKED);
+        DASSERT(getState(stateAndVersion.load()) == LOCKED);
         stateAndVersion.store(updateStateAndIncrementVersion(stateAndVersion.load(), UNLOCKED));
     }
     void unlockUnchanged() {
-        // TODO(Keenan / Guodong): Track down this rare bug and re-enable the assert. Ref #2289.
-        // DASSERT(getState(stateAndVersion.load()) == LOCKED);
+        DASSERT(getState(stateAndVersion.load()) == LOCKED);
         stateAndVersion.store(updateStateWithSameVersion(stateAndVersion.load(), UNLOCKED));
     }
     // Change page state from Mark to Unlocked.
@@ -90,6 +108,20 @@ public:
     void clearDirtyWithoutLock() { stateAndVersion &= ~DIRTY_MASK; }
     bool isDirty() const { return stateAndVersion & DIRTY_MASK; }
     uint64_t getStateAndVersion() const { return stateAndVersion.load(); }
+    // The version re-check of an optimistic read (BufferManager::optimisticRead). The frame was
+    // read with plain loads, and the load of the version alone does not keep them before it: on
+    // a weakly ordered CPU (ARM) they may be satisfied after it, so the re-check could still see
+    // the old version while the bytes came from a writer that held the lock in between. The
+    // acquire fence pairs with the release fence in fenceAfterLock(): if any byte the reader
+    // returned was written under a lock taken after the reader's first load, the re-check sees
+    // LOCKED or a later version and the read is retried. This is the reader half of a seqlock
+    // in the C++ memory model (Boehm, "Can Seqlocks Get Along With Programming Language Memory
+    // Models?", 2012). On x86 the fence emits no instruction; it only stops the compiler from
+    // moving the frame loads past the re-check.
+    uint64_t getStateAndVersionAfterOptimisticRead() const {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return stateAndVersion.load();
+    }
 
     void resetToEvicted() {
 #if BM_MALLOC
@@ -113,8 +145,20 @@ public:
 #endif
 
 private:
-    // Highest 1 bit is dirty bit, and the rest are page state and version bits.
-    // In the rest bits, the lowest 1 byte is state, and the rest are version.
+    // Called right after every successful transition to LOCKED. The lock holder then writes the
+    // frame with plain stores (a pinned writer, cachePageIntoFrame, the zero-fill of a released
+    // frame, updateFrameIfPageIsInFrame) while optimistic readers may be reading it. A successful
+    // compare-exchange orders the accesses before it, not the stores after it: without this fence
+    // a reader could see a store made under the lock and still read the version from before the
+    // lock. Writer half of the seqlock, see getStateAndVersionAfterOptimisticRead(). On x86 it
+    // emits no instruction.
+    static void fenceAfterLock() { std::atomic_thread_fence(std::memory_order_release); }
+
+    // The top byte (bits 56..63, STATE_MASK) is the state. The low 56 bits (bits 0..55,
+    // VERSION_MASK) are the version, and the dirty bit is bit 55 (DIRTY_MASK) of those: it is
+    // the highest bit of the version, not of the word. The state updates keep the low 56 bits
+    // as they are (that is how the dirty bit survives a state change), so they carry the dirty
+    // bit along, and an increment of the version that reaches bit 55 sets the dirty bit.
     std::atomic<uint64_t> stateAndVersion;
 #if BM_MALLOC
     std::unique_ptr<uint8_t[]> page;

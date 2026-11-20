@@ -2,6 +2,7 @@
 
 #include "binder/expression/expression_util.h"
 #include "binder/expression_visitor.h"
+#include "binder/query/reading_clause/bound_assert_clause.h"
 #include "binder/query/reading_clause/bound_load_from.h"
 #include "binder/query/reading_clause/bound_match_clause.h"
 #include "binder/query/reading_clause/bound_table_function_call.h"
@@ -68,6 +69,10 @@ void PropertyCollector::visitLoadFrom(const BoundReadingClause& readingClause) {
     }
 }
 
+void PropertyCollector::visitAssert(const BoundReadingClause& readingClause) {
+    collectProperties(readingClause.constCast<BoundAssertClause>().getCondition());
+}
+
 void PropertyCollector::visitTableFunctionCall(const BoundReadingClause& readingClause) {
     auto& call = readingClause.constCast<BoundTableFunctionCall>();
     if (call.hasPredicate()) {
@@ -84,6 +89,9 @@ void PropertyCollector::visitSet(const BoundUpdatingClause& updatingClause) {
         auto& rel = info.pattern->constCast<RelExpression>();
         DASSERT(!rel.isEmpty() && rel.getRelType() == QueryRelType::NON_RECURSIVE);
         properties.insert(rel.getInternalID());
+    }
+    for (const auto& move : boundSetClause.namespaceMoves) {
+        properties.insert(move.entity->getInternalID());
     }
 }
 
@@ -116,6 +124,12 @@ void PropertyCollector::visitInsert(const BoundUpdatingClause& updatingClause) {
 
 void PropertyCollector::visitMerge(const BoundUpdatingClause& updatingClause) {
     auto& boundMergeClause = updatingClause.constCast<BoundMergeClause>();
+    for (const auto& move : boundMergeClause.onMatchNamespaceMoves) {
+        properties.insert(move.entity->getInternalID());
+    }
+    for (const auto& move : boundMergeClause.onCreateNamespaceMoves) {
+        properties.insert(move.entity->getInternalID());
+    }
     for (auto& rel : boundMergeClause.getQueryGraphCollection()->getQueryRels()) {
         if (rel->getRelType() == QueryRelType::NON_RECURSIVE) {
             properties.insert(rel->getInternalID());

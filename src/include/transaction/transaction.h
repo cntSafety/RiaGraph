@@ -109,6 +109,11 @@ public:
     int64_t getCurrentTS() const { return currentTS; }
 
     void setForceCheckpoint() { forceCheckpoint = true; }
+    // The transaction dropped a table (or a rel table's FROM/TO pair). Its storage stays in the
+    // storage manager, and keeps the buffer-pool memory behind it, until it is reclaimed at the
+    // next checkpoint (or, in memory, once no transaction can still see it).
+    void setDroppedTableStorage() { droppedTableStorage = true; }
+    bool hasDroppedTableStorage() const { return droppedTableStorage; }
     bool shouldAppendToUndoBuffer() const {
         // Only write transactions and recovery transactions should append to the undo buffer.
         return isWriteTransaction() || isRecovery();
@@ -159,6 +164,12 @@ public:
     // The transaction's undo records may point into the parked catalog; destroying it
     // before commit or rollback finishes would leave those records dangling.
     void retireGraphCatalog(std::unique_ptr<catalog::Catalog> catalog);
+    void recordNamespaceGroup(catalog::CatalogEntry* entry);
+    uint64_t getNamespaceGeneration() const {
+        const auto* state = namespaceState.load(std::memory_order_acquire);
+        return state ? state->generation.load(std::memory_order_relaxed) : 0;
+    }
+    void incrementNamespaceGeneration();
     void pushInsertInfo(common::node_group_idx_t nodeGroupIdx, common::row_idx_t startRow,
         common::row_idx_t numRows, const storage::VersionRecordHandler* versionRecordHandler) const;
     void pushDeleteInfo(common::node_group_idx_t nodeGroupIdx, common::row_idx_t startRow,
@@ -171,6 +182,13 @@ public:
     void recordCatalogChange(catalog::Catalog* catalog);
 
 private:
+    struct NamespaceState {
+        std::unordered_set<catalog::Catalog*> dataCatalogs;
+        std::unordered_set<catalog::CatalogEntry*> groups;
+        std::atomic<uint64_t> generation{0};
+    };
+    // Caller holds changedCatalogsMutex; publishing supports parallel COPY workers.
+    NamespaceState& getOrCreateNamespaceStateNoLock();
     common::offset_t getMinUncommittedNodeOffset(const storage::Table& table) const;
     common::offset_t getMinUncommittedNodeOffset(common::table_id_t tableID) const;
 
@@ -188,9 +206,12 @@ private:
     std::vector<std::function<void(Transaction&)>> commitCallbacks;
     std::vector<std::function<void(Transaction&)>> rollbackCallbacks;
     bool forceCheckpoint;
+    bool droppedTableStorage = false;
     std::vector<std::unique_ptr<catalog::Catalog>> retiredGraphCatalogs;
     std::unordered_set<catalog::Catalog*> changedCatalogs;
     std::mutex changedCatalogsMutex;
+    std::unique_ptr<NamespaceState> namespaceStateOwner;
+    std::atomic<NamespaceState*> namespaceState{nullptr};
 };
 
 // TODO(bmwinger): These shouldn't need to be exported

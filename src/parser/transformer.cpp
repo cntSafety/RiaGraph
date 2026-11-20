@@ -8,6 +8,7 @@
 #include "parser/analyze_statement.h"
 #include "parser/explain_statement.h"
 #include "parser/graph_statement.h"
+#include "parser/namespace_statement.h"
 #include "parser/query/regular_query.h" // IWYU pragma: keep (fixes a forward declaration error)
 
 using namespace riag::common;
@@ -88,6 +89,8 @@ std::unique_ptr<Statement> Transformer::transformStatement(CypherParser::OC_Stat
         return transformCreateGraph(*ctx.iC_CreateGraph());
     } else if (ctx.iC_UseGraph()) {
         return transformUseGraph(*ctx.iC_UseGraph());
+    } else if (ctx.iC_NamespaceStatement()) {
+        return transformNamespaceStatement(*ctx.iC_NamespaceStatement());
     } else {
         UNREACHABLE_CODE;
     }
@@ -99,6 +102,40 @@ std::unique_ptr<Statement> Transformer::transformAnalyze(CypherParser::IC_Analyz
         tableName = transformSchemaName(*ctx.oC_SchemaName());
     }
     return std::make_unique<AnalyzeStatement>(std::move(tableName));
+}
+
+NamespaceSelector Transformer::transformNamespaceList(CypherParser::IC_NamespaceListContext& ctx) {
+    NamespaceSelector selector;
+    selector.all = ctx.ALL() != nullptr;
+    for (auto* name : ctx.iC_NamespaceName()) {
+        if (name->GLOBAL()) {
+            selector.global = true;
+        } else {
+            selector.names.push_back(transformSymbolicName(*name->oC_SymbolicName()));
+        }
+    }
+    return selector;
+}
+
+std::unique_ptr<Statement> Transformer::transformNamespaceStatement(
+    CypherParser::IC_NamespaceStatementContext& ctx) {
+    const auto action = ctx.CREATE() ? NamespaceAction::CREATE :
+                        ctx.DROP()   ? NamespaceAction::DROP :
+                        ctx.ALTER()  ? NamespaceAction::RENAME :
+                                       NamespaceAction::USE;
+    auto result = std::make_unique<NamespaceStatement>(action);
+    const auto names = ctx.oC_SymbolicName();
+    if (!names.empty()) {
+        result->name = transformSymbolicName(*names[0]);
+    }
+    if (names.size() > 1) {
+        result->newName = transformSymbolicName(*names[1]);
+    }
+    result->ifExists = ctx.iC_IfExists() != nullptr || ctx.iC_IfNotExists() != nullptr;
+    if (ctx.iC_NamespaceList()) {
+        result->selector = transformNamespaceList(*ctx.iC_NamespaceList());
+    }
+    return result;
 }
 
 std::unique_ptr<ParsedExpression> Transformer::transformWhere(CypherParser::OC_WhereContext& ctx) {
@@ -174,6 +211,18 @@ std::string Transformer::transformStringLiteral(antlr4::tree::TerminalNode& stri
                     if (endPtr != hexStr.c_str() + hexDigits) {
                         UNREACHABLE_CODE;
                     }
+                    // The lexer accepts any eight hex digits, but only a Unicode scalar value has a
+                    // UTF-8 encoding: reject what lies above U+10FFFF and the UTF-16 surrogates
+                    // U+D800..U+DFFF, which would otherwise be emitted as invalid UTF-8.
+                    if (hexValue > 0x10FFFF || (hexValue >= 0xD800 && hexValue <= 0xDFFF)) {
+                        const auto reason = hexValue > 0x10FFFF ?
+                                                "the code point is above U+10FFFF." :
+                                                "UTF-16 surrogates (U+D800 to U+DFFF) are not "
+                                                "valid characters.";
+                        throw common::ParserException{"Invalid unicode escape sequence '" +
+                                                      content.substr(i, 2 + hexDigits) +
+                                                      "' in string literal: " + reason};
+                    }
                     // Convert Unicode code point to UTF-8
                     if (hexValue <= 0x7F) {
                         result += static_cast<char>(hexValue);
@@ -190,7 +239,7 @@ std::string Transformer::transformStringLiteral(antlr4::tree::TerminalNode& stri
                         result += static_cast<char>(0x80 | ((hexValue >> 6) & 0x3F));
                         result += static_cast<char>(0x80 | (hexValue & 0x3F));
                     } else {
-                        UNREACHABLE_CODE;
+                        UNREACHABLE_CODE; // Rejected above.
                     }
                     i += 1 + hexDigits;
                 }

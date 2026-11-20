@@ -8,6 +8,7 @@ namespace riag {
 namespace binder {
 
 struct ExportedTableData {
+    std::string namespaceImport;
     std::string tableName;
     std::string fileName;
     std::unique_ptr<BoundRegularQuery> regularQuery;
@@ -22,6 +23,14 @@ class BoundExportDatabase final : public BoundStatement {
     static constexpr common::StatementType type_ = common::StatementType::EXPORT_DATABASE;
 
 public:
+    bool namespaceAware = false;
+    std::string getNamespaceImport() const {
+        std::string result;
+        for (const auto& table : exportData) {
+            result += table.namespaceImport;
+        }
+        return result;
+    }
     BoundExportDatabase(std::string filePath, common::FileTypeInfo fileTypeInfo,
         std::vector<ExportedTableData> exportData,
         common::case_insensitive_map_t<common::Value> csvOption, bool schemaOnly)

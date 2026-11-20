@@ -113,6 +113,11 @@ void packSingleImpl(const UncompressedType in, CompressedType* __restrict out, u
 template<IntegerBitpackingType UncompressedType>
 void BitpackingUtils<UncompressedType>::unpackSingle(const uint8_t* __restrict srcCursor,
     UncompressedType* __restrict dst, uint16_t bitWidth, size_t srcOffset) {
+    if (bitWidth == 0) {
+        // A value of width 0 occupies no storage: the buffer may have no bytes at all.
+        *dst = 0;
+        return;
+    }
     const size_t srcBufferOffset = srcOffset * bitWidth / sizeOfCompressedTypeBits;
     const size_t shiftRight = srcOffset * bitWidth % sizeOfCompressedTypeBits;
 
@@ -124,6 +129,11 @@ void BitpackingUtils<UncompressedType>::unpackSingle(const uint8_t* __restrict s
 template<IntegerBitpackingType UncompressedType>
 void BitpackingUtils<UncompressedType>::packSingle(const UncompressedType src,
     uint8_t* __restrict dstBuffer, uint16_t bitWidth, size_t dstOffset) {
+    if (bitWidth == 0) {
+        // Nothing to store: the read-modify-write below would touch a unit of a buffer that
+        // may have no bytes at all.
+        return;
+    }
     const size_t dstBufferOffset = dstOffset * bitWidth / sizeOfCompressedTypeBits;
     const size_t shiftLeft = dstOffset * bitWidth % sizeOfCompressedTypeBits;
 

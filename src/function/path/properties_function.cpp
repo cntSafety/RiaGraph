@@ -1,3 +1,4 @@
+#include "binder/expression/expression_util.h"
 #include "binder/expression/literal_expression.h"
 #include "common/constants.h"
 #include "common/exception/binder.h"
@@ -25,6 +26,7 @@ static std::unique_ptr<FunctionBindData> bindFunc(const ScalarBindFuncInput& inp
         throw BinderException(std::format("Expected literal input as the second argument for {}().",
             PropertiesFunction::name));
     }
+    ExpressionUtil::validateDataType(*input.arguments[1], LogicalTypeID::STRING);
     auto literalExpr = input.arguments[1]->constPtrCast<LiteralExpression>();
     auto key = literalExpr->getValue().getValue<std::string>();
     const auto& listType = input.arguments[0]->getDataType();

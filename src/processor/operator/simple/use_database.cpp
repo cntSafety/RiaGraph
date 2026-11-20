@@ -11,6 +11,7 @@ namespace processor {
 void UseDatabase::executeInternal(ExecutionContext* context) {
     auto dbManager = main::DatabaseManager::Get(*context->clientContext);
     dbManager->setDefaultDatabase(dbName);
+    context->clientContext->resetNamespaceSelection();
     appendMessage("Used database successfully.",
         storage::MemoryManager::Get(*context->clientContext));
 }

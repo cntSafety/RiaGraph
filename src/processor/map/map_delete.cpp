@@ -72,6 +72,7 @@ std::unique_ptr<NodeDeleteExecutor> PlanMapper::getNodeDeleteExecutor(
     auto& node = boundInfo.pattern->constCast<NodeExpression>();
     auto nodeIDPos = getDataPos(*node.getInternalID(), schema);
     auto info = NodeDeleteInfo(boundInfo.deleteType, nodeIDPos);
+    info.namespaceScope = boundInfo.namespaceScope;
     if (node.isEmpty()) {
         return std::make_unique<EmptyNodeDeleteExecutor>(std::move(info));
     }

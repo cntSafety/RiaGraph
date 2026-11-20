@@ -9,9 +9,11 @@
 #include "binder/expression_visitor.h"
 #include "common/exception/binder.h"
 #include "common/exception/not_implemented.h"
+#include "common/types/value/nested.h"
 #include "expression_evaluator/expression_evaluator_utils.h"
 #include "function/arithmetic/vector_arithmetic_functions.h"
 #include "function/cast/vector_cast_functions.h"
+#include "function/struct/vector_struct_functions.h"
 #include "parser/expression/parsed_expression_visitor.h"
 #include "parser/expression/parsed_parameter_expression.h"
 #include <format>
@@ -425,6 +427,9 @@ std::shared_ptr<Expression> ExpressionBinder::implicitCastIfNecessary(
         expression->cast(targetType);
         return expression;
     }
+    if (auto repacked = tryRepackStructLiteral(expression, targetType)) {
+        return repacked->dataType == targetType ? repacked : implicitCast(repacked, targetType);
+    }
     return implicitCast(expression, targetType);
 }
 
@@ -435,6 +440,66 @@ std::shared_ptr<Expression> ExpressionBinder::implicitCast(
     } else {
         throw BinderException(unsupportedImplicitCastException(*expression, targetType.toString()));
     }
+}
+
+// A map literal {b: 3, a: 4} is a STRUCT_PACK call. Casting it to STRUCT(a INT64, b INT64) as a
+// whole would need every field to cast implicitly, which a NULL field (typed STRING, see
+// StructPackFunctions) does not. Re-packing the arguments under the target's fields casts each
+// argument on its own instead, so {v: null} fits STRUCT(v INT64), and a target field the map
+// does not have becomes a NULL literal. Fields are matched by name (cntSafety/RiaGraph#193).
+// A map whose values are all constants has already been folded into a STRUCT literal; its
+// values are re-packed the same way.
+std::shared_ptr<Expression> ExpressionBinder::tryRepackStructLiteral(
+    const std::shared_ptr<Expression>& expression, const LogicalType& targetType) {
+    const auto& sourceType = expression->dataType;
+    if (sourceType.getLogicalTypeID() != LogicalTypeID::STRUCT ||
+        targetType.getLogicalTypeID() != LogicalTypeID::STRUCT) {
+        return nullptr;
+    }
+    expression_vector sourceChildren;
+    if (expression->expressionType == ExpressionType::FUNCTION &&
+        expression->constCast<ScalarFunctionExpression>().getFunction().name ==
+            StructPackFunctions::name) {
+        sourceChildren = expression->getChildren();
+    } else if (expression->expressionType == ExpressionType::LITERAL) {
+        const auto& value = expression->constCast<LiteralExpression>().getValue();
+        if (value.isNull()) {
+            return nullptr; // A NULL map casts statically.
+        }
+        for (auto i = 0u; i < NestedVal::getChildrenSize(&value); ++i) {
+            const auto& childValue = *NestedVal::getChildVal(&value, i);
+            sourceChildren.push_back(childValue.isNull() ? createNullLiteralExpression(childValue) :
+                                                           createLiteralExpression(childValue));
+        }
+    } else {
+        return nullptr;
+    }
+    if (sourceChildren.size() != StructType::getNumFields(sourceType)) {
+        return nullptr; // LCOV_EXCL_LINE
+    }
+    for (const auto& field : StructType::getFields(sourceType)) {
+        if (!StructType::hasField(targetType, field.getName())) {
+            return nullptr; // Leave it to the regular cast, which reports the error.
+        }
+    }
+    expression_vector children;
+    std::vector<std::string> fieldNames;
+    for (const auto& targetField : StructType::getFields(targetType)) {
+        auto idx = StructType::getFieldIdx(sourceType, targetField.getName());
+        if (idx == INVALID_STRUCT_FIELD_IDX) {
+            children.push_back(
+                createNullLiteralExpression(Value::createNullValue(targetField.getType())));
+        } else {
+            children.push_back(implicitCastIfNecessary(sourceChildren[idx], targetField.getType()));
+        }
+        fieldNames.push_back(targetField.getName());
+    }
+    auto result =
+        bindScalarFunctionExpression(children, StructPackFunctions::name, std::move(fieldNames));
+    if (ConstantExpressionVisitor::needFold(*result)) {
+        return tryFoldExpression(result);
+    }
+    return result;
 }
 
 // cast without implicit checking.

@@ -1,7 +1,10 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <thread>
+#include <vector>
 
 #include "common/constants.h"
 #include "common/system_config.h"
@@ -14,6 +17,8 @@
 #include "storage/buffer_manager/spiller.h"
 #include "storage/buffer_manager/vm_region.h"
 #include "storage/enums/residency_state.h"
+#include "storage/shadow_file.h"
+#include "storage/shadow_utils.h"
 #include "storage/storage_manager.h"
 #include "storage/table/chunked_node_group.h"
 #include "storage/table/column_chunk.h"
@@ -345,6 +350,219 @@ TEST_F(EmptyBufferManagerTest, SpilledBufferIsNotKeptForReuse) {
     ASSERT_EQ(memorySpilled.memoryFreed, MemoryManager::REUSABLE_BUFFER_SIZE);
     ASSERT_EQ(mm->getNumReusableBuffers(), 0u);
 }
+
+#if !defined(__SINGLE_THREADED__)
+// The lock of a page (its LOCKED state) belongs to the thread that took it until that thread
+// releases it. Functions that take the lock of a page they were not asked to pin have to wait for
+// the owner instead of taking the lock over, otherwise two threads would be using the page and the
+// first one to finish releases a lock the other still relies on.
+class PageLatchTest : public EmptyBufferManagerTest {
+public:
+    static constexpr uint64_t NUM_HOLDS = 100000;
+    static constexpr uint64_t CHECKS_PER_HOLD = 50;
+
+    FileHandle* createFileWithOnePage(uint8_t fill) {
+        auto* bm = getBufferManager(*database);
+        auto* context = getClientContext(*conn);
+        fh = bm->getFileHandle(databasePath + ".pagelatch",
+            FileHandle::O_PERSISTENT_FILE_CREATE_NOT_EXISTS, getFileSystem(*database), context);
+        pageIdx = fh->addNewPage();
+        std::vector<uint8_t> content(RIAG_PAGE_SIZE, fill);
+        fh->writePageToFile(content.data(), pageIdx);
+        return fh;
+    }
+
+    // Pins the page NUM_HOLDS times. While a pin is held the page has to stay LOCKED, and the
+    // frame must keep what the owner wrote into it. Anything else means that another thread took
+    // the lock, and maybe the frame, away from the owner.
+    void holdPageRepeatedly(std::atomic<bool>& violated) {
+        for (auto i = 0u; i < NUM_HOLDS && !violated.load(); i++) {
+            auto* frame = fh->pinPage(pageIdx, PageReadPolicy::READ_PAGE);
+            const auto stamp = static_cast<uint8_t>(i);
+            frame[0] = stamp;
+            for (auto j = 0u; j < CHECKS_PER_HOLD; j++) {
+                if (fh->getPageState(pageIdx)->getState() != PageState::LOCKED ||
+                    frame[0] != stamp) {
+                    violated.store(true);
+                }
+            }
+            fh->unpinPage(pageIdx);
+        }
+    }
+
+    FileHandle* fh = nullptr;
+    page_idx_t pageIdx = INVALID_PAGE_IDX;
+};
+
+// updateFrameIfPageIsInFrame is used by a checkpoint while read transactions are running. A reader
+// that loads an evicted page holds the lock of the page until it is done loading it.
+TEST_F(PageLatchTest, UpdateFrameWaitsForPinnedPage) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    createFileWithOnePage(0x5A);
+    auto* bm = getBufferManager(*database);
+    std::vector<uint8_t> newPage(RIAG_PAGE_SIZE, 0xCD);
+    std::atomic<bool> violated{false};
+    std::atomic<bool> holderDone{false};
+    std::thread holder([&]() {
+        holdPageRepeatedly(violated);
+        holderDone.store(true);
+    });
+    std::thread updater([&]() {
+        while (!holderDone.load()) {
+            bm->updateFrameIfPageIsInFrame(fh->getFileIndex(), newPage.data(), pageIdx);
+        }
+    });
+    holder.join();
+    updater.join();
+    ASSERT_FALSE(violated.load()) << "The page was updated while another thread had it locked";
+}
+
+// removePageFromFrame does not expect the page to be locked, but eviction and loading threads
+// lock pages that nobody asked them to leave alone.
+TEST_F(PageLatchTest, RemovePageFromFrameWaitsForPinnedPage) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    createFileWithOnePage(0x5A);
+    std::atomic<bool> violated{false};
+    std::atomic<bool> holderDone{false};
+    std::thread holder([&]() {
+        holdPageRepeatedly(violated);
+        holderDone.store(true);
+    });
+    std::thread remover([&]() {
+        while (!holderDone.load()) {
+            fh->removePageFromFrameIfNecessary(pageIdx);
+        }
+    });
+    holder.join();
+    remover.join();
+    ASSERT_FALSE(violated.load()) << "The page was removed while another thread had it locked";
+}
+
+// The path of a reader that finds the page evicted: it pins the page, reads it and unpins it, all
+// inside optimisticRead. The page has to be consistent whichever of the readers and updaters win.
+TEST_F(PageLatchTest, OptimisticReadOfEvictedPageWithConcurrentUpdateAndRemove) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    createFileWithOnePage(0x5A);
+    auto* bm = getBufferManager(*database);
+    std::vector<uint8_t> newPage(RIAG_PAGE_SIZE, 0xCD);
+    std::atomic<bool> badRead{false};
+    std::atomic<bool> readerDone{false};
+    std::thread reader([&]() {
+        std::vector<uint8_t> copy(RIAG_PAGE_SIZE);
+        for (auto i = 0u; i < NUM_HOLDS / 200 && !badRead.load(); i++) {
+            fh->removePageFromFrameIfNecessary(pageIdx);
+            fh->optimisticReadPage(pageIdx,
+                [&](const uint8_t* frame) { memcpy(copy.data(), frame, RIAG_PAGE_SIZE); });
+            // The page is either the one on disk or the one from the update.
+            const auto expected = copy[0];
+            if ((expected != 0x5A && expected != 0xCD) ||
+                std::any_of(copy.begin(), copy.end(), [&](auto b) { return b != expected; })) {
+                badRead.store(true);
+            }
+        }
+        readerDone.store(true);
+    });
+    std::thread updater([&]() {
+        while (!readerDone.load()) {
+            bm->updateFrameIfPageIsInFrame(fh->getFileIndex(), newPage.data(), pageIdx);
+            // Updates change the version of the page, which makes the reader read it again.
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+    });
+    std::thread remover([&]() {
+        // Every removal makes the next reader load the page again, which adds an entry to the
+        // eviction queue, so removals are spaced out to stay far below its capacity.
+        while (!readerDone.load()) {
+            fh->removePageFromFrameIfNecessary(pageIdx);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    });
+    reader.join();
+    updater.join();
+    remover.join();
+    ASSERT_FALSE(badRead.load());
+}
+
+// An optimistic read that passes its version re-check must have read one version of the page: the
+// writer fills the whole page with one stamp per pin, so a validated copy holding two different
+// bytes is a torn read. The re-check only catches this if the frame loads cannot be satisfied after
+// it and the writer's stores cannot become visible before its lock (the fences in PageState). On
+// x86 neither reordering happens in hardware, so there this test guards the protocol (the version
+// re-check and its retry) rather than the fences; on a weakly ordered CPU (ARM) it can also catch a
+// missing fence, though not reliably.
+TEST_F(PageLatchTest, OptimisticReadNeverValidatesATornPage) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    createFileWithOnePage(0x5A);
+    constexpr uint64_t numWrites = 20000;
+    constexpr auto numReaders = 2u;
+    std::atomic<bool> writerDone{false};
+    std::atomic<uint64_t> numTornReads{0};
+    std::atomic<uint64_t> numReads{0};
+    std::thread writer([&]() {
+        for (auto i = 0u; i < numWrites; i++) {
+            auto* frame = fh->pinPage(pageIdx, PageReadPolicy::READ_PAGE);
+            memset(frame, static_cast<uint8_t>(i), RIAG_PAGE_SIZE);
+            fh->getPageState(pageIdx)->setDirty();
+            fh->unpinPage(pageIdx);
+        }
+        writerDone.store(true);
+    });
+    std::vector<std::thread> readers;
+    for (auto r = 0u; r < numReaders; r++) {
+        readers.emplace_back([&]() {
+            std::vector<uint8_t> copy(RIAG_PAGE_SIZE);
+            while (!writerDone.load()) {
+                fh->optimisticReadPage(pageIdx,
+                    [&](const uint8_t* frame) { memcpy(copy.data(), frame, RIAG_PAGE_SIZE); });
+                const auto stamp = copy[0];
+                if (std::any_of(copy.begin(), copy.end(), [&](auto b) { return b != stamp; })) {
+                    numTornReads.fetch_add(1);
+                }
+                numReads.fetch_add(1);
+            }
+        });
+    }
+    writer.join();
+    for (auto& reader : readers) {
+        reader.join();
+    }
+    ASSERT_EQ(numTornReads.load(), 0u) << "of " << numReads.load() << " validated reads";
+}
+
+// A shadow page is pinned (locked) before the original page is read into it. When that read fails
+// the caller never receives the pin, so it has to be released: the rollback of a failed checkpoint
+// removes the shadow page from its frame and waits for the lock.
+TEST_F(PageLatchTest, FailedShadowPageCreationDoesNotLeaveShadowPageLocked) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    createFileWithOnePage(0x5A);
+    // A page past the end of the file: reading it fails.
+    const auto unreadablePage = fh->getNumPages();
+    auto& shadowFile = StorageManager::Get(*getClientContext(*conn))->getShadowFile();
+    const auto savepoint = shadowFile.createSavepoint();
+    ASSERT_THROW(ShadowUtils::createShadowVersionIfNecessaryAndPinPage(unreadablePage,
+                     false /* skipReadingOriginalPage */, *fh, shadowFile),
+        Exception);
+    const auto shadowPage = savepoint + 1;
+    auto& shadowFH = shadowFile.getShadowingFH();
+    const auto state = shadowFH.getPageState(shadowPage)->getState();
+    if (state == PageState::LOCKED) {
+        // Do not leave the page locked for the rollback and the teardown of the test.
+        shadowFH.unpinPage(shadowPage);
+    }
+    ASSERT_NE(state, PageState::LOCKED);
+    shadowFile.rollbackToSavepoint(savepoint);
+}
+#endif
 
 } // namespace testing
 } // namespace riag

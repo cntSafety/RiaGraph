@@ -104,21 +104,30 @@ scalar_func_exec_t getExecFunc(const binder::expression_vector& expr) {
     return execFunc;
 }
 
+// The parameter types of the bind data are the types the binder casts the arguments to, and the
+// execution functions read every argument as STRING: they must be the declared types, never the
+// types of the arguments, so a non-STRING argument is cast as for the other regexp functions.
 std::unique_ptr<FunctionBindData> bindFunc(ScalarBindFuncInput input) {
     auto definition = input.definition->ptrCast<ScalarFunction>();
     re2_replace_func_t replaceFunc = bindReplaceFunc(input.arguments);
-    if (input.arguments[1]->expressionType == ExpressionType::LITERAL) {
-        definition->execFunc = getExecFunc<RegexpReplaceStaticPattern>(input.arguments);
-        auto value = evaluator::ExpressionEvaluatorUtils::evaluateConstantExpression(
-            input.arguments[1], input.context);
-        return std::make_unique<RegexReplaceBindDataStaticPattern>(
-            binder::ExpressionUtil::getDataTypes(input.arguments), std::move(replaceFunc),
-            BaseRegexpOperation::parseCypherPattern(value.getValue<std::string>()));
-    } else {
-        definition->execFunc = getExecFunc<RegexpReplace>(input.arguments);
-        return std::make_unique<RegexReplaceBindData>(
-            binder::ExpressionUtil::getDataTypes(input.arguments), std::move(replaceFunc));
+    auto paramTypes = logical_type_vec_t{};
+    for (auto typeID : definition->parameterTypeIDs) {
+        paramTypes.push_back(LogicalType(typeID));
     }
+    const auto& pattern = input.arguments[1];
+    if (pattern->expressionType == ExpressionType::LITERAL &&
+        pattern->getDataType().getLogicalTypeID() == LogicalTypeID::STRING) {
+        auto value =
+            evaluator::ExpressionEvaluatorUtils::evaluateConstantExpression(pattern, input.context);
+        if (!value.isNull()) {
+            definition->execFunc = getExecFunc<RegexpReplaceStaticPattern>(input.arguments);
+            return std::make_unique<RegexReplaceBindDataStaticPattern>(std::move(paramTypes),
+                std::move(replaceFunc),
+                BaseRegexpOperation::parseCypherPattern(value.getValue<std::string>()));
+        }
+    }
+    definition->execFunc = getExecFunc<RegexpReplace>(input.arguments);
+    return std::make_unique<RegexReplaceBindData>(std::move(paramTypes), std::move(replaceFunc));
 }
 
 function_set RegexpReplaceFunction::getFunctionSet() {

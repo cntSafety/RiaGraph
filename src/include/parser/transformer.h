@@ -3,13 +3,19 @@
 // ANTLR4 generates code with unused parameters.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
+// The ASSERT keyword gives the generated contexts an ASSERT() accessor, which the ASSERT(condition)
+// macro of common/assert.h would expand. Push/pop to keep the fix local.
+#pragma push_macro("ASSERT")
+#undef ASSERT
 #include "cypher_parser.h"
+#pragma pop_macro("ASSERT")
 #pragma GCC diagnostic pop
 
 #include "common/enums/conflict_action.h"
 #include "extension/transformer_extension.h"
 #include "parser/ddl/create_table_info.h"
 #include "parser/ddl/parsed_property_definition.h"
+#include "parser/namespace_selector.h"
 #include "statement.h"
 
 namespace riag {
@@ -48,6 +54,10 @@ public:
 
     std::unique_ptr<Statement> transformStatement(CypherParser::OC_StatementContext& ctx);
     std::unique_ptr<Statement> transformAnalyze(CypherParser::IC_AnalyzeContext& ctx);
+    std::unique_ptr<Statement> transformNamespaceStatement(
+        CypherParser::IC_NamespaceStatementContext& ctx);
+    NamespaceSelector transformNamespaceList(CypherParser::IC_NamespaceListContext& ctx);
+    NamespaceMove transformNamespaceMove(CypherParser::OC_SetItemContext& ctx);
 
     std::unique_ptr<ParsedExpression> transformWhere(CypherParser::OC_WhereContext& ctx);
 
@@ -95,6 +105,7 @@ public:
     std::vector<YieldVariable> transformYieldVariables(CypherParser::OC_YieldItemsContext& ctx);
     std::unique_ptr<ReadingClause> transformInQueryCall(CypherParser::IC_InQueryCallContext& ctx);
     std::unique_ptr<ReadingClause> transformLoadFrom(CypherParser::IC_LoadFromContext& ctx);
+    std::unique_ptr<ReadingClause> transformAssert(CypherParser::IC_AssertContext& ctx);
     std::shared_ptr<JoinHintNode> transformJoinHint(CypherParser::IC_JoinNodeContext& ctx);
 
     // Transform projection.
@@ -152,6 +163,9 @@ public:
     std::unique_ptr<ParsedExpression> transformStringOperatorExpression(
         CypherParser::OC_StringOperatorExpressionContext& ctx,
         std::unique_ptr<ParsedExpression> propertyExpression);
+    std::unique_ptr<ParsedExpression> transformListPredicateExpression(
+        CypherParser::OC_ListPredicateExpressionContext& ctx,
+        std::unique_ptr<ParsedExpression> childExpression);
     std::unique_ptr<ParsedExpression> transformListOperatorExpression(
         CypherParser::OC_ListOperatorExpressionContext& ctx,
         std::unique_ptr<ParsedExpression> childExpression);

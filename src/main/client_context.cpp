@@ -66,6 +66,33 @@ struct InternalCatalogFlagGuard {
 private:
     ClientContext& context;
 };
+
+bool namespacePlanStale(const CachedPreparedStatement& statement, const ClientContext& context) {
+    const auto dependency = statement.namespaceCatalogPlanVersion;
+    if (dependency == 0) {
+        return false;
+    }
+    const auto* owner = Catalog::Get(context);
+    if (statement.namespaceCatalogName != owner->getCatalogName()) {
+        return true;
+    }
+    const auto* transaction = TransactionContext::Get(context)->getActiveTransaction();
+    if (transaction && statement.bindTransactionID != 0 &&
+        statement.bindTransactionID == transaction->getID()) {
+        // Bound in the transaction it runs in, as every statement of query() is: binding read
+        // this transaction's snapshot, so schema changes committed by other connections since
+        // the dependency was captured are visible to neither. The dependency is captured before
+        // the binding snapshot opens and so may lag it; comparing it here would refuse a current
+        // plan, again on every rebind while another connection keeps committing DDL.
+        return false;
+    }
+    if (dependency >= Transaction::START_TRANSACTION_ID) {
+        // A plan bound against an explicit snapshot must be rebound when that
+        // snapshot ends, even if another writer advanced the version before bind.
+        return !transaction || dependency != transaction->getID();
+    }
+    return dependency != owner->getPlanVersion() + 1;
+}
 } // namespace
 
 ActiveQuery::ActiveQuery() : interrupted{false} {}
@@ -251,7 +278,8 @@ void ClientContext::addDBDirToFileSearchPath(const std::string& dbPath) {
     if (dirPath.empty()) {
         dirPath = expandedPath[slashPos] == '\\' ? "\\" : "/";
     } else {
-        dirPath = std::filesystem::absolute(dirPath).lexically_normal().string();
+        dirPath = FileSystem::pathToUTF8(
+            std::filesystem::absolute(FileSystem::pathFromUTF8(dirPath)).lexically_normal());
     }
     // Prepend to fileSearchPath if not already present
     auto& fileSearchPath = clientConfig.fileSearchPath;
@@ -414,7 +442,9 @@ std::unique_ptr<QueryResult> ClientContext::executeWithParams(PreparedStatement*
     // LCOV_EXCL_STOP
     auto cachedStatement = cachedPreparedStatementManager->getCachedStatement(name);
     const bool planStale =
-        cachedStatement->planVersion != localDatabase->getCatalog()->getPlanVersion();
+        cachedStatement->planVersion != localDatabase->getCatalog()->getPlanVersion() ||
+        cachedStatement->namespaceSelectionGeneration != getNamespaceSelectionGeneration() ||
+        namespacePlanStale(*cachedStatement, *this);
     // Statements with parameters baked into a plan (e.g. parameter-valued SKIP/LIMIT
     // frozen to uint64_t) must rebind/replan on every execution instead of reusing any
     // riag-rename:skip-next upstream provenance
@@ -422,41 +452,57 @@ std::unique_ptr<QueryResult> ClientContext::executeWithParams(PreparedStatement*
     // Likewise, a catalog change (e.g. ALTER TABLE ADD) or a checkpoint that renumbered column
     // riag-rename:skip-next upstream provenance
     // IDs invalidates the bound logical plan (https://github.com/LadybugDB/ladybug/issues/1158).
-    if (useCachedPlan && !cachedStatement->hasBakedParameters && !planStale) {
-        return executeNoLock(preparedStatement, cachedStatement, queryID, {}, true);
-    }
-    // rebind
-    auto [newPreparedStatement, newCachedStatement] =
-        prepareNoLock(cachedStatement->parsedStatement, false /*shouldCommitNewTransaction*/,
-            preparedStatement->parameterMap);
-    useInternalCatalogEntry_ = false;
-    if (newPreparedStatement->isSuccess()) {
-        // Refresh the manager entry after every rebind: bindParametersNoLock has already stored
-        // the new parameter values and types, and the cached plan must match them. Later
-        // executions with the same types reuse it instead of rebinding. This includes the first
-        // execution of a statement prepared without parameter values, as the C API prepares, and
-        // a stale plan after a catalog change or a checkpoint that renumbered column IDs. The
-        // physical-plan cache is cleared; executeNoLock below rebuilds and repopulates it from
-        // the fresh logical plan.
-        preparedStatement->unknownParametersBound = true;
-        cachedStatement->logicalPlan = std::move(newCachedStatement->logicalPlan);
-        cachedStatement->columns = std::move(newCachedStatement->columns);
-        cachedStatement->columnNames = std::move(newCachedStatement->columnNames);
-        cachedStatement->boundParameters = std::move(newCachedStatement->boundParameters);
-        cachedStatement->hasBakedParameters = newCachedStatement->hasBakedParameters;
-        cachedStatement->planVersion = newCachedStatement->planVersion;
-        cachedStatement->physicalPlanCache.reset();
-        cachedStatement->sinkResultSetDescriptors.clear();
-        // The pool holds operator trees cloned from the previous template (bound for the
-        // previous parameter types / catalog version). They reference stale evaluators and
-        // descriptors and must not be served for the rebound plan.
-        {
-            std::lock_guard poolLock{cachedStatement->physicalPlanPoolMutex};
-            cachedStatement->physicalPlanPool.clear();
+    auto rebindAndExecute = [&]() -> std::unique_ptr<QueryResult> {
+        auto [newPreparedStatement, newCachedStatement] =
+            prepareNoLock(cachedStatement->parsedStatement, false /*shouldCommitNewTransaction*/,
+                preparedStatement->parameterMap);
+        useInternalCatalogEntry_ = false;
+        if (newPreparedStatement->isSuccess()) {
+            // Refresh the manager entry after every rebind: bindParametersNoLock has already stored
+            // the new parameter values and types, and the cached plan must match them. Later
+            // executions with the same types reuse it instead of rebinding. This includes the first
+            // execution of a statement prepared without parameter values, as the C API prepares,
+            // and a stale plan after a catalog change or a checkpoint that renumbered column IDs.
+            // The physical-plan cache is cleared; executeNoLock below rebuilds and repopulates it
+            // from the fresh logical plan.
+            preparedStatement->unknownParametersBound = true;
+            cachedStatement->logicalPlan = std::move(newCachedStatement->logicalPlan);
+            cachedStatement->columns = std::move(newCachedStatement->columns);
+            cachedStatement->columnNames = std::move(newCachedStatement->columnNames);
+            cachedStatement->boundParameters = std::move(newCachedStatement->boundParameters);
+            cachedStatement->hasBakedParameters = newCachedStatement->hasBakedParameters;
+            cachedStatement->planVersion = newCachedStatement->planVersion;
+            cachedStatement->namespaceSelectionGeneration =
+                newCachedStatement->namespaceSelectionGeneration;
+            cachedStatement->namespaceCatalogName = newCachedStatement->namespaceCatalogName;
+            cachedStatement->namespaceCatalogPlanVersion =
+                newCachedStatement->namespaceCatalogPlanVersion;
+            cachedStatement->bindTransactionID = newCachedStatement->bindTransactionID;
+            cachedStatement->physicalPlanCache.reset();
+            cachedStatement->sinkResultSetDescriptors.clear();
+            // The pool holds operator trees cloned from the previous template (bound for the
+            // previous parameter types / catalog version). They reference stale evaluators and
+            // descriptors and must not be served for the rebound plan.
+            {
+                std::lock_guard poolLock{cachedStatement->physicalPlanPoolMutex};
+                cachedStatement->physicalPlanPool.clear();
+            }
+            return executeNoLock(newPreparedStatement.get(), cachedStatement, queryID, {}, true);
         }
-        return executeNoLock(newPreparedStatement.get(), cachedStatement, queryID, {}, true);
+        return executeNoLock(newPreparedStatement.get(), newCachedStatement.get(), queryID, {},
+            true);
+    };
+    rebindStalePlan_ = false;
+    auto result = useCachedPlan && !cachedStatement->hasBakedParameters && !planStale ?
+                      executeNoLock(preparedStatement, cachedStatement, queryID, {}, true) :
+                      rebindAndExecute();
+    // A namespace-dependent plan found stale at transaction start (see executeNoLock).
+    for (auto rebinds = 0u; rebindStalePlan_ && rebinds < MAX_STALE_PLAN_REBINDS; rebinds++) {
+        rebindStalePlan_ = false;
+        result = rebindAndExecute();
     }
-    return executeNoLock(newPreparedStatement.get(), newCachedStatement.get(), queryID, {}, true);
+    rebindStalePlan_ = false;
+    return result;
 }
 
 std::unique_ptr<QueryResult> ClientContext::query(std::string_view query,
@@ -480,8 +526,18 @@ std::unique_ptr<QueryResult> ClientContext::queryNoLock(std::string_view query,
     for (const auto& statement : parsedStatements) {
         auto [preparedStatement, cachedStatement] =
             prepareNoLock(statement, false /*shouldCommitNewTransaction*/);
+        rebindStalePlan_ = false;
         auto currentQueryResult =
             executeNoLock(preparedStatement.get(), cachedStatement.get(), queryID, config, false);
+        for (auto rebinds = 0u; rebindStalePlan_ && rebinds < MAX_STALE_PLAN_REBINDS; rebinds++) {
+            rebindStalePlan_ = false;
+            auto rebound = prepareNoLock(statement, false /*shouldCommitNewTransaction*/);
+            preparedStatement = std::move(rebound.preparedStatement);
+            cachedStatement = std::move(rebound.cachedPreparedStatement);
+            currentQueryResult = executeNoLock(preparedStatement.get(), cachedStatement.get(),
+                queryID, config, false);
+        }
+        rebindStalePlan_ = false;
         if (!currentQueryResult->isSuccess()) {
             if (!lastResult) {
                 queryResult = std::move(currentQueryResult);
@@ -587,6 +643,21 @@ ClientContext::PrepareResult ClientContext::prepareNoLock(
     auto prepareTimer = TimeMetric(true /* enable */);
     prepareTimer.start();
     try {
+        const auto* namespaceOwner = Catalog::Get(*this);
+        if (getNamespaceSelectionOwner() && getNamespaceSelectionOwner() != namespaceOwner) {
+            // DROP GRAPH can select main implicitly. Normalize its old selection
+            // before capturing dependencies for this statement's binding.
+            resetNamespaceSelection();
+        }
+        // Capture before opening the binding snapshot. A concurrent namespace
+        // promotion during preparation must never validate an older constant fold.
+        cachedStatement->planVersion = localDatabase->getCatalog()->getPlanVersion();
+        cachedStatement->namespaceSelectionGeneration = getNamespaceSelectionGeneration();
+        if (namespaceOwner->getNamespaces() || namespaceOwner != localDatabase->getCatalog() ||
+            getNamespaceSelectionOwner()) {
+            cachedStatement->namespaceCatalogName = namespaceOwner->getCatalogName();
+            cachedStatement->namespaceCatalogPlanVersion = namespaceOwner->getPlanVersion() + 1;
+        }
         preparedStatement->preparedSummary.statementType = parsedStatement->getStatementType();
         auto readWriteAnalyzer = StatementReadWriteAnalyzer(this);
         TransactionHelper::runFuncInTransaction(
@@ -594,10 +665,26 @@ ClientContext::PrepareResult ClientContext::prepareNoLock(
             true /* readOnly */, false /* */,
             TransactionHelper::TransactionCommitAction::COMMIT_IF_NEW);
         preparedStatement->readOnly = readWriteAnalyzer.isReadOnly();
-        validateTransaction(preparedStatement->readOnly, parsedStatement->requireTransaction());
+        try {
+            validateTransaction(preparedStatement->readOnly, parsedStatement->requireTransaction());
+        } catch (std::exception&) {
+            // A statement refused in an explicit transaction (a write in a read-only transaction)
+            // aborts it like any other error does inside runFuncInTransaction. Without an active
+            // transaction (auto mode) this is a no-op.
+            transactionContext->rollback();
+            throw;
+        }
         TransactionHelper::runFuncInTransaction(
             *transactionContext,
             [&]() -> void {
+                if (const auto* transaction = transactionContext->getActiveTransaction()) {
+                    cachedStatement->bindTransactionID = transaction->getID();
+                }
+                if (!transactionContext->isAutoTransaction() &&
+                    cachedStatement->namespaceCatalogPlanVersion != 0) {
+                    cachedStatement->namespaceCatalogPlanVersion =
+                        transactionContext->getActiveTransaction()->getID();
+                }
                 auto binder = Binder(this, localDatabase->getBinderExtensions());
                 auto expressionBinder = binder.getExpressionBinder();
                 for (auto& [name, value] : inputParams) {
@@ -625,7 +712,6 @@ ClientContext::PrepareResult ClientContext::prepareNoLock(
         preparedStatement->success = false;
         preparedStatement->errMsg = exception.what();
     }
-    cachedStatement->planVersion = localDatabase->getCatalog()->getPlanVersion();
     prepareTimer.stop();
     preparedStatement->preparedSummary.compilingTime =
         parsedStatement->getParsingTime() + prepareTimer.getElapsedTimeMS();
@@ -790,6 +876,29 @@ std::unique_ptr<QueryResult> ClientContext::executeNoLock(PreparedStatement* pre
         TransactionHelper::runFuncInTransaction(
             *transactionContext,
             [&]() -> void {
+                // A prepared statement reuses its plan without passing prepareNoLock, where the
+                // transaction type is first checked, so a write prepared earlier would run inside
+                // a read-only transaction and be discarded at COMMIT. Check again at execution;
+                // runFuncInTransaction rolls the transaction back on the refusal, as on the
+                // prepare path. An auto transaction is always typed to match its statement.
+                if (!transactionContext->isAutoTransaction()) {
+                    validateTransaction(preparedStatement->isReadOnly(),
+                        cachedStatement->parsedStatement->requireTransaction());
+                }
+                // Namespaces are optional: a statement that depends on none (no namespace in
+                // its catalog, no session selection) runs its plan as it did before namespaces
+                // existed, whatever other connections change meanwhile. A namespace-dependent
+                // plan bound in an earlier auto transaction must not run against a newer schema;
+                // the caller rebinds it (rebindStalePlan_), in the transaction it then runs in,
+                // so a rebound plan is never stale again. A plan bound in this transaction,
+                // explicit or auto, was bound against this transaction's own snapshot.
+                if (cachedStatement->namespaceSelectionGeneration !=
+                        getNamespaceSelectionGeneration() ||
+                    namespacePlanStale(*cachedStatement, *this)) {
+                    rebindStalePlan_ = transactionContext->isAutoTransaction();
+                    throw RuntimeException("Schema or namespace selection changed while starting "
+                                           "the statement; retry the query.");
+                }
                 const auto profiler = std::make_unique<Profiler>();
                 profiler->enabled = cachedStatement->logicalPlan->isProfile();
                 if (profiler->enabled) {

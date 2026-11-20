@@ -28,10 +28,11 @@ class SetNodeProperty final : public PhysicalOperator {
 
 public:
     SetNodeProperty(std::vector<std::unique_ptr<NodeSetExecutor>> executors,
+        std::vector<std::vector<common::idx_t>> columnsToRefresh,
         std::unique_ptr<PhysicalOperator> child, uint32_t id,
         std::unique_ptr<OPPrintInfo> printInfo)
         : PhysicalOperator{type_, std::move(child), id, std::move(printInfo)},
-          executors{std::move(executors)} {}
+          executors{std::move(executors)}, columnsToRefresh{std::move(columnsToRefresh)} {}
 
     bool isParallel() const override { return false; }
 
@@ -40,12 +41,15 @@ public:
     bool getNextTuplesInternal(ExecutionContext* context) override;
 
     std::unique_ptr<PhysicalOperator> copy() override {
-        return std::make_unique<SetNodeProperty>(copyVector(executors), children[0]->copy(), id,
-            printInfo->copy());
+        return std::make_unique<SetNodeProperty>(copyVector(executors), columnsToRefresh,
+            children[0]->copy(), id, printInfo->copy());
     }
 
 private:
     std::vector<std::unique_ptr<NodeSetExecutor>> executors;
+    // Per executor: the executors whose target property its right-hand side reads. Those are
+    // read again from storage before it runs; see NodeSetExecutor::refreshColumn.
+    std::vector<std::vector<common::idx_t>> columnsToRefresh;
 };
 
 class SetRelProperty final : public PhysicalOperator {
@@ -53,10 +57,11 @@ class SetRelProperty final : public PhysicalOperator {
 
 public:
     SetRelProperty(std::vector<std::unique_ptr<RelSetExecutor>> executors,
+        std::vector<std::vector<common::idx_t>> columnsToRefresh,
         std::unique_ptr<PhysicalOperator> child, uint32_t id,
         std::unique_ptr<OPPrintInfo> printInfo)
         : PhysicalOperator{type_, std::move(child), id, std::move(printInfo)},
-          executors{std::move(executors)} {}
+          executors{std::move(executors)}, columnsToRefresh{std::move(columnsToRefresh)} {}
 
     bool isParallel() const override { return false; }
 
@@ -65,12 +70,15 @@ public:
     bool getNextTuplesInternal(ExecutionContext* context) override;
 
     std::unique_ptr<PhysicalOperator> copy() override {
-        return std::make_unique<SetRelProperty>(copyVector(executors), children[0]->copy(), id,
-            printInfo->copy());
+        return std::make_unique<SetRelProperty>(copyVector(executors), columnsToRefresh,
+            children[0]->copy(), id, printInfo->copy());
     }
 
 private:
     std::vector<std::unique_ptr<RelSetExecutor>> executors;
+    // Per executor: the executors whose target property its right-hand side reads. Those are
+    // read again from storage before it runs; see NodeSetExecutor::refreshColumn.
+    std::vector<std::vector<common::idx_t>> columnsToRefresh;
 };
 
 } // namespace processor

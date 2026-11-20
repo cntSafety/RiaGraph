@@ -1,0 +1,302 @@
+-DATASET CSV empty
+
+--
+
+# cntSafety/RiaGraph#193: a map is keyed by name. Maps combined into one type (list literal,
+# coalesce, CASE, comparison, insert into a STRUCT column) are matched field by field by NAME,
+# never by position. Differing key sets merge to the union of keys (first-occurrence order); a
+# key missing from one map reads as NULL there. (Neo4j omits such keys instead; accepted
+# divergence.)
+
+-CASE MapByNameIssueTable1
+
+-LOG UnwindReorderedKeys
+-STATEMENT UNWIND [{a: 1, b: 2}, {b: 3, a: 4}] AS r RETURN r.a, r.b
+---- 2
+1|2
+4|3
+
+-LOG ListReorderedKeys
+-STATEMENT RETURN [{a: 1, b: 2}, {b: 3, a: 4}]
+---- 1
+[{a: 1, b: 2},{a: 4, b: 3}]
+
+-LOG ListDisjointSingleKeys
+-STATEMENT RETURN [{v: 1}, {w: 2}]
+---- 1
+[{v: 1, w: },{v: , w: 2}]
+
+-LOG ListDisjointKeys
+-STATEMENT RETURN [{a: 1, b: 2}, {c: 3, d: 4}]
+---- 1
+[{a: 1, b: 2, c: , d: },{a: , b: , c: 3, d: 4}]
+
+-LOG ListOfVariables
+-STATEMENT WITH {a: 1, b: 2} AS x, {b: 3, a: 4} AS y RETURN [x, y]
+---- 1
+[{a: 1, b: 2},{a: 4, b: 3}]
+
+-LOG CoalesceReorderedKeys
+-STATEMENT RETURN coalesce(null, {b: 3, a: 4}, {a: 1, b: 2}).a
+---- 1
+4
+-STATEMENT RETURN coalesce(null, {b: 3, a: 4}, {a: 1, b: 2})
+---- 1
+{b: 3, a: 4}
+
+-LOG EqualityReorderedKeys
+-STATEMENT RETURN {a: 1, b: 2} = {b: 2, a: 1}
+---- 1
+True
+-STATEMENT RETURN {a: 1, b: 2} <> {b: 2, a: 1}
+---- 1
+False
+-STATEMENT RETURN {a: 1, b: 2} = {b: 1, a: 2}
+---- 1
+False
+
+-LOG ListEqualityReorderedKeys
+-STATEMENT RETURN [{a: 1, b: 2}] = [{b: 2, a: 1}]
+---- 1
+True
+
+-CASE MapByNameIssueTable2
+
+-LOG UnwindNullField
+-STATEMENT UNWIND [{v: null}, {v: 2}] AS r RETURN r.v
+---- 2
+
+2
+
+-LOG UnwindNullFieldSum
+-STATEMENT UNWIND [{g: 'a', v: null}, {g: 'b', v: 2}] AS r RETURN sum(r.v)
+---- 1
+2
+
+-LOG UnwindReorderedMixedTypes
+-STATEMENT UNWIND [{name: 'alice', age: 30}, {age: 40, name: 'bob'}] AS p RETURN p.name, p.age
+---- 2
+alice|30
+bob|40
+
+-LOG ListSubsetKeys
+-STATEMENT RETURN [{a: 1}, {a: 1, b: 2}]
+---- 1
+[{a: 1, b: },{a: 1, b: 2}]
+
+-LOG InsertReorderedKeys
+-STATEMENT CREATE NODE TABLE T(id INT64, m STRUCT(a INT64, b INT64), PRIMARY KEY(id))
+---- ok
+-STATEMENT CREATE (:T {id: 1, m: {b: 20, a: 10}})
+---- ok
+-STATEMENT CREATE (:T {id: 2, m: {a: 11, b: 21}})
+---- ok
+-STATEMENT CREATE (:T {id: 3, m: {a: 12}})
+---- ok
+-STATEMENT CREATE (:T {id: 4, m: {b: 23}})
+---- ok
+-STATEMENT MATCH (t:T) RETURN t.id, t.m, t.m.a, t.m.b ORDER BY t.id
+---- 4
+1|{a: 10, b: 20}|10|20
+2|{a: 11, b: 21}|11|21
+3|{a: 12, b: }|12|
+4|{a: , b: 23}||23
+-STATEMENT CREATE (:T {id: 5, m: {a: 1, c: 2}})
+---- error(regex)
+^.*STRUCT fields are matched by name\.$
+-STATEMENT CREATE (:T {id: 5, m: {x: 1, y: 2}})
+---- error(regex)
+^.*STRUCT fields are matched by name\.$
+-STATEMENT MATCH (t:T {id: 1}) SET t.m = {b: 200, a: 100}
+---- ok
+-STATEMENT MERGE (t:T {id: 6}) ON CREATE SET t.m = {b: 26, a: 16}
+---- ok
+-STATEMENT MATCH (t:T) WHERE t.id IN [1, 6] RETURN t.id, t.m.a, t.m.b ORDER BY t.id
+---- 2
+1|100|200
+6|16|26
+-STATEMENT MATCH (t:T) WHERE t.m = {b: 21, a: 11} RETURN t.id
+---- 1
+2
+-STATEMENT MATCH (t:T {m: {b: 26, a: 16}}) RETURN t.id
+---- 1
+6
+-STATEMENT UNWIND [{b: 27, a: 17}] AS m CREATE (:T {id: 7, m: m})
+---- ok
+-STATEMENT UNWIND [28] AS v CREATE (:T {id: 8, m: {b: v, a: 18}})
+---- ok
+-STATEMENT UNWIND [29] AS v CREATE (:T {id: 9, m: {b: v}})
+---- ok
+-STATEMENT UNWIND [30] AS v CREATE (:T {id: 10, m: {b: null, a: v}})
+---- ok
+-STATEMENT MATCH (t:T) WHERE t.id >= 7 RETURN t.id, t.m ORDER BY t.id
+---- 4
+7|{a: 17, b: 27}
+8|{a: 18, b: 28}
+9|{a: , b: 29}
+10|{a: 30, b: }
+
+-CASE MapByNameBoundary
+
+-LOG AllNullFields
+-STATEMENT RETURN [{v: null}, {v: null}]
+---- 1
+[{v: },{v: }]
+
+-LOG TypedNullField
+-STATEMENT RETURN [{v: CAST(null AS INT64)}, {v: 2}]
+---- 1
+[{v: },{v: 2}]
+
+-LOG NumericWidening
+-STATEMENT UNWIND [{v: 1}, {v: 2.5}] AS r RETURN r.v
+---- 2
+1.000000
+2.500000
+
+-LOG CaseBranches
+-STATEMENT RETURN CASE WHEN 1 = 2 THEN {a: 1, b: 2} ELSE {b: 3, a: 4} END AS c
+---- 1
+{a: 4, b: 3}
+-STATEMENT RETURN CASE WHEN 1 = 2 THEN {a: 1, b: 2} ELSE {b: 3, a: 4} END.a AS c
+---- 1
+4
+-STATEMENT RETURN CASE WHEN 1 = 1 THEN {a: 1, b: 2} ELSE {b: 3, a: 4} END.a AS c
+---- 1
+1
+-STATEMENT RETURN CASE WHEN 1 = 1 THEN {a: 1} ELSE {a: 2, b: 2} END AS c
+---- 1
+{a: 1, b: }
+
+-LOG SameKeysSameOrder
+-STATEMENT RETURN [{a: 1, b: 'x'}, {a: 2, b: 'y'}]
+---- 1
+[{a: 1, b: x},{a: 2, b: y}]
+
+-CASE MapByNameEquality
+
+# Neo4j 2026.04: maps with different key sets are never equal, a NULL value included.
+-LOG DifferentKeySets
+-STATEMENT RETURN {a: 1} = {a: 1, b: NULL}
+---- 1
+False
+-STATEMENT RETURN {a: 1} <> {a: 1, b: NULL}
+---- 1
+True
+-STATEMENT RETURN {a: 1} = {b: 1}
+---- 1
+False
+-STATEMENT RETURN {a: 1} = {b: 'x'}
+---- 1
+False
+-STATEMENT WITH CAST(NULL AS STRUCT(a INT64)) AS n RETURN n = {a: 1, b: 2}, n <> {a: 1, b: 2}
+---- 1
+|
+
+-LOG NestedReorderedKeys
+-STATEMENT RETURN {a: {x: 1, y: 2}} = {a: {y: 2, x: 1}}
+---- 1
+True
+-STATEMENT RETURN [{a: {x: 1, y: 2}}, {a: {y: 3, x: 4}}]
+---- 1
+[{a: {x: 1, y: 2}},{a: {x: 4, y: 3}}]
+
+-LOG DistinctReorderedKeys
+-STATEMENT UNWIND [{a: 1, b: 2}, {b: 2, a: 1}, {b: 1, a: 2}] AS x RETURN count(DISTINCT x)
+---- 1
+2
+
+-LOG FilterReorderedKeys
+-STATEMENT UNWIND [{a: 1, b: 2}, {b: 3, a: 4}] AS x WITH x WHERE x = {b: 2, a: 1} RETURN x.a
+---- 1
+1
+
+-CASE MapByNameCast
+
+-LOG ExplicitCastByName
+-STATEMENT RETURN CAST({b: 2, a: 1} AS STRUCT(a INT64, b INT64))
+---- 1
+{a: 1, b: 2}
+-STATEMENT RETURN CAST({a: 1} AS STRUCT(a INT64, b INT64))
+---- 1
+{a: 1, b: }
+-STATEMENT RETURN CAST({a: 1, b: 2} AS STRUCT(c INT64, d INT64))
+---- error
+Conversion exception: Unsupported casting function from STRUCT(a INT64, b INT64) to STRUCT(c INT64, d INT64): field a does not exist in the target STRUCT. STRUCT fields are matched by name.
+-STATEMENT RETURN CAST([{a: 1}] AS STRUCT(b INT64)[])
+---- error
+Conversion exception: Unsupported casting function from STRUCT(a INT64) to STRUCT(b INT64): field a does not exist in the target STRUCT. STRUCT fields are matched by name.
+-STATEMENT RETURN CAST([{b: 2, a: 1}] AS STRUCT(a INT64, b INT64)[])
+---- 1
+[{a: 1, b: 2}]
+
+-CASE MapByNameMisc
+
+-LOG VariedListsOfMaps
+-STATEMENT RETURN [{a: 1}, {b: 'x'}, {b: 'y', a: 3}]
+---- 1
+[{a: 1, b: },{a: , b: x},{a: 3, b: y}]
+-STATEMENT UNWIND [{k: 1, l: 'one'}, {l: 'two', k: 2}, {k: 3}, {l: 'four'}] AS r RETURN r.k, r.l
+---- 4
+1|one
+2|two
+3|
+|four
+-STATEMENT RETURN [{x: [1, 2]}, {y: true, x: [3]}]
+---- 1
+[{x: [1,2], y: },{x: [3], y: True}]
+-STATEMENT RETURN size([{a: 1, b: 2}, {b: 3, a: 4}, {c: 5}])
+---- 1
+3
+
+-LOG NonConstantMaps
+-STATEMENT UNWIND [1, 2] AS i RETURN [{v: null, i: i}, {i: i * 10, v: 2}, {w: 'w'}]
+---- 2
+[{v: , i: 1, w: },{v: 2, i: 10, w: },{v: , i: , w: w}]
+[{v: , i: 2, w: },{v: 2, i: 20, w: },{v: , i: , w: w}]
+-STATEMENT UNWIND [1] AS i UNWIND [{a: {x: i, y: null}}, {a: {y: 3, x: 4}}, {a: {z: true}}] AS r RETURN r.a.x, r.a.y, r.a.z
+---- 3
+1||
+4|3|
+||True
+-STATEMENT UNWIND [1] AS i RETURN CASE WHEN i = 1 THEN {a: i} ELSE {b: 'x', a: 2} END AS c
+---- 1
+{a: 1, b: }
+
+-LOG ListFunctionsOfMaps
+-STATEMENT RETURN [{a: 1, b: 2}] + [{b: 3, a: 4}, {c: 5}]
+---- 1
+[{a: 1, b: 2, c: },{a: 4, b: 3, c: },{a: , b: , c: 5}]
+-STATEMENT RETURN list_concat([{a: 1}], [{b: 2}])
+---- 1
+[{a: 1, b: },{a: , b: 2}]
+-STATEMENT RETURN list_append([{a: 1, b: 2}], {b: 3, a: 4})
+---- 1
+[{a: 1, b: 2},{a: 4, b: 3}]
+-STATEMENT RETURN list_prepend([{a: 1}], {b: 3})
+---- 1
+[{a: , b: 3},{a: 1, b: }]
+-STATEMENT RETURN list_has_any([{a: 1, b: 2}], [{b: 2, a: 1}]), list_has_all([{a: 1, b: 2}, {c: 3}], [{c: 3}])
+---- 1
+True|True
+-STATEMENT RETURN list_contains([{a: 1, b: 2}, {b: 3, a: 4}], {b: 3, a: 4})
+---- 1
+True
+
+-LOG CollectComputedMaps
+-STATEMENT UNWIND [1, 2] AS i WITH {k: i, j: i * 10} AS m RETURN collect(m)
+---- 1
+[{k: 1, j: 10},{k: 2, j: 20}]
+
+-LOG UnionAllSameKeyOrder
+-STATEMENT RETURN {a: 1, b: 2} AS m UNION ALL RETURN {a: 3, b: 4} AS m
+---- 2
+{a: 1, b: 2}
+{a: 3, b: 4}
+
+# UNION requires identical column types (as for scalars: RETURN 1 UNION ALL RETURN 2.5 is an
+# error too). Maps with another key order used to be mixed up by position; now it is an error.
+-LOG UnionAllReorderedKeys
+-STATEMENT RETURN {a: 1, b: 2} AS m UNION ALL RETURN {b: 3, a: 4} AS m
+---- error(regex)
+^Binder exception: .*STRUCT\(a INT64, b INT64\).*$

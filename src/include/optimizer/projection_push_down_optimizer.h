@@ -34,6 +34,7 @@ private:
     void visitExtend(planner::LogicalOperator* op) override;
     void visitAccumulate(planner::LogicalOperator* op) override;
     void visitFilter(planner::LogicalOperator* op) override;
+    void visitAssert(planner::LogicalOperator* op) override;
     void visitNodeLabelFilter(planner::LogicalOperator* op) override;
     void visitHashJoin(planner::LogicalOperator* op) override;
     void visitIndexLookUp(planner::LogicalOperator* op) override;
@@ -44,6 +45,7 @@ private:
     void visitUnwindDeduplicate(planner::LogicalOperator* op) override;
     void visitQueryPrimaryKeyLookup(planner::LogicalOperator* op) override;
     void visitSetProperty(planner::LogicalOperator* op) override;
+    void visitNamespaceMutation(planner::LogicalOperator* op) override;
     void visitInsert(planner::LogicalOperator* op) override;
     void visitDelete(planner::LogicalOperator* op) override;
     void visitMerge(planner::LogicalOperator* op) override;

@@ -9,6 +9,7 @@
 #include "planner/operator/extend/logical_extend.h"
 #include "planner/operator/extend/logical_recursive_extend.h"
 #include "planner/operator/logical_accumulate.h"
+#include "planner/operator/logical_assert.h"
 #include "planner/operator/logical_filter.h"
 #include "planner/operator/logical_hash_join.h"
 #include "planner/operator/logical_intersect.h"
@@ -23,6 +24,7 @@
 #include "planner/operator/persistent/logical_delete.h"
 #include "planner/operator/persistent/logical_insert.h"
 #include "planner/operator/persistent/logical_merge.h"
+#include "planner/operator/persistent/logical_namespace_mutation.h"
 #include "planner/operator/persistent/logical_set.h"
 #include "planner/operator/scan/logical_index_look_up.h"
 #include "planner/operator/scan/logical_query_primary_key_lookup.h"
@@ -99,6 +101,10 @@ void ProjectionPushDownOptimizer::visitAccumulate(LogicalOperator* op) {
 void ProjectionPushDownOptimizer::visitFilter(LogicalOperator* op) {
     auto& filter = op->constCast<LogicalFilter>();
     collectExpressionsInUse(filter.getPredicate());
+}
+
+void ProjectionPushDownOptimizer::visitAssert(LogicalOperator* op) {
+    collectExpressionsInUse(op->constCast<LogicalAssert>().getCondition());
 }
 
 void ProjectionPushDownOptimizer::visitNodeLabelFilter(LogicalOperator* op) {
@@ -261,6 +267,12 @@ void ProjectionPushDownOptimizer::visitDelete(LogicalOperator* op) {
 void ProjectionPushDownOptimizer::visitMerge(LogicalOperator* op) {
     auto& merge = op->constCast<LogicalMerge>();
     collectExpressionsInUse(merge.getExistenceMark());
+    for (const auto& move : merge.onMatchNamespaceMoves) {
+        collectExpressionsInUse(move.entity->getInternalID());
+    }
+    for (const auto& move : merge.onCreateNamespaceMoves) {
+        collectExpressionsInUse(move.entity->getInternalID());
+    }
     for (auto& info : merge.getInsertNodeInfos()) {
         visitInsertInfo(info);
     }
@@ -285,6 +297,12 @@ void ProjectionPushDownOptimizer::visitSetProperty(LogicalOperator* op) {
     auto& set = op->constCast<LogicalSetProperty>();
     for (auto& info : set.getInfos()) {
         visitSetInfo(info);
+    }
+}
+
+void ProjectionPushDownOptimizer::visitNamespaceMutation(LogicalOperator* op) {
+    for (const auto& move : op->constCast<LogicalNamespaceMutation>().moves) {
+        collectExpressionsInUse(move.entity->getInternalID());
     }
 }
 

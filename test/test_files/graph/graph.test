@@ -125,6 +125,18 @@ person|foo1(graph)
 -STATEMENT DROP GRAPH foo1
 ---- ok
 
+-CASE DropGraphAfterCheckpoint
+-LOG DROP GRAPH makes the next checkpoint rewrite the main catalog and metadata. The ranges the
+-LOG previous checkpoint wrote must be freed, or the FSM leak check after this case finds them in use.
+-STATEMENT CREATE GRAPH g_dropcp
+---- ok
+
+-STATEMENT CHECKPOINT
+---- ok
+
+-STATEMENT DROP GRAPH g_dropcp
+---- ok
+
 -CASE MainGraphProtection
 
 -LOG CreateGraphNamedMain

@@ -37,6 +37,12 @@ std::string CatalogEntryTypeUtils::toString(CatalogEntryType type) {
         return "INDEX_ENTRY";
     case CatalogEntryType::GRAPH_ENTRY:
         return "GRAPH_ENTRY";
+    case CatalogEntryType::NAMESPACE_ENTRY:
+        return "NAMESPACE_ENTRY";
+    case CatalogEntryType::NAMESPACE_POLICY_ENTRY:
+        return "NAMESPACE_POLICY_ENTRY";
+    case CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY:
+        return "NAMESPACE_MEMBERSHIP_ENTRY";
     }
     UNREACHABLE_CODE;
 }

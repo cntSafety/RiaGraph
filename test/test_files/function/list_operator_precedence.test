@@ -1,0 +1,69 @@
+-DATASET CSV empty
+
+--
+
+# List subscripts x[i] and slices x[a:b] are postfix operators of the same precedence as property
+# lookups, and bind tighter than IN, the string predicates, IS [NOT] NULL, unary minus and
+# factorial. They used to share one grammar rule with IN, which made `3 IN [1,2,3][1:2]` parse as
+# `(3 IN [1,2,3])[1:2]` and return a substring of 'True'/'False'.
+
+-CASE InBindsLooserThanSubscript
+-STATEMENT RETURN 3 IN [1,2,3][1:2] AS r;
+---- 1
+False
+-STATEMENT RETURN 2 IN [1,2,3][1:2] AS r, typeof(2 IN [1,2,3][1:2]) AS t;
+---- 1
+True|BOOL
+-STATEMENT RETURN 3 IN ([1,2,3][1:2]) AS r;
+---- 1
+False
+-STATEMENT RETURN 3 IN [[1,2,3]][1] AS r;
+---- 1
+True
+-STATEMENT WITH [[1,2,3]] AS list RETURN 3 IN list[1] AS r;
+---- 1
+True
+-STATEMENT WITH [1,2,3] AS list RETURN 3 IN list[2..3] AS a, 1 IN list[2..3] AS b;
+---- 1
+True|False
+-STATEMENT UNWIND [1,2,3] AS x RETURN x, x IN [1,2,3][2:3] AS r;
+---- 3
+1|False
+2|True
+3|True
+-STATEMENT RETURN 1 IN [1] IN [true] AS r;
+---- 1
+True
+
+-CASE SubscriptBeforePredicates
+-STATEMENT RETURN [NULL,2][1] IS NULL AS a, [NULL,2][2] IS NOT NULL AS b;
+---- 1
+True|True
+-STATEMENT RETURN ['abc'][1] STARTS WITH 'a' AS a, ['abc'][1] ENDS WITH 'c' AS b, ['abc'][1] CONTAINS 'b' AS c;
+---- 1
+True|True|True
+-STATEMENT RETURN 'abc' STARTS WITH ['x','a'][2] AS a, 'abc' =~ ['a.*'][1] AS b;
+---- 1
+True|True
+
+-CASE SubscriptAndPropertyLookupChain
+-STATEMENT RETURN [{a:1}][1].a AS r;
+---- 1
+1
+-STATEMENT RETURN {a:[5,6]}.a[2] AS r;
+---- 1
+6
+-STATEMENT RETURN [{a:[{b:7}]}][1].a[1].b AS r;
+---- 1
+7
+
+-CASE SubscriptBindsTighterThanUnaryOperators
+-STATEMENT RETURN -[1,2][2] AS r;
+---- 1
+-2
+-STATEMENT RETURN [3,4][1]! AS r;
+---- 1
+6
+-STATEMENT RETURN -170141183460469231731687303715884105728 AS r;
+---- 1
+-170141183460469231731687303715884105728

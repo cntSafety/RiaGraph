@@ -18,6 +18,8 @@ std::string LogicalOperatorUtils::logicalOperatorTypeToString(LogicalOperatorTyp
         return "ALTER";
     case LogicalOperatorType::ANALYZE:
         return "ANALYZE";
+    case LogicalOperatorType::ASSERT:
+        return "ASSERT";
     case LogicalOperatorType::ATTACH_DATABASE:
         return "ATTACH_DATABASE";
     case LogicalOperatorType::COPY_FROM:
@@ -130,6 +132,10 @@ std::string LogicalOperatorUtils::logicalOperatorTypeToString(LogicalOperatorTyp
         return "CREATE_GRAPH";
     case LogicalOperatorType::USE_GRAPH:
         return "USE_GRAPH";
+    case LogicalOperatorType::NAMESPACE_COMMAND:
+        return "NAMESPACE_COMMAND";
+    case LogicalOperatorType::NAMESPACE_MUTATION:
+        return "NAMESPACE_MUTATION";
     case LogicalOperatorType::CREATE_TYPE:
         return "CREATE_TYPE";
     case LogicalOperatorType::EXTENSION_CLAUSE:
@@ -146,9 +152,13 @@ std::string LogicalOperatorUtils::logicalOperatorTypeToString(LogicalOperatorTyp
 
 bool LogicalOperatorUtils::isUpdate(LogicalOperatorType type) {
     switch (type) {
+    // ASSERT writes nothing, but like a write it must see every row it is given: no optimizer may
+    // skip, narrow or reorder the subtree below it, and joins put its side on the build side.
+    case LogicalOperatorType::ASSERT:
     case LogicalOperatorType::INSERT:
     case LogicalOperatorType::DELETE:
     case LogicalOperatorType::SET_PROPERTY:
+    case LogicalOperatorType::NAMESPACE_MUTATION:
     case LogicalOperatorType::MERGE:
         return true;
     default:
@@ -193,6 +203,34 @@ bool LogicalOperator::hasUpdateRecursive() {
         }
     }
     return false;
+}
+
+// Updates stream: SET, CREATE, MERGE and DELETE apply to exactly the rows their consumer pulls
+// through them. Follow the chain of operators whose input streams into their output. A sink that
+// consumes all of its input before it emits a row ends the search, and so does the build side of a
+// join or cross product (child 1), which runs to completion before its probe side (child 0).
+bool LogicalOperator::hasUpdateInPipeline() const {
+    auto op = this;
+    while (true) {
+        if (LogicalOperatorUtils::isUpdate(op->getOperatorType())) {
+            return true;
+        }
+        switch (op->getOperatorType()) {
+        case LogicalOperatorType::ACCUMULATE:
+        case LogicalOperatorType::AGGREGATE:
+        case LogicalOperatorType::ORDER_BY:
+        case LogicalOperatorType::UNION_ALL:
+        // LimitPushDownOptimizer does not cap a DISTINCT that has an update in its pipeline.
+        case LogicalOperatorType::DISTINCT:
+            return false;
+        default:
+            break;
+        }
+        if (op->getNumChildren() == 0) {
+            return false;
+        }
+        op = op->children[0].get();
+    }
 }
 
 std::string LogicalOperator::toString(uint64_t depth) const {

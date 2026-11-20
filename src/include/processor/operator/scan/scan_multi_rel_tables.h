@@ -102,6 +102,7 @@ private:
     std::unique_ptr<storage::RelTableScanState> scanState;
 
     common::ValueVector* boundNodeIDVector;
+    BoundNodeStateKeeper boundNodeState;
     common::table_id_map_t<RelTableCollectionScanner> scanners;
     RelTableCollectionScanner* currentScanner;
 };

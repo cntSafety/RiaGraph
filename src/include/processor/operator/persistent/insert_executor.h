@@ -1,8 +1,10 @@
 #pragma once
 
+#include "catalog/namespace_catalog.h"
 #include "common/enums/conflict_action.h"
 #include "common/partition_routing.h"
 #include "common/partition_routing_hook.h"
+#include "common/types/value/value.h"
 #include "expression_evaluator/expression_evaluator.h"
 #include "processor/execution_context.h"
 #include "processor/partition_routing.h"
@@ -18,6 +20,7 @@ struct NodeInsertInfo {
     // Column vector pos is invalid if it doesn't need to be projected.
     std::vector<DataPos> columnsPos;
     common::ConflictAction conflictAction;
+    common::namespace_id_t namespaceTarget = common::GLOBAL_NAMESPACE_ID;
 
     common::ValueVector* nodeIDVector = nullptr;
     std::vector<common::ValueVector*> columnVectors;
@@ -35,7 +38,7 @@ struct NodeInsertInfo {
 private:
     NodeInsertInfo(const NodeInsertInfo& other)
         : nodeIDPos{other.nodeIDPos}, columnsPos{other.columnsPos},
-          conflictAction{other.conflictAction} {}
+          conflictAction{other.conflictAction}, namespaceTarget{other.namespaceTarget} {}
 };
 
 // Table level info
@@ -96,14 +99,23 @@ public:
     void setNodeIDVectorToNonNull() const;
     common::nodeID_t insert(main::ClientContext* context);
 
-    // For MERGE, we might need to skip the insert for duplicate input. But still, we need to write
-    // the output vector for later usage.
-    void skipInsert() const;
+    // For MERGE, we skip the insert for input whose pattern an earlier row already created. But
+    // still, we need to write the output vectors (read back from storage) for later usage.
     void skipInsert(common::nodeID_t nodeID, main::ClientContext* context) const;
+    bool namespaceMatches(common::nodeID_t id, const transaction::Transaction* transaction) const;
+    // The stored values of the given columns (indexes into the insert's columns) of a node an
+    // earlier row inserted.
+    std::vector<common::Value> readColumns(common::nodeID_t nodeID,
+        const std::vector<common::idx_t>& columns, main::ClientContext* context) const;
 
 private:
     NodeInsertExecutor(const NodeInsertExecutor& other)
         : info{other.info.copy()}, tableInfo{other.tableInfo.copy()} {}
+
+    // Looks node `nodeID` up into `outputVectors`, which share the state of `idVector`.
+    void lookup(common::nodeID_t nodeID, common::ValueVector* idVector,
+        std::vector<common::column_id_t> columnIDs, std::vector<common::ValueVector*> outputVectors,
+        main::ClientContext* context) const;
 
     bool checkConflict(const transaction::Transaction* transaction,
         storage::NodeTable* table) const;
@@ -123,9 +135,11 @@ private:
 private:
     NodeInsertInfo info;
     NodeTableInsertInfo tableInfo;
+    std::unique_ptr<catalog::NamespaceWriteState> namespaceWriter;
 };
 
 struct RelInsertInfo {
+    common::namespace_id_t namespaceTarget = common::GLOBAL_NAMESPACE_ID;
     DataPos srcNodeIDPos;
     DataPos dstNodeIDPos;
     std::vector<DataPos> columnsPos;
@@ -143,8 +157,9 @@ struct RelInsertInfo {
 
 private:
     RelInsertInfo(const RelInsertInfo& other)
-        : srcNodeIDPos{other.srcNodeIDPos}, dstNodeIDPos{other.dstNodeIDPos},
-          columnsPos{other.columnsPos}, srcNodeIDVector{nullptr}, dstNodeIDVector{nullptr} {}
+        : namespaceTarget{other.namespaceTarget}, srcNodeIDPos{other.srcNodeIDPos},
+          dstNodeIDPos{other.dstNodeIDPos}, columnsPos{other.columnsPos}, srcNodeIDVector{nullptr},
+          dstNodeIDVector{nullptr} {}
 };
 
 struct RelTableInsertInfo {
@@ -176,7 +191,12 @@ public:
     common::internalID_t insert(main::ClientContext* context);
 
     // See comment in NodeInsertExecutor.
-    void skipInsert() const;
+    void skipInsert(common::internalID_t relID, main::ClientContext* context) const;
+    bool namespaceMatches(common::internalID_t id,
+        const transaction::Transaction* transaction) const;
+    // As NodeInsertExecutor::readColumns, for the rel `relID` between the current end nodes.
+    std::vector<common::Value> readColumns(common::internalID_t relID,
+        const std::vector<common::idx_t>& columns, main::ClientContext* context) const;
 
 private:
     RelInsertExecutor(const RelInsertExecutor& other)
@@ -185,6 +205,7 @@ private:
 private:
     RelInsertInfo info;
     RelTableInsertInfo tableInfo;
+    std::unique_ptr<catalog::NamespaceWriteState> namespaceWriter;
 };
 
 } // namespace processor

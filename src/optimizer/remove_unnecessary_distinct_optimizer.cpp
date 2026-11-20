@@ -69,7 +69,7 @@ bool RemoveUnnecessaryDistinctOptimizer::isRedundantDistinct(
             return false;
         }
         auto& property = key->constCast<PropertyExpression>();
-        if (!property.isPrimaryKey() && !property.isInternalID()) {
+        if (!property.isGloballyUniquePrimaryKey() && !property.isInternalID()) {
             return false;
         }
     }

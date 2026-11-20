@@ -69,15 +69,12 @@ bool CastArrayHelper::containsListToArray(const LogicalType& srcType, const Logi
                 ListType::getChildType(dstType));
         }
         case PhysicalTypeID::STRUCT: {
-            auto srcFieldTypes = StructType::getFieldTypes(srcType);
-            auto dstFieldTypes = StructType::getFieldTypes(dstType);
-            if (srcFieldTypes.size() != dstFieldTypes.size()) {
-                throw ConversionException{std::format("Unsupported casting function from {} to {}.",
-                    srcType.toString(), dstType.toString())};
-            }
-
-            for (auto i = 0u; i < srcFieldTypes.size(); i++) {
-                if (containsListToArray(*srcFieldTypes[i], *dstFieldTypes[i])) {
+            // STRUCT fields are cast by name (see resolveNestedVector), so look at the target
+            // field of the same name. A source field without one is reported by the cast itself.
+            for (const auto& srcField : StructType::getFields(srcType)) {
+                if (StructType::hasField(dstType, srcField.getName()) &&
+                    containsListToArray(srcField.getType(),
+                        StructType::getFieldType(dstType, srcField.getName()))) {
                     return true;
                 }
             }
@@ -135,12 +132,16 @@ void CastArrayHelper::validateListEntry(ValueVector* inputVector, const LogicalT
     } break;
     case PhysicalTypeID::STRUCT: {
         if (inputType.getPhysicalType() == PhysicalTypeID::STRUCT) {
+            // Fields are matched by name, as in the cast itself.
             auto fieldVectors = StructVector::getFieldVectors(inputVector);
-            auto fieldTypes = StructType::getFieldTypes(resultType);
-
+            const auto& inputFields = StructType::getFields(inputType);
             auto structEntry = inputVector->getValue<struct_entry_t>(pos);
             for (auto i = 0u; i < fieldVectors.size(); i++) {
-                validateListEntry(fieldVectors[i].get(), *fieldTypes[i], structEntry.pos);
+                const auto& name = inputFields[i].getName();
+                if (StructType::hasField(resultType, name)) {
+                    validateListEntry(fieldVectors[i].get(),
+                        StructType::getFieldType(resultType, name), structEntry.pos);
+                }
             }
         }
     } break;

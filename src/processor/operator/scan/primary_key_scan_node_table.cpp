@@ -3,6 +3,8 @@
 #include <limits>
 
 #include "binder/expression/expression_util.h"
+#include "catalog/catalog.h"
+#include "catalog/namespace_catalog.h"
 #include "processor/execution_context.h"
 
 using namespace riag::common;
@@ -38,6 +40,9 @@ idx_t PrimaryKeyScanSharedState::getTableIdx() {
 void PrimaryKeyScanNodeTable::initLocalStateInternal(ResultSet* resultSet,
     ExecutionContext* context) {
     ScanTable::initLocalStateInternal(resultSet, context);
+    currentRangeTableIdx = 0;
+    rangeOffsets.clear();
+    rangeOffsetCursor = 0;
     auto nodeIDVector = resultSet->getValueVector(opInfo.nodeIDPos).get();
     scanState = std::make_unique<NodeTableScanState>(nodeIDVector, std::vector<ValueVector*>{},
         nodeIDVector->state);
@@ -57,9 +62,15 @@ void PrimaryKeyScanNodeTable::initGlobalStateInternal(ExecutionContext* /*contex
 }
 
 bool PrimaryKeyScanNodeTable::getNextTuplesInternal(ExecutionContext* context) {
-    if (isRange) {
-        return lookupRange(context);
+    if (lookupKind != LookupKind::POINT) {
+        return lookupKind == LookupKind::NAMESPACE_POINT ? lookupPoint<true>(context) :
+                                                           lookupRange(context);
     }
+    return lookupPoint<false>(context);
+}
+
+template<bool NAMESPACE_POINT>
+inline bool PrimaryKeyScanNodeTable::lookupPoint(ExecutionContext* context) {
     auto transaction = transaction::Transaction::Get(*context->clientContext);
     auto tableIdx = sharedState->getTableIdx();
     if (tableIdx >= tableInfos.size()) {
@@ -78,7 +89,15 @@ bool PrimaryKeyScanNodeTable::getNextTuplesInternal(ExecutionContext* context) {
     }
     offset_t nodeOffset = 0;
     auto& table = tableInfo.table->cast<NodeTable>();
-    if (!table.lookupPK(transaction, indexVector, pos, nodeOffset)) {
+    bool found;
+    if constexpr (NAMESPACE_POINT) {
+        DASSERT(tableInfo.namespaceScope && tableInfo.namespaceScope->getSingleton());
+        found = table.lookupPKInNamespace(transaction, indexVector, pos,
+            *tableInfo.namespaceScope->getSingleton(), nodeOffset);
+    } else {
+        found = table.lookupPK(transaction, indexVector, pos, nodeOffset);
+    }
+    if (!found) {
         return false;
     }
     auto nodeID = nodeID_t{nodeOffset, table.getTableID()};
@@ -126,7 +145,12 @@ bool PrimaryKeyScanNodeTable::lookupRange(ExecutionContext* context) {
                 }
             }
             static constexpr auto maxRangeResults = std::numeric_limits<common::idx_t>::max();
+            const NamespaceSet unrestricted;
             const auto found =
+                isIndexEquality && indexName == "_PK" && table.hasLocalPrimaryKey() ?
+                    table.lookupPKInNamespaces(transaction, lowerBoundVector, lowerPos,
+                        tableInfo.namespaceScope ? *tableInfo.namespaceScope : unrestricted,
+                        rangeOffsets) :
                 indexName.empty() ?
                     table.lookupPKRange(transaction, lowerBoundVector, lowerPos, lowerInclusive,
                         upperBoundVector, upperPos, upperInclusive, maxRangeResults, rangeOffsets) :

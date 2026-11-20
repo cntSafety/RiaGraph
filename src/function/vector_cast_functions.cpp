@@ -37,6 +37,29 @@ struct CastChildFunctionExecutor {
 
 static union_field_idx_t findUnionMinCostTag(const LogicalType&, const LogicalType&);
 
+// For a STRUCT -> STRUCT cast, maps each target field to the source field of the same name, or to
+// INVALID_STRUCT_FIELD_IDX when the source has no such field (the target field becomes NULL).
+// Throws if a source field has no counterpart in the target: dropping it would lose a value, and
+// moving it to another key is exactly the positional renaming this mapping exists to prevent.
+static std::vector<struct_field_idx_t> getStructCastFieldMap(const LogicalType& srcType,
+    const LogicalType& dstType) {
+    for (const auto& srcField : StructType::getFields(srcType)) {
+        if (!StructType::hasField(dstType, srcField.getName())) {
+            throw ConversionException{std::format(
+                "Unsupported casting function from {} to {}: field {} does not exist in the "
+                "target STRUCT. STRUCT fields are matched by name.",
+                srcType.toString(), dstType.toString(), srcField.getName())};
+        }
+    }
+    const auto& dstFields = StructType::getFields(dstType);
+    std::vector<struct_field_idx_t> fieldMap;
+    fieldMap.reserve(dstFields.size());
+    for (const auto& dstField : dstFields) {
+        fieldMap.push_back(StructType::getFieldIdx(srcType, dstField.getName()));
+    }
+    return fieldMap;
+}
+
 static void resolveNestedVector(std::shared_ptr<ValueVector> inputVector, ValueVector* resultVector,
     uint64_t numOfEntries, CastFunctionBindData* dataPtr) {
     const auto* inputType = &inputVector->dataType;
@@ -58,9 +81,30 @@ static void resolveNestedVector(std::shared_ptr<ValueVector> inputVector, ValueV
             resultVector = ListVector::getDataVector(resultVector);
             inputType = &inputVector->dataType;
             resultType = &resultVector->dataType;
-        } else if ((inputType->getLogicalTypeID() == LogicalTypeID::STRUCT &&
-                       resultType->getLogicalTypeID() == LogicalTypeID::STRUCT) ||
-                   CastArrayHelper::isUnionSpecialCast(*inputType, *resultType)) {
+        } else if (inputType->getLogicalTypeID() == LogicalTypeID::STRUCT &&
+                   resultType->getLogicalTypeID() == LogicalTypeID::STRUCT) {
+            // A STRUCT is keyed by name: each source field goes to the target field of the same
+            // name (case-insensitive), whatever its position. A target field the source does not
+            // have reads as NULL; a source field the target does not have cannot be placed
+            // anywhere and is an error, so values never end up under another key
+            // (cntSafety/RiaGraph#193).
+            const auto fieldMap = getStructCastFieldMap(*inputType, *resultType);
+            // copy data and nullmask from input
+            memcpy(resultVector->getData(), inputVector->getData(),
+                numOfEntries * resultVector->getNumBytesPerValue());
+            resultVector->setNullFromBits(inputVector->getNullMask().getData(), 0, 0, numOfEntries);
+            auto inputFieldVectors = StructVector::getFieldVectors(inputVector.get());
+            auto resultFieldVectors = StructVector::getFieldVectors(resultVector);
+            for (auto i = 0u; i < resultFieldVectors.size(); i++) {
+                if (fieldMap[i] == INVALID_STRUCT_FIELD_IDX) {
+                    resultFieldVectors[i]->setAllNull();
+                    continue;
+                }
+                resolveNestedVector(inputFieldVectors[fieldMap[i]], resultFieldVectors[i].get(),
+                    numOfEntries, dataPtr);
+            }
+            return;
+        } else if (CastArrayHelper::isUnionSpecialCast(*inputType, *resultType)) {
             // Check if struct type can be cast
             auto errorMsg = std::format("Unsupported casting function from {} to {}.",
                 inputType->toString(), resultType->toString());
@@ -137,7 +181,10 @@ static void resolveNestedVector(std::shared_ptr<ValueVector> inputVector, ValueV
         }
     }
     // non-nested types
-    if (inputType->getLogicalTypeID() != resultType->getLogicalTypeID()) {
+    // The full types are compared, not only their IDs: two DECIMALs of another precision or scale
+    // share the ID but not the scale, and possibly not the physical type, so copying the raw
+    // integers would reinterpret them. They take the cast, CastBetweenDecimal, as a scalar does.
+    if (*inputType != *resultType) {
         auto func = CastFunction::bindCastFunction<CastChildFunctionExecutor>("CAST", *inputType,
             *resultType)
                         ->execFunc;
@@ -202,17 +249,16 @@ static bool hasImplicitCastListToArray(const LogicalType& srcType, const Logical
         ArrayType::getChildType(dstType));
 }
 
+// STRUCT fields are matched by name (see getStructCastFieldMap): every source field must exist in
+// the target and cast implicitly to the target field's type. Target-only fields become NULL.
 static bool hasImplicitCastStruct(const LogicalType& srcType, const LogicalType& dstType) {
-    const auto& srcFields = StructType::getFields(srcType);
-    const auto& dstFields = StructType::getFields(dstType);
-    if (srcFields.size() != dstFields.size()) {
-        return false;
-    }
-    for (auto i = 0u; i < srcFields.size(); i++) {
-        if (srcFields[i].getName() != dstFields[i].getName()) {
+    for (const auto& srcField : StructType::getFields(srcType)) {
+        if (!StructType::hasField(dstType, srcField.getName())) {
             return false;
         }
-        if (!CastFunction::hasImplicitCast(srcFields[i].getType(), dstFields[i].getType())) {
+        const auto& dstFieldType = StructType::getFieldType(dstType, srcField.getName());
+        if (srcField.getType() != dstFieldType &&
+            !CastFunction::hasImplicitCast(srcField.getType(), dstFieldType)) {
             return false;
         }
     }
@@ -457,8 +503,18 @@ static std::unique_ptr<ScalarFunction> bindCastFromStringFunction(const std::str
         throw ConversionException{
             std::format("Unsupported casting function from STRING to {}.", targetType.toString())};
     }
-    return std::make_unique<ScalarFunction>(functionName,
+    auto function = std::make_unique<ScalarFunction>(functionName,
         std::vector<LogicalTypeID>{LogicalTypeID::STRING}, targetType.getLogicalTypeID(), execFunc);
+    // The string executors read the cast options through UnaryCastStringFunctionWrapper, which
+    // downcasts the bind data to CastFunctionBindData. Functions defined on top of this one, such
+    // as TIMESTAMP(), TO_DATE() or BOOL(), have no bindFunc of their own and would otherwise be
+    // handed a plain FunctionBindData. LogicalType is move-only and std::function needs a copyable
+    // target, hence the shared_ptr.
+    function->bindFunc = [resultType = std::make_shared<LogicalType>(targetType.copy())](
+                             const ScalarBindFuncInput&) {
+        return std::make_unique<CastFunctionBindData>(resultType->copy());
+    };
+    return function;
 }
 
 template<typename EXECUTOR = UnaryFunctionExecutor>
@@ -594,6 +650,13 @@ static std::unique_ptr<ScalarFunction> bindCastToStringFunction(const std::strin
         std::vector<LogicalTypeID>{sourceType.getLogicalTypeID()}, LogicalTypeID::STRING, func);
 }
 
+// Any source type that is not numeric or DECIMAL, e.g. a list or a struct, has no cast to DECIMAL.
+[[noreturn]] static void throwUnsupportedDecimalCast(const LogicalType& sourceType,
+    const LogicalType& targetType) {
+    throw ConversionException(std::format("Unsupported casting function from {} to {}.",
+        sourceType.toString(), targetType.toString()));
+}
+
 template<typename DST_TYPE, CastExecutor EXECUTOR>
 static std::unique_ptr<ScalarFunction> bindCastToDecimalFunction(const std::string& functionName,
     const LogicalType& sourceType, const LogicalType& targetType) {
@@ -605,14 +668,14 @@ static std::unique_ptr<ScalarFunction> bindCastToDecimalFunction(const std::stri
                 func = ScalarFunction::UnaryCastExecFunction<T, DST_TYPE, CastBetweenDecimal,
                     EXECUTOR>;
             },
-            [&](auto) { UNREACHABLE_CODE; });
+            [&](auto) { throwUnsupportedDecimalCast(sourceType, targetType); });
     } else {
         TypeUtils::visit(
             sourceType,
             [&]<NumericTypes T>(T) {
                 func = ScalarFunction::UnaryCastExecFunction<T, DST_TYPE, CastToDecimal, EXECUTOR>;
             },
-            [&](auto) { UNREACHABLE_CODE; });
+            [&](auto) { throwUnsupportedDecimalCast(sourceType, targetType); });
     }
     return std::make_unique<ScalarFunction>(functionName,
         std::vector<LogicalTypeID>{sourceType.getLogicalTypeID()}, targetType.getLogicalTypeID(),
@@ -741,6 +804,14 @@ static std::unique_ptr<ScalarFunction> bindCastToUnionFunction(const std::string
         std::vector<LogicalTypeID>{sourceType.getLogicalTypeID()}, targetType.getLogicalTypeID(),
         ScalarFunction::UnaryCastExecFunction<void, void, CastToUnion, UnaryFunctionExecutor,
             UnaryCastUnionFunctionWrapper>);
+    // targetType is captured by reference on purpose. The only place that calls this bindFunc is
+    // castBindFunc, which invokes it right after bindCastFunction returned, while its own
+    // targetType (the one passed in here) is still alive; the ScalarFunction is then dropped, so
+    // the lambda is never stored in a plan or re-bound later. Every other caller of
+    // bindCastFunction, including the innerCast above, uses the execFunc only and never reaches
+    // this lambda. The bind data below owns a copy of the type, which is all that outlives the
+    // bind call. A caller that keeps the function and calls bindFunc after targetType died would
+    // have to capture by value instead.
     castFunc->bindFunc = [minCostTag, innerFunc, &targetType](const ScalarBindFuncInput&) {
         return std::make_unique<CastToUnionBindData>(minCostTag, innerFunc, targetType.copy());
     };
@@ -868,9 +939,11 @@ std::unique_ptr<ScalarFunction> CastFunction::bindCastFunction(const std::string
     }
     case LogicalTypeID::DECIMAL: {
         std::unique_ptr<ScalarFunction> scalarFunc;
+        // A DECIMAL's physical type is always signed (INT16 to INT128), so the unsigned integer
+        // types are not instantiated: the DECIMAL casts range-check against -10^p.
         TypeUtils::visit(
             targetType.getPhysicalType(),
-            [&]<IntegerTypes T>(T) {
+            [&]<SignedIntegerTypes T>(T) {
                 scalarFunc =
                     bindCastToDecimalFunction<T, EXECUTOR>(functionName, sourceType, targetType);
             },
@@ -1171,6 +1244,7 @@ static std::unique_ptr<FunctionBindData> castBindFunc(ScalarBindFuncInput input)
     if (input.arguments[1]->expressionType != ExpressionType::LITERAL) {
         throw BinderException(std::format("Second parameter of CAST function must be a literal."));
     }
+    binder::ExpressionUtil::validateDataType(*input.arguments[1], LogicalTypeID::STRING);
     auto literalExpr = input.arguments[1]->constPtrCast<LiteralExpression>();
     auto targetTypeStr = literalExpr->getValue().getValue<std::string>();
     auto func = input.definition->ptrCast<ScalarFunction>();

@@ -94,6 +94,10 @@ public:
 
     bool isSelfLoop() const { return *srcNode == *dstNode; }
 
+    // A second expression for the same non-recursive rel: same unique name and the same property
+    // expressions, so it binds the same columns, but setDstNode() on it leaves this one alone.
+    std::shared_ptr<RelExpression> copy() const;
+
     std::string detailsToString() const;
 
     // if multiple tables match the pattern

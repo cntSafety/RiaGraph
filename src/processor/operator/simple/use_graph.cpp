@@ -11,6 +11,7 @@ namespace processor {
 void UseGraph::executeInternal(ExecutionContext* context) {
     auto dbManager = main::DatabaseManager::Get(*context->clientContext);
     dbManager->setDefaultGraph(graphName);
+    context->clientContext->resetNamespaceSelection();
     appendMessage("Used graph successfully.", storage::MemoryManager::Get(*context->clientContext));
 }
 

@@ -15,5 +15,9 @@ bool LogicalPlan::hasUpdate() const {
     return lastOperator->hasUpdateRecursive();
 }
 
+bool LogicalPlan::hasUpdateInPipeline() const {
+    return lastOperator != nullptr && lastOperator->hasUpdateInPipeline();
+}
+
 } // namespace planner
 } // namespace riag

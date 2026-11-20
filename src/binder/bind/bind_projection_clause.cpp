@@ -229,6 +229,16 @@ static void validateNestedAggregate(const Expression& expr, const expr_ptr_set& 
     }
 }
 
+expression_vector Binder::getNewAggregateExpressions(
+    const std::shared_ptr<Expression>& expression) {
+    auto scopeExprs = getScopeExprs(scope);
+    auto aggregates = getAggregateExpressions(expression, scopeExprs);
+    for (auto& aggregate : aggregates) {
+        validateNestedAggregate(*aggregate, scopeExprs);
+    }
+    return aggregates;
+}
+
 namespace {
 
 class VariableNameCollector final : public parser::ParsedExpressionVisitor {

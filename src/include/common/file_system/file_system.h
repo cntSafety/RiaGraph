@@ -86,6 +86,14 @@ public:
 
     static std::string getFileName(const std::filesystem::path& path);
 
+    // Paths are UTF-8 std::strings throughout RiaGraph. On Windows, std::filesystem::path's
+    // narrow-string constructor and string() use the process ANSI code page instead, so a path
+    // crossing into or out of std::filesystem goes through these two. pathFromUTF8 throws an
+    // IOException for a string that is not valid UTF-8. Elsewhere they are the plain narrow
+    // conversions.
+    static std::filesystem::path pathFromUTF8(const std::string& utf8Path);
+    static std::string pathToUTF8(const std::filesystem::path& path);
+
     virtual bool canHandleFile(const std::string_view /*path*/) const { UNREACHABLE_CODE; }
 
     virtual void syncFile(const FileInfo& fileInfo) const = 0;

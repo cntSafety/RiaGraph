@@ -2,9 +2,12 @@
 
 #include "common/assert.h"
 #include "common/exception/conversion.h"
+#include "common/exception/overflow.h"
 #include "common/string_utils.h"
 #include "common/types/cast_helpers.h"
 #include "common/types/timestamp_t.h"
+#include "function/arithmetic/add.h"
+#include "function/arithmetic/subtract.h"
 #include "re2.h"
 #include <format>
 
@@ -62,29 +65,26 @@ date_t date_t::operator+(const interval_t& interval) const {
     } else {
         result = *this;
     }
-    if (interval.days != 0) {
-        result.days += interval.days;
-    }
-    if (interval.micros != 0) {
-        result.days += int32_t(interval.micros / Interval::MICROS_PER_DAY);
-    }
-    return result;
+    // Widen to int64_t and range-check the sum as a DATE; a plain int32_t `+=` wrapped silently.
+    int64_t resultDays = result.days;
+    resultDays += interval.days;
+    resultDays += interval.micros / Interval::MICROS_PER_DAY;
+    return Date::fromDaysChecked(resultDays);
 }
 
 date_t date_t::operator-(const interval_t& interval) const {
-    interval_t inverseRight{};
-    inverseRight.months = -interval.months;
-    inverseRight.days = -interval.days;
-    inverseRight.micros = -interval.micros;
-    return *this + inverseRight;
+    return *this + interval.negate();
 }
 
 int64_t date_t::operator-(const date_t& rhs) const {
     return (*this).days - rhs.days;
 }
 
+// A date is compared with a timestamp through the timestamp's own date and time of day instead of
+// converting the date to microseconds: that product overflows for dates near the DATE limits, and
+// a comparison must not throw.
 bool date_t::operator==(const timestamp_t& rhs) const {
-    return Timestamp::fromDateTime(*this, dtime_t(0)).value == rhs.value;
+    return days == Timestamp::getDate(rhs).days && Timestamp::getTime(rhs).micros == 0;
 }
 
 bool date_t::operator!=(const timestamp_t& rhs) const {
@@ -92,7 +92,8 @@ bool date_t::operator!=(const timestamp_t& rhs) const {
 }
 
 bool date_t::operator<(const timestamp_t& rhs) const {
-    return Timestamp::fromDateTime(*this, dtime_t(0)).value < rhs.value;
+    auto rhsDays = Timestamp::getDate(rhs).days;
+    return days < rhsDays || (days == rhsDays && Timestamp::getTime(rhs).micros > 0);
 }
 
 bool date_t::operator<=(const timestamp_t& rhs) const {
@@ -107,12 +108,32 @@ bool date_t::operator>=(const timestamp_t& rhs) const {
     return !(*this < rhs);
 }
 
-date_t date_t::operator+(const int32_t& day) const {
-    return date_t(this->days + day);
-};
-date_t date_t::operator-(const int32_t& day) const {
-    return date_t(this->days - day);
-};
+date_t date_t::operator+(const int64_t& day) const {
+    // Non-const copies: the checked Add specialization only matches plain int64_t&.
+    int64_t lDays = days;
+    int64_t rDays = day;
+    int64_t sum = 0;
+    function::Add::operation(lDays, rDays, sum);
+    return Date::fromDaysChecked(sum);
+}
+
+date_t date_t::operator-(const int64_t& day) const {
+    int64_t lDays = days;
+    int64_t rDays = day;
+    int64_t difference = 0;
+    function::Subtract::operation(lDays, rDays, difference);
+    return Date::fromDaysChecked(difference);
+}
+
+date_t Date::fromDaysChecked(int64_t days) {
+    // The valid DATE range is the one fromDate() accepts: years MIN_YEAR..MAX_YEAR.
+    static const int64_t minDays = Date::fromDate(MIN_YEAR, 1, 1).days;
+    static const int64_t maxDays = Date::fromDate(MAX_YEAR, 12, 31).days;
+    if (days < minDays || days > maxDays) {
+        throw OverflowException(std::format("Value {} is not within DATE range.", days));
+    }
+    return date_t(static_cast<int32_t>(days));
+}
 
 const int32_t Date::NORMAL_DAYS[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 const int32_t Date::LEAP_DAYS[] = {0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
@@ -494,10 +515,6 @@ date_t Date::trunc(DatePartSpecifier specifier, date_t date) {
     default:
         return date;
     }
-}
-
-int64_t Date::getEpochNanoSeconds(const date_t& date) {
-    return ((int64_t)date.days) * (Interval::MICROS_PER_DAY * Interval::NANOS_PER_MICRO);
 }
 
 const regex::RE2& Date::regexPattern() {

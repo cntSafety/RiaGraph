@@ -17,6 +17,14 @@ namespace parser {
 
 std::unique_ptr<Statement> Transformer::transformAlterTable(
     CypherParser::IC_AlterTableContext& ctx) {
+    if (auto* namespaces = ctx.iC_AlterOptions()->iC_AlterNamespaces()) {
+        auto type = namespaces->ADD()    ? AlterType::ADD_NAMESPACES :
+                    namespaces->REMOVE() ? AlterType::REMOVE_NAMESPACES :
+                                           AlterType::SET_NAMESPACES;
+        return std::make_unique<Alter>(AlterInfo{type, transformSchemaName(*ctx.oC_SchemaName()),
+            std::make_unique<ExtraAlterNamespaces>(
+                transformNamespaceList(*namespaces->iC_NamespaceList()))});
+    }
     if (ctx.iC_AlterOptions()->iC_AddProperty()) {
         return transformAddProperty(ctx);
     }
@@ -116,6 +124,10 @@ std::unique_ptr<Statement> Transformer::transformCreateNodeTable(
     auto tableName = transformSchemaName(*ctx.oC_SchemaName());
     auto createTableInfo =
         CreateTableInfo(TableType::NODE, tableName, transformConflictAction(ctx.iC_IfNotExists()));
+    if (ctx.iC_NamespaceScope()) {
+        createTableInfo.namespaceSelector =
+            transformNamespaceList(*ctx.iC_NamespaceScope()->iC_NamespaceList());
+    }
     // If CREATE NODE TABLE AS syntax
     if (ctx.oC_Query()) {
         return std::make_unique<CreateTable>(std::move(createTableInfo),
@@ -130,6 +142,23 @@ std::unique_ptr<Statement> Transformer::transformCreateNodeTable(
         auto partitionInfo = transformPartitionInfo(ctx.iC_PartitionBy());
         createTableInfo.extraInfo = std::make_unique<ExtraCreateNodeTableInfo>(getPKName(ctx),
             std::move(options), std::move(partitionInfo));
+        std::optional<bool> localKey;
+        const auto recordKeyScope = [&](bool local) {
+            if (localKey.has_value() && *localKey != local) {
+                throw ParserException("Conflicting LOCAL/GLOBAL primary key declarations.");
+            }
+            localKey = local;
+        };
+        for (auto* definition : ctx.iC_PropertyDefinitions()->iC_PropertyDefinition()) {
+            if (definition->PRIMARY()) {
+                recordKeyScope(definition->LOCAL() != nullptr);
+            }
+        }
+        if (ctx.iC_CreateNodeConstraint()) {
+            recordKeyScope(ctx.iC_CreateNodeConstraint()->LOCAL() != nullptr);
+        }
+        static_cast<ExtraCreateNodeTableInfo*>(createTableInfo.extraInfo.get())->localPrimaryKey =
+            localKey.value_or(false);
         return std::make_unique<CreateTable>(std::move(createTableInfo));
     }
 }
@@ -161,6 +190,10 @@ std::unique_ptr<Statement> Transformer::transformCreateRelGroup(
             std::move(options));
     auto conflictAction = transformConflictAction(ctx.iC_IfNotExists());
     auto createTableInfo = CreateTableInfo(common::TableType::REL, tableName, conflictAction);
+    if (ctx.iC_NamespaceScope()) {
+        createTableInfo.namespaceSelector =
+            transformNamespaceList(*ctx.iC_NamespaceScope()->iC_NamespaceList());
+    }
     if (ctx.iC_PropertyDefinitions()) {
         createTableInfo.propertyDefinitions =
             transformPropertyDefinitions(*ctx.iC_PropertyDefinitions());

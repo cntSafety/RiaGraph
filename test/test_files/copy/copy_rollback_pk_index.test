@@ -1,0 +1,181 @@
+-DATASET CSV empty
+--
+
+# A COPY that fails on a primary key the table already holds rolls back its rows and their
+# primary-key index entries. The rollback must remove only the entries of the rolled-back rows,
+# never the entry of the pre-existing row with the same key: otherwise that row stays visible to
+# scans but is no longer found by key, and the key can be inserted a second time.
+
+-CASE CopyFailingOnExistingKeyKeepsItsIndexEntry
+-STATEMENT CREATE NODE TABLE foo(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE (:foo {id: 10});
+---- ok
+-STATEMENT COPY foo FROM (UNWIND range(1, 10) AS i RETURN i);
+---- error
+Copy exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (f:foo) RETURN f.id;
+---- 1
+10
+-STATEMENT MATCH (f:foo {id: 10}) RETURN f.id;
+---- 1
+10
+-STATEMENT CREATE (:foo {id: 10});
+---- error
+Runtime exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+-STATEMENT COPY foo FROM (UNWIND range(1, 10) AS i RETURN i);
+---- error
+Copy exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (f:foo) RETURN count(*);
+---- 1
+1
+-STATEMENT CREATE (:foo {id: 1});
+---- ok
+-STATEMENT MATCH (f:foo) RETURN f.id ORDER BY f.id;
+---- 2
+1
+10
+
+-CASE CopyFailingOnExistingStringKeyKeepsItsIndexEntry
+-STATEMENT CREATE NODE TABLE bar(id STRING, v INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE (:bar {id: 'k', v: 0});
+---- ok
+-STATEMENT COPY bar FROM (UNWIND ['a', 'k', 'b'] AS i RETURN i, 1);
+---- error
+Copy exception: Found duplicated primary key value k, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (b:bar {id: 'k'}) RETURN b.v;
+---- 1
+0
+-STATEMENT CREATE (:bar {id: 'k', v: 2});
+---- error
+Runtime exception: Found duplicated primary key value k, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (b:bar) RETURN b.id, b.v;
+---- 1
+k|0
+
+# An in-file duplicate is rolled back as before: both of its rows go, and so do their entries.
+-CASE CopyFailingOnInFileDuplicateKeepsExistingKeys
+-STATEMENT CREATE NODE TABLE baz(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE (:baz {id: 10});
+---- ok
+-STATEMENT COPY baz FROM (UNWIND [1, 2, 1] AS i RETURN i);
+---- error
+Copy exception: Found duplicated primary key value 1, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (b:baz {id: 10}) RETURN b.id;
+---- 1
+10
+-STATEMENT MATCH (b:baz {id: 1}) RETURN b.id;
+---- 0
+-STATEMENT CREATE (:baz {id: 1});
+---- ok
+-STATEMENT CREATE (:baz {id: 2});
+---- ok
+-STATEMENT MATCH (b:baz) RETURN b.id ORDER BY b.id;
+---- 3
+1
+2
+10
+
+-CASE CopyFailingOnExistingKeyInLargeBatch
+-STATEMENT CREATE NODE TABLE big(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE (:big {id: 4000});
+---- ok
+-STATEMENT CREATE (:big {id: 7});
+---- ok
+-STATEMENT COPY big FROM (UNWIND range(1, 5000) AS i RETURN i);
+---- error(regex)
+Copy exception: Found duplicated primary key value (7|4000), which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (b:big) WHERE b.id = 4000 OR b.id = 7 RETURN b.id ORDER BY b.id;
+---- 2
+7
+4000
+-STATEMENT MATCH (b:big {id: 4000}) RETURN b.id;
+---- 1
+4000
+-STATEMENT MATCH (b:big {id: 7}) RETURN b.id;
+---- 1
+7
+-STATEMENT COPY big FROM (UNWIND range(1, 5000) AS i RETURN i);
+---- error(regex)
+Copy exception: Found duplicated primary key value (7|4000), which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (b:big) RETURN count(*);
+---- 1
+2
+
+-CASE CopyFailingOnExistingKeyInExplicitTransaction
+-STATEMENT CREATE NODE TABLE tx(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE (:tx {id: 10});
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+# A COPY, not a CREATE, writes 20: COPY into a table that a CREATE of the same transaction wrote
+# to is refused (copy_transaction_index.test).
+-STATEMENT COPY tx FROM (UNWIND [20] AS i RETURN i);
+---- ok
+-STATEMENT COPY tx FROM (UNWIND range(1, 10) AS i RETURN i);
+---- error
+Copy exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+# The failed COPY rolls the whole transaction back, the first COPY's 20 included.
+-STATEMENT MATCH (t:tx) RETURN t.id;
+---- 1
+10
+-STATEMENT MATCH (t:tx {id: 10}) RETURN t.id;
+---- 1
+10
+-STATEMENT MATCH (t:tx {id: 20}) RETURN t.id;
+---- 0
+-STATEMENT CREATE (:tx {id: 10});
+---- error
+Runtime exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+
+-CASE CopyFailingOnExistingKeyAfterCheckpoint
+-STATEMENT CREATE NODE TABLE ck(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE (:ck {id: 10});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT COPY ck FROM (UNWIND range(1, 10) AS i RETURN i);
+---- error
+Copy exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (c:ck {id: 10}) RETURN c.id;
+---- 1
+10
+-STATEMENT CREATE (:ck {id: 10});
+---- error
+Runtime exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+-RELOADDB
+-STATEMENT MATCH (c:ck {id: 10}) RETURN c.id;
+---- 1
+10
+-STATEMENT MATCH (c:ck) RETURN count(*);
+---- 1
+1
+
+-CASE ArtCopyFailingOnExistingKeyKeepsItsIndexEntry
+-STATEMENT CALL enable_default_hash_index=false;
+---- ok
+-STATEMENT CREATE NODE TABLE art(id INT64, PRIMARY KEY (id));
+---- ok
+-STATEMENT CREATE ART INDEX art_pk FOR (a:art) ON (a.id);
+---- ok
+-STATEMENT CREATE (:art {id: 10});
+---- ok
+-STATEMENT COPY art FROM (UNWIND range(1, 10) AS i RETURN i);
+---- error(regex)
+.*Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+-STATEMENT MATCH (a:art {id: 10}) RETURN a.id;
+---- 1
+10
+-STATEMENT MATCH (a:art) WHERE a.id >= 1 AND a.id <= 10 RETURN a.id;
+---- 1
+10
+-STATEMENT CREATE (:art {id: 10});
+---- error
+Runtime exception: Found duplicated primary key value 10, which violates the uniqueness constraint of the primary key column.
+-STATEMENT CALL enable_default_hash_index=true;
+---- ok

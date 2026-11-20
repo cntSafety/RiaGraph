@@ -4,7 +4,8 @@ add_library(riag_storage_index
         art_index_disk.cpp
         hash_index.cpp
         in_mem_hash_index.cpp
-        index.cpp)
+        index.cpp
+        namespace_primary_key_index.cpp)
 
 set(ALL_OBJECT_FILES
         ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:riag_storage_index>

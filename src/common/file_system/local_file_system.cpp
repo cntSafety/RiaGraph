@@ -31,14 +31,14 @@ namespace riag {
 namespace common {
 
 // File and database paths arrive as UTF-8. std::filesystem::path built from a narrow
-// string decodes per process code page, so convert explicitly on Windows to keep
-// non-ASCII paths working regardless of the process code page.
+// string, and its string(), use the process code page on Windows, so every path crosses into
+// and out of std::filesystem through FileSystem::pathFromUTF8 and FileSystem::pathToUTF8.
 static std::filesystem::path toNativePath(const std::string& utf8Path) {
-#if defined(_WIN32)
-    return std::filesystem::path(std::u8string(utf8Path.begin(), utf8Path.end()));
-#else
-    return std::filesystem::path(utf8Path);
-#endif
+    return FileSystem::pathFromUTF8(utf8Path);
+}
+
+static std::string toUTF8(const std::filesystem::path& path) {
+    return FileSystem::pathToUTF8(path);
 }
 
 LocalFileInfo::~LocalFileInfo() {
@@ -207,6 +207,9 @@ std::vector<std::string> LocalFileSystem::glob(main::ClientContext* context,
     if (path.empty()) {
         return std::vector<std::string>();
     }
+    // glob decodes the pattern as UTF-8 on Windows; reject one that is not with an IOException
+    // here rather than with the standard library's conversion error from inside glob.
+    (void)toNativePath(path);
     std::vector<std::string> pathsToGlob;
     if (path[0] == '/' || (std::isalpha(path[0]) && path[1] == ':')) {
         // Note:
@@ -237,7 +240,7 @@ std::vector<std::string> LocalFileSystem::glob(main::ClientContext* context,
     std::vector<std::string> result;
     for (auto& pathToGlob : pathsToGlob) {
         for (auto& resultPath : glob::glob(pathToGlob)) {
-            result.emplace_back(resultPath.string());
+            result.emplace_back(toUTF8(resultPath));
         }
     }
     return result;
@@ -317,17 +320,17 @@ static bool isAllowedDeletionPath(const std::string& path, const std::string& db
         return false;
     }
 
-    const auto fileName = p.filename().string();
-    const auto extension = p.extension().string();
-    const auto stemWithoutExt = p.stem().string();
+    const auto fileName = toUTF8(p.filename());
+    const auto extension = toUTF8(p.extension());
+    const auto stemWithoutExt = toUTF8(p.stem());
 
-    const auto dbBase = dbPathP.stem().string();
-    const auto dbExt = dbPathP.extension().string();
+    const auto dbBase = toUTF8(dbPathP.stem());
+    const auto dbExt = toUTF8(dbPathP.extension());
     const auto dbFileName = dbBase + dbExt;
 
     // Frozen WALs: <allowed WAL>.checkpoint
     if (extension == ".checkpoint" && p.stem().extension() == ".wal") {
-        return isAllowedDeletionPath((p.parent_path() / p.stem()).string(), dbPath);
+        return isAllowedDeletionPath(toUTF8(p.parent_path() / p.stem()), dbPath);
     }
 
     // Main DB sidecars: db.riag.{wal|shadow|tmp|lock}
@@ -343,9 +346,12 @@ static bool isAllowedDeletionPath(const std::string& path, const std::string& db
                stemWithoutExt.starts_with(dbFileName + ".");
     }
 
-    // Graph DB file: db.<graph>.riag
-    if (extension == dbExt) {
-        return fileName.starts_with(dbBase + ".") && fileName != dbFileName;
+    // Graph DB file: db.<graph>.riag, as StorageUtils::getGraphPath builds it. The child keeps the
+    // database's extension, so for a database path with none ("db") the child is "db.<graph>" and
+    // its own extension is whatever follows the last dot of the name: compare the extension only
+    // when the database has one, and require a non-empty name after "<stem>." otherwise.
+    if (fileName.starts_with(dbBase + ".") && fileName != dbFileName) {
+        return dbExt.empty() ? fileName.size() > dbBase.size() + 1 : extension == dbExt;
     }
 
     return false;

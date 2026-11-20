@@ -1,0 +1,257 @@
+-DATASET CSV empty
+
+--
+
+# RemoveUnnecessaryJoinOptimizer drops an inner hash join whose build side is a bare node scan,
+# e.g. the join that re-matches an already bound node (MATCH (b:T)). The join also removed every
+# row whose join key is NULL, and a bare scan never yields a NULL node ID. The key is NULL when
+# the node was bound by an OPTIONAL MATCH that found nothing, so the row has to go; removing the
+# join kept it. The join may only be removed when the key cannot be NULL.
+
+-CASE RemoveJoinOnNullKey
+-STATEMENT CREATE NODE TABLE T(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE U(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT CREATE REL TABLE RG(FROM T TO T, FROM T TO U);
+---- ok
+-STATEMENT CREATE (:T {id: 0});
+---- ok
+# b is NULL for the only a, and MATCH (b:T) cannot bind NULL.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) WITH a, b MATCH (b) RETURN a.id, b.id;
+---- 0
+# Control: a property predicate keeps the scan on the build side.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) MATCH (b:T) WHERE b.id >= 0 RETURN a.id, b.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) MATCH (b:T) RETURN a.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) MATCH (b:T) RETURN count(*);
+---- 1
+0
+# A relationship variable and several hops.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[e:R]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b)-[:R]->(c) MATCH (c:T) RETURN a.id, b.id, c.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R*1..2]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:RG]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:RG]->(b) MATCH (b) RETURN a.id, b.id;
+---- 0
+
+-CASE RemoveJoinOnNullKeyMixed
+-STATEMENT CREATE NODE TABLE T(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE U(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT CREATE REL TABLE RG(FROM T TO T, FROM T TO U);
+---- ok
+-STATEMENT UNWIND range(0, 9) AS i CREATE (:T {id: i});
+---- ok
+-STATEMENT UNWIND range(0, 2) AS i CREATE (:U {id: i});
+---- ok
+# 1 -> 2, 3 -> 4, 3 -> 5; 7 -> 7 and 7 -> U2 in RG.
+-STATEMENT MATCH (a:T {id: 1}), (b:T {id: 2}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T {id: 3}), (b:T {id: 4}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T {id: 3}), (b:T {id: 5}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T {id: 7}), (b:T {id: 7}) CREATE (a)-[:RG]->(b);
+---- ok
+-STATEMENT MATCH (a:T {id: 7}), (b:U {id: 2}) CREATE (a)-[:RG]->(b);
+---- ok
+# Ten a, three of them with a matched b: the rows with a real b stay, the NULL ones go.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 3
+1|2
+3|4
+3|5
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) WITH a, b MATCH (b) RETURN a.id, b.id;
+---- 3
+1|2
+3|4
+3|5
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[e:R]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 3
+1|2
+3|4
+3|5
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) MATCH (b:T) RETURN count(*);
+---- 1
+3
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) MATCH (b:T) WHERE b.id >= 0 RETURN a.id, b.id;
+---- 3
+1|2
+3|4
+3|5
+# b can be re-matched through a second hop only for a = 1 and a = 3.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) MATCH (b:T)<-[:R]-(c:T) RETURN a.id, b.id, c.id;
+---- 3
+1|2|1
+3|4|3
+3|5|3
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R*1..2]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 3
+1|2
+3|4
+3|5
+# The NULL survives WITH DISTINCT, an aggregate and UNWIND before the re-match.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) WITH DISTINCT b MATCH (b:T) RETURN b.id;
+---- 3
+2
+4
+5
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) WITH b, count(*) AS n MATCH (b:T) RETURN b.id, n;
+---- 3
+2|1
+4|1
+5|1
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) UNWIND [1, 2] AS k MATCH (b:T) RETURN a.id, b.id, k;
+---- 6
+1|2|1
+1|2|2
+3|4|1
+3|4|2
+3|5|1
+3|5|2
+# b is bound to a T or a U for a = 7; only the T row matches MATCH (b:T).
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:RG]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 1
+7|7
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:RG]->(b) MATCH (b) RETURN a.id, b.id;
+---- 2
+7|2
+7|7
+
+-CASE RemoveJoinKeepsNonNullKey
+-STATEMENT CREATE NODE TABLE T(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT UNWIND range(0, 4) AS i CREATE (:T {id: i});
+---- ok
+-STATEMENT MATCH (a:T {id: 1}), (b:T {id: 2}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T {id: 3}), (b:T {id: 4}) CREATE (a)-[:R]->(b);
+---- ok
+# The key is never NULL here, so the join is still removed; the answers must not change.
+-STATEMENT MATCH (a:T)-[e:R]->(b:T) RETURN a.id, b.id;
+---- 2
+1|2
+3|4
+-STATEMENT MATCH (a:T)-[:R]->(b:T)-[:R]->(c:T) RETURN a.id;
+---- 0
+-STATEMENT MATCH (a:T)-[:R*1..2]->(b:T) RETURN a.id, b.id;
+---- 2
+1|2
+3|4
+-STATEMENT MATCH (a:T) MATCH (a)-[:R]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 2
+1|2
+3|4
+# An OPTIONAL MATCH whose own pattern re-matches nodes it bound itself.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b:T) RETURN a.id, b.id;
+---- 5
+0|
+1|2
+2|
+3|4
+4|
+-STATEMENT MATCH (a:T {id: 1}) OPTIONAL MATCH (a)-[:R]->(b:T) MATCH (a:T) RETURN a.id, b.id;
+---- 1
+1|2
+
+# OPTIONAL MATCH is planned as a LEFT hash join only when it is correlated with the clauses
+# before it. Without a join key it is an OPTIONAL cross product (or, as the first clause, an
+# OPTIONAL accumulate), which pads the NULL row the same way.
+-CASE RemoveJoinOnNullKeyUncorrelatedOptional
+-STATEMENT CREATE NODE TABLE T(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT UNWIND range(0, 4) AS i CREATE (:T {id: i});
+---- ok
+-STATEMENT MATCH (a:T {id: 1}), (b:T {id: 2}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (b:T) WHERE b.id > 100 MATCH (b:T) RETURN a.id, b.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (b:T) WHERE b.id > 100 WITH a, b MATCH (b) RETURN a.id, b.id;
+---- 0
+-STATEMENT OPTIONAL MATCH (b:T) WHERE b.id > 100 MATCH (b:T) RETURN b.id;
+---- 0
+-STATEMENT OPTIONAL MATCH (b:T) WHERE b.id > 100 WITH b MATCH (b) RETURN b.id;
+---- 0
+-STATEMENT OPTIONAL MATCH (a:T)-[:R]->(b:T) WHERE a.id > 100 MATCH (b:T) RETURN b.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) WHERE b.id > 100 MATCH (b:T) RETURN a.id, b.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b)-[:R]->(c) MATCH (b:T) RETURN a.id, b.id;
+---- 0
+-STATEMENT UNWIND [1, 2] AS i OPTIONAL MATCH (b:T) WHERE b.id = i + 100 MATCH (b:T) RETURN i, b.id;
+---- 0
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)<-[:R]-(b) MATCH (b:T) RETURN a.id, b.id;
+---- 1
+2|1
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R*1..2]->(b) MATCH (b:T) RETURN a.id, b.id;
+---- 1
+1|2
+# Two OPTIONAL MATCH in a row, the second one correlated with the NULL of the first.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (b:T) WHERE b.id > 100 OPTIONAL MATCH (b)-[:R]->(c) MATCH (c:T) RETURN a.id, c.id;
+---- 0
+# The OPTIONAL MATCH finds something: those rows stay.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (b:T) WHERE b.id = 3 MATCH (b:T) RETURN a.id, b.id;
+---- 5
+0|3
+1|3
+2|3
+3|3
+4|3
+-STATEMENT OPTIONAL MATCH (b:T) WHERE b.id = 3 MATCH (b:T) RETURN b.id;
+---- 1
+3
+-STATEMENT OPTIONAL MATCH (b:T) WHERE b.id = 3 WITH b MATCH (b) RETURN b.id;
+---- 1
+3
+
+# A COUNT subquery is a left-join-like hash join as well: an outer row without a match gets a
+# count of 0. When the outer side is a bare scan (nothing else of `a` is used) the join was
+# removed like an inner join, leaving only the rows that have a match.
+-CASE RemoveJoinKeepsCountJoin
+-STATEMENT CREATE NODE TABLE T(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT UNWIND range(0, 4) AS i CREATE (:T {id: i});
+---- ok
+-STATEMENT MATCH (a:T {id: 1}), (b:T {id: 2}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T) RETURN COUNT { MATCH (a)-[:R]->() } AS c;
+---- 5
+0
+0
+0
+0
+1
+-STATEMENT MATCH (a:T) RETURN a.id, COUNT { MATCH (a)-[:R]->() } AS c;
+---- 5
+0|0
+1|1
+2|0
+3|0
+4|0
+# The probe key of the COUNT join can be NULL (OPTIONAL MATCH): the count is 0.
+-STATEMENT MATCH (a:T) OPTIONAL MATCH (a)-[:R]->(b) RETURN b.id, COUNT { MATCH (b)-[:R]->() } AS c;
+---- 5
+|0
+|0
+|0
+|0
+2|0

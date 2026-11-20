@@ -7,6 +7,7 @@ add_library(riag_processor_mapper
         map_acc_hash_join.cpp
         map_accumulate.cpp
         map_aggregate.cpp
+        map_assert.cpp
         map_analyze.cpp
         map_count_rel_table.cpp
         map_count_anti_edge_chain.cpp

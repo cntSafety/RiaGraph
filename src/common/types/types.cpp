@@ -1,5 +1,6 @@
 #include "common/types/types.h"
 
+#include <algorithm>
 #include <set>
 #include <string_view>
 
@@ -584,7 +585,26 @@ bool LogicalType::operator==(const LogicalType& other) const {
         return false;
     }
     if (extraTypeInfo) {
-        return *extraTypeInfo == *other.extraTypeInfo;
+        if (!(*extraTypeInfo == *other.extraTypeInfo)) {
+            return false;
+        }
+        // A STRUCT is keyed by field name, so the names are part of its identity:
+        // STRUCT(a INT64, b INT64), STRUCT(b INT64, a INT64) and STRUCT(c INT64, d INT64) are
+        // three different types. Comparing only the field types made them "equal", and a value
+        // of one was then read positionally as another, silently moving values to other keys
+        // (cntSafety/RiaGraph#193). Field names compare case-insensitively, like every
+        // STRUCT field lookup. The check is deliberately limited to STRUCT: NODE/REL/UNION
+        // also carry a StructTypeInfo, but their identity rules are unchanged.
+        if (typeID == LogicalTypeID::STRUCT) {
+            const auto& fields = StructType::getFields(*this);
+            const auto& otherFields = StructType::getFields(other);
+            for (auto i = 0u; i < fields.size(); ++i) {
+                if (!StringUtils::caseInsensitiveEquals(fields[i].getName(),
+                        otherFields[i].getName())) {
+                    return false;
+                }
+            }
+        }
     }
     return true;
 }
@@ -1474,9 +1494,14 @@ LogicalType parseUnionType(const std::string& trimmedStr, main::ClientContext* c
 
 LogicalType parseDecimalType(const std::string& trimmedStr) {
     auto leftBracketPos = trimmedStr.find_last_of('(');
-    auto rightBracketPos = trimmedStr.find_last_of(')');
     if (leftBracketPos == std::string::npos) {
         return LogicalType::DECIMAL(18, 3);
+    }
+    // The parameter list has to end the type. Anything after it, such as the unterminated array
+    // suffix of DECIMAL(5,2)[3, would otherwise be dropped and the rest read as a plain DECIMAL.
+    auto rightBracketPos = trimmedStr.find_last_of(')');
+    if (rightBracketPos == std::string::npos || rightBracketPos + 1 != trimmedStr.size()) {
+        throw BinderException("Cannot parse NUMERIC/DECIMAL type: " + trimmedStr);
     }
     auto paramSubstr = StringUtils::ltrim(StringUtils::rtrim(
         trimmedStr.substr(leftBracketPos + 1, rightBracketPos - leftBracketPos - 1)));
@@ -1486,8 +1511,24 @@ LogicalType parseDecimalType(const std::string& trimmedStr) {
     }
     auto precisionStr = StringUtils::ltrim(StringUtils::rtrim(paramSubstr.substr(0, commaPos)));
     auto scaleStr = StringUtils::ltrim(StringUtils::rtrim(paramSubstr.substr(commaPos + 1)));
-    auto precision = std::strtoll(precisionStr.c_str(), nullptr, 0);
-    auto scale = std::strtoll(scaleStr.c_str(), nullptr, 0);
+    // Both numbers have to be plain decimal digits, as a whole. strtoll would read the 5 of "5x"
+    // and drop the rest, accept a sign or a hex/octal prefix (base 0), and saturate on overflow.
+    // A value beyond any valid precision is clamped, so the range checks below name it.
+    auto parseNumber = [&](const std::string& numStr) -> int64_t {
+        if (numStr.empty()) {
+            throw BinderException("Cannot parse NUMERIC/DECIMAL type: " + trimmedStr);
+        }
+        int64_t value = 0;
+        for (auto c : numStr) {
+            if (c < '0' || c > '9') {
+                throw BinderException("Cannot parse NUMERIC/DECIMAL type: " + trimmedStr);
+            }
+            value = std::min<int64_t>(value * 10 + (c - '0'), 1000);
+        }
+        return value;
+    };
+    auto precision = parseNumber(precisionStr);
+    auto scale = parseNumber(scaleStr);
     if (precision <= 0 || precision > 38) {
         throw BinderException(
             "Precision of DECIMAL/NUMERIC must be a positive integer no greater than 38");
@@ -1582,27 +1623,38 @@ static bool tryCombineListArrayTypes(const LogicalType& left, const LogicalType&
     return true;
 }
 
-// If we can match child labels and combine their types, then we can combine
-// the struct
+// Maps are keyed by name, so two STRUCTs combine field by field by NAME (case-insensitive, like
+// every STRUCT field lookup), never by position. The result has the union of both key sets: a key
+// that only one side has reads as NULL on the other side once that value is cast to the combined
+// type. Field order of the result is deterministic: first-occurrence order, i.e. the left
+// type's fields in their order, followed by the right-only fields in the right type's order.
+// A field whose type is the NULL-literal type (ANY/STRING, see canAlwaysCast) takes the other
+// side's type through tryGetMaxLogicalType. See cntSafety/RiaGraph#193.
 static bool tryCombineStructTypes(const LogicalType& left, const LogicalType& right,
     LogicalType& result) {
     const auto& leftFields = StructType::getFields(left);
     const auto& rightFields = StructType::getFields(right);
-    if (leftFields.size() != rightFields.size()) {
-        return false;
-    }
     std::vector<StructField> newFields;
-    for (auto i = 0u; i < leftFields.size(); i++) {
-        if (leftFields[i].getName() != rightFields[i].getName()) {
-            return false;
+    newFields.reserve(leftFields.size() + rightFields.size());
+    for (const auto& leftField : leftFields) {
+        if (!StructType::hasField(right, leftField.getName())) {
+            newFields.push_back(leftField.copy());
+            continue;
         }
         LogicalType combinedType;
-        if (LogicalTypeUtils::tryGetMaxLogicalType(leftFields[i].getType(),
-                rightFields[i].getType(), combinedType)) {
-            newFields.push_back(StructField(leftFields[i].getName(), std::move(combinedType)));
-        } else {
+        if (!LogicalTypeUtils::tryGetMaxLogicalType(leftField.getType(),
+                StructType::getFieldType(right, leftField.getName()), combinedType)) {
             return false;
         }
+        newFields.emplace_back(leftField.getName(), std::move(combinedType));
+    }
+    for (const auto& rightField : rightFields) {
+        if (!StructType::hasField(left, rightField.getName())) {
+            newFields.push_back(rightField.copy());
+        }
+    }
+    if (newFields.size() >= INVALID_STRUCT_FIELD_IDX) {
+        return false;
     }
     result = LogicalType::STRUCT(std::move(newFields));
     return true;

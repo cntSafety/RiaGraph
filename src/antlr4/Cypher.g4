@@ -31,10 +31,27 @@ oC_Statement
         | iC_DetachDatabase
         | iC_UseDatabase
         | iC_CreateGraph
-        | iC_UseGraph;
+        | iC_UseGraph
+        | iC_NamespaceStatement;
+
+iC_NamespaceStatement
+    : CREATE SP NAMESPACE SP (iC_IfNotExists SP)? oC_SymbolicName
+    | DROP SP NAMESPACE SP (iC_IfExists SP)? oC_SymbolicName
+    | ALTER SP NAMESPACE SP oC_SymbolicName SP RENAME SP TO SP oC_SymbolicName
+    | USE SP NAMESPACE SP iC_NamespaceList;
+
+iC_NamespaceScope
+    : IN SP iC_NamespaceList;
+
+iC_NamespaceList
+    : ALL SP NAMESPACES
+    | iC_NamespaceName (SP? ',' SP? iC_NamespaceName)*;
+
+iC_NamespaceName
+    : GLOBAL | oC_SymbolicName;
 
 iC_CopyFrom
-    : COPY SP oC_SchemaName iC_ColumnNames? SP FROM SP iC_ScanSource ( SP? '(' SP? iC_Options SP? ')' )? ;
+    : COPY SP oC_SchemaName iC_ColumnNames? (SP iC_NamespaceScope)? SP FROM SP iC_ScanSource ( SP? '(' SP? iC_Options SP? ')' )? ;
 
 iC_ColumnNames
     : SP? '(' SP? (oC_SchemaName ( SP? ',' SP? oC_SchemaName )* SP?)? ')';
@@ -114,7 +131,7 @@ iC_IfNotExists
     : IF SP NOT SP EXISTS ;
 
 iC_CreateNodeTable
-    : CREATE SP NODE SP TABLE SP (iC_IfNotExists SP)? oC_SchemaName ( SP? '(' SP? iC_PropertyDefinitions SP? ( ',' SP? iC_CreateNodeConstraint )? SP? ')' | SP AS SP oC_Query ) ( SP WITH SP? '(' SP? iC_Options SP? ')')? ( SP iC_PartitionBy )? ;
+    : CREATE SP NODE SP TABLE SP (iC_IfNotExists SP)? oC_SchemaName (SP iC_NamespaceScope)? ( SP? '(' SP? iC_PropertyDefinitions SP? ( ',' SP? iC_CreateNodeConstraint )? SP? ')' | SP AS SP oC_Query ) ( SP WITH SP? '(' SP? iC_Options SP? ')')? ( SP iC_PartitionBy )? ;
 
 // PostgreSQL-style partitioning. A node table can be declared as a partitioned parent,
 // where each partition is backed by its own subgraph (a hidden node table).
@@ -133,6 +150,7 @@ iC_PartitionList
 
 iC_CreateRelTable
     : CREATE SP REL SP TABLE ( SP GROUP )? ( SP iC_IfNotExists )? SP oC_SchemaName
+        (SP iC_NamespaceScope)?
         SP? '(' SP?
             iC_CreateFromToConnections SP? (
             ( ',' SP? iC_PropertyDefinitions SP? )?
@@ -222,7 +240,12 @@ iC_AlterOptions
         | iC_RenameProperty
         | iC_AddFromToConnection
         | iC_DropFromToConnection
-        | iC_SetSortedBy;
+        | iC_SetSortedBy
+        | iC_AlterNamespaces;
+
+iC_AlterNamespaces
+    : (ADD SP TO SP NAMESPACE | REMOVE SP FROM SP NAMESPACE) SP iC_NamespaceList
+    | SET SP NAMESPACES SP iC_NamespaceList;
 
 iC_AddProperty
     : ADD SP (iC_IfNotExists SP)? oC_PropertyKeyName SP iC_DataType ( SP iC_Default )? ;
@@ -257,9 +280,9 @@ iC_ColumnDefinition : oC_PropertyKeyName SP iC_DataType ;
 
 iC_PropertyDefinitions : iC_PropertyDefinition ( SP? ',' SP? iC_PropertyDefinition )* ;
 
-iC_PropertyDefinition : iC_ColumnDefinition ( SP iC_Default )? ( SP PRIMARY SP KEY)?;
+iC_PropertyDefinition : iC_ColumnDefinition ( SP iC_Default )? ( SP ((GLOBAL | LOCAL) SP)? PRIMARY SP KEY)?;
 
-iC_CreateNodeConstraint : PRIMARY SP KEY SP? '(' SP? oC_PropertyKeyName SP? ')' ;
+iC_CreateNodeConstraint : ((GLOBAL | LOCAL) SP)? PRIMARY SP KEY SP? '(' SP? oC_PropertyKeyName SP? ')' ;
 
 DECIMAL: ( 'D' | 'd' ) ( 'E' | 'e' ) ( 'C' | 'c' ) ( 'I' | 'i' ) ( 'M' | 'm' ) ( 'A' | 'a' ) ( 'L' | 'l' ) ;
 
@@ -342,6 +365,7 @@ oC_SingleQuery
 oC_SinglePartQuery
     : ( oC_ReadingClause SP? )* oC_Return
         | ( ( oC_ReadingClause SP? )* oC_UpdatingClause ( SP? oC_UpdatingClause )* ( SP? oC_Return )? )
+        | ( oC_ReadingClause SP? )* iC_Assert
         ;
 
 oC_MultiPartQuery
@@ -362,7 +386,13 @@ oC_ReadingClause
         | oC_Unwind
         | iC_InQueryCall
         | iC_LoadFrom
+        | iC_Assert
         ;
+
+// ASSERT reads the rows that reach it and passes them on unchanged. It fails the statement when
+// its condition is not TRUE, so a query may also end with it. See docs/assert.md.
+iC_Assert
+    : ASSERT SP? oC_Expression ( SP AS SP StringLiteral )? ;
 
 iC_LoadFrom
     :  LOAD ( SP WITH SP HEADERS SP? '(' SP? iC_ColumnDefinitions SP? ')' )? SP FROM SP iC_ScanSource (SP? '(' SP? iC_Options SP? ')')? (SP? oC_Where)? ;
@@ -378,7 +408,7 @@ iC_InQueryCall
     : CALL SP oC_FunctionInvocation (SP? oC_Where)? ( SP? YIELD SP oC_YieldItems )? ;
 
 oC_Match
-    : ( OPTIONAL SP )? MATCH SP? oC_Pattern ( SP oC_Where )? ( SP iC_Hint )? ;
+    : ( OPTIONAL SP )? MATCH SP? oC_Pattern (SP iC_NamespaceScope)? ( SP oC_Where )? ( SP iC_Hint )? ;
 
 iC_Hint
     : HINT SP iC_JoinNode;
@@ -392,11 +422,11 @@ iC_JoinNode
 oC_Unwind : UNWIND SP? oC_Expression SP AS SP oC_Variable ;
 
 oC_Create
-    : CREATE SP? oC_Pattern ;
+    : CREATE SP? oC_Pattern (SP iC_NamespaceScope)? ;
 
 // For unknown reason, openCypher use oC_PatternPart instead of oC_Pattern. There should be no difference in terms of planning.
 // So we choose to be consistent with oC_Create and use oC_Pattern instead.
-oC_Merge : MERGE SP? oC_Pattern ( SP oC_MergeAction )* ;
+oC_Merge : MERGE SP? oC_Pattern (SP iC_NamespaceScope)? ( SP oC_MergeAction )* ;
 
 oC_MergeAction
     :  ( ON SP MATCH SP oC_Set )
@@ -408,7 +438,8 @@ oC_Set
         | SET SP? oC_Atom SP? '=' SP? iC_Properties;
 
 oC_SetItem
-    : ( oC_PropertyExpression SP? '=' SP? oC_Expression ) ;
+    : ( oC_PropertyExpression SP? '=' SP? oC_Expression )
+    | oC_Variable SP IN SP iC_NamespaceName;
 
 oC_Delete
     : ( DETACH SP )? DELETE SP? oC_Expression ( SP? ',' SP? oC_Expression )*;
@@ -467,7 +498,7 @@ oC_PatternElement
         ;
 
 oC_NodePattern
-    : '(' SP? ( oC_Variable SP? )? ( oC_NodeLabels SP? )? ( iC_Properties SP? )? ')' ;
+    : '(' SP? ( oC_Variable SP? )? ( oC_NodeLabels SP? )? ( iC_Properties SP? )? (iC_NamespaceScope SP?)? ')' ;
 
 oC_PatternElementChain
     : oC_RelationshipPattern SP? oC_NodePattern ;
@@ -479,7 +510,7 @@ oC_RelationshipPattern
         ;
 
 oC_RelationshipDetail
-    : '[' SP? ( oC_Variable SP? )? ( oC_RelationshipTypes SP? )? ( iC_RecursiveDetail SP? )? ( iC_Properties SP? )? ']' ;
+    : '[' SP? ( oC_Variable SP? )? ( oC_RelationshipTypes SP? )? ( iC_RecursiveDetail SP? )? ( iC_Properties SP? )? (iC_NamespaceScope SP?)? ']' ;
 
 // The original oC_Properties definition is  oC_MapLiteral | oC_Parameter.
 // We choose to not support parameter as properties which will be the decision for a long time.
@@ -541,9 +572,9 @@ oC_NotExpression
     : ( NOT SP? )*  oC_ComparisonExpression;
 
 oC_ComparisonExpression
-    : iC_BitwiseOrOperatorExpression ( SP? iC_ComparisonOperator SP? iC_BitwiseOrOperatorExpression )?
-        | iC_BitwiseOrOperatorExpression ( SP? INVALID_NOT_EQUAL SP? iC_BitwiseOrOperatorExpression ) { notifyInvalidNotEqualOperator($INVALID_NOT_EQUAL); }
-        | iC_BitwiseOrOperatorExpression SP? iC_ComparisonOperator SP? iC_BitwiseOrOperatorExpression ( SP? iC_ComparisonOperator SP? iC_BitwiseOrOperatorExpression )+ { notifyNonBinaryComparison($ctx->start); }
+    : oC_StringListNullOperatorExpression ( SP? iC_ComparisonOperator SP? oC_StringListNullOperatorExpression )?
+        | oC_StringListNullOperatorExpression ( SP? INVALID_NOT_EQUAL SP? oC_StringListNullOperatorExpression ) { notifyInvalidNotEqualOperator($INVALID_NOT_EQUAL); }
+        | oC_StringListNullOperatorExpression SP? iC_ComparisonOperator SP? oC_StringListNullOperatorExpression ( SP? iC_ComparisonOperator SP? oC_StringListNullOperatorExpression )+ { notifyNonBinaryComparison($ctx->start); }
         ;
 
 iC_ComparisonOperator : '=' | '<>' | '<' | '<=' | '>' | '>=' ;
@@ -572,14 +603,20 @@ oC_MultiplyDivideModuloExpression
 iC_MultiplyDivideModuloOperator : '*' | '/' | '%' ;
 
 oC_PowerOfExpression
-    : oC_StringListNullOperatorExpression ( SP? '^' SP? oC_StringListNullOperatorExpression )* ;
+    : oC_UnaryAddSubtractOrFactorialExpression ( SP? '^' SP? oC_UnaryAddSubtractOrFactorialExpression )* ;
 
+// As in openCypher 9 (oC_StringListNullPredicateExpression), the string, list and null predicates
+// bind looser than every arithmetic and bitwise operator and tighter than the comparisons, and
+// chain left to right: 1 + 2 IN [3] is (1 + 2) IN [3], a = b IS NULL is a = (b IS NULL), and
+// x IN l IS NULL is (x IN l) IS NULL. Their right-hand operands are at the same level.
 oC_StringListNullOperatorExpression
-    : oC_UnaryAddSubtractOrFactorialExpression ( oC_StringOperatorExpression | oC_ListOperatorExpression+ | oC_NullOperatorExpression )? ;
+    : iC_BitwiseOrOperatorExpression ( oC_StringOperatorExpression | oC_ListPredicateExpression | oC_NullOperatorExpression )* ;
+
+oC_ListPredicateExpression
+    : SP IN SP? iC_BitwiseOrOperatorExpression ;
 
 oC_ListOperatorExpression
-    : ( SP IN SP? oC_PropertyOrLabelsExpression )
-        | ( '[' oC_Expression ']' )
+    : ( '[' oC_Expression ']' )
         | ( '[' oC_Expression? ( COLON | DOTDOT ) oC_Expression? ']' ) ;
 
 COLON : ':' ;
@@ -587,7 +624,7 @@ COLON : ':' ;
 DOTDOT : '..' ;
 
 oC_StringOperatorExpression
-    :  ( oC_RegularExpression | ( SP STARTS SP WITH ) | ( SP ENDS SP WITH ) | ( SP CONTAINS ) ) SP? oC_PropertyOrLabelsExpression ;
+    :  ( oC_RegularExpression | ( SP STARTS SP WITH ) | ( SP ENDS SP WITH ) | ( SP CONTAINS ) ) SP? iC_BitwiseOrOperatorExpression ;
 
 oC_RegularExpression
     :  SP? '=~' ;
@@ -604,7 +641,7 @@ oC_UnaryAddSubtractOrFactorialExpression
     : ( MINUS SP? )* oC_PropertyOrLabelsExpression (SP? FACTORIAL)? ;
 
 oC_PropertyOrLabelsExpression
-    : oC_Atom ( SP? oC_PropertyLookup )* ;
+    : oC_Atom ( ( SP? oC_PropertyLookup ) | oC_ListOperatorExpression )* ;
 
 oC_Atom
     : oC_Literal
@@ -793,6 +830,7 @@ iC_NonReservedKeywords
         | ALTER
         | ANALYZE
         | AS
+        | ASSERT
         | ATTACH
         | BEGIN
         | BY
@@ -857,6 +895,11 @@ iC_NonReservedKeywords
         | PARTITIONS
         | PASSWORD
         | MAP
+        | NAMESPACE
+        | NAMESPACES
+        | GLOBAL
+        | LOCAL
+        | REMOVE
         ;
 
 UnescapedSymbolicName

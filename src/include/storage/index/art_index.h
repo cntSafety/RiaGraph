@@ -98,7 +98,7 @@ public:
         bool lowerInclusive, common::ValueVector* upperBoundVector, uint64_t upperBoundPos,
         bool upperInclusive, common::idx_t maxResults, std::vector<common::offset_t>& results,
         visible_func isVisible) override;
-    void discardPrimaryKey(common::ValueVector* keyVector) override;
+    void discardPrimaryKey(common::ValueVector* keyVector, common::offset_t firstOffset) override;
 
     void checkpoint(main::ClientContext*, PageAllocator&, ShadowFile&) override;
     void rollbackCheckpoint() override;
@@ -181,8 +181,9 @@ private:
     const Node* findLeaf(const ArtKey& key) const;
     void appendVisibleOffsets(const Node& node, std::vector<common::offset_t>& results,
         visible_func isVisible) const;
-    bool eraseInternal(Node& node, const std::vector<uint8_t>& key, uint64_t depth);
-    void erase(const ArtKey& key);
+    bool eraseInternal(Node& node, const std::vector<uint8_t>& key, uint64_t depth,
+        common::offset_t offset);
+    void erase(const ArtKey& key, common::offset_t offset);
     static void eraseOffsetFromLeaf(Node& node, common::offset_t offset);
     static void resetNodePayload(Node& node);
     bool eraseOffsetInternal(Node& node, common::offset_t offset);

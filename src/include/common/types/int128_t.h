@@ -116,8 +116,10 @@ public:
         if (input.high == INT64_MIN && input.low == 0) {
             throw common::OverflowException("INT128 is out of range: cannot negate INT128_MIN");
         }
-        input.low = UINT64_MAX + 1 - input.low;
-        input.high = -input.high - 1 + (input.low == 0);
+        // Two's complement, ~input + 1, on the unsigned halves: negating the signed high part
+        // overflows for values whose high part is INT64_MIN.
+        input.low = uint64_t(0) - input.low;
+        input.high = static_cast<int64_t>(~static_cast<uint64_t>(input.high) + (input.low == 0));
     }
 
     static int128_t negate(int128_t input) {

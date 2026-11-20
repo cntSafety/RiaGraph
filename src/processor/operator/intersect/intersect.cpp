@@ -57,6 +57,10 @@ void Intersect::initLocalStateInternal(ResultSet* resultSet, ExecutionContext* /
     }
     std::fill(tupleIdxPerBuildSide.begin(), tupleIdxPerBuildSide.end(), 0);
     carryBuildSideIdx = -1u;
+    duplicateRunKeys.clear();
+    duplicateRunBounds.clear();
+    duplicateRunCursor.assign(sharedHTs.size(), 0);
+    nextDuplicateRun = 0;
 }
 
 void Intersect::probeHTs() {
@@ -176,6 +180,111 @@ void Intersect::intersectLists() {
     outKeyVector->state->getSelVectorUnsafe().setSelSize(leftSelVector.getSelSize());
 }
 
+// Lists live in packed storage (see intersectLists), so entries are read with memcpy.
+static nodeID_t getListEntry(const overflow_value_t& list, sel_t pos) {
+    nodeID_t nodeID;
+    memcpy(&nodeID, list.value + pos * sizeof(nodeID_t), sizeof(nodeID_t));
+    return nodeID;
+}
+
+static bool hasEqualNeighbour(const overflow_value_t& list, sel_t pos, const nodeID_t& key) {
+    return (pos > 0 && getListEntry(list, pos - 1) == key) ||
+           (pos + 1 < list.numElements && getListEntry(list, pos + 1) == key);
+}
+
+// A list holds one entry per relationship, so parallel edges put the same neighbour into it
+// several times, and each combination of one entry per list is a separate match. The kernels
+// pair equal entries one to one instead (a key in lists of 2 and 2 entries yields 2 matches, not
+// 4), which is right only while no matched key repeats in a list. Lists are sorted, so a repeat
+// sits next to the matched position; checking both neighbours of every match is the whole cost
+// when there are none. Otherwise, record every matched key with the run of positions it covers
+// in each list, for emitDuplicateRuns to expand into the cross product.
+bool Intersect::collectDuplicateRuns() {
+    const auto numLists = listsToIntersect.size();
+    const auto numMatches = outKeyVector->state->getSelVector().getSelSize();
+    const auto* keys = reinterpret_cast<const nodeID_t*>(outKeyVector->getData());
+    auto hasDuplicates = false;
+    for (auto i = 0u; i < numMatches && !hasDuplicates; i++) {
+        for (auto j = 0u; j < numLists; j++) {
+            if (hasEqualNeighbour(listsToIntersect[j], (*intersectSelVectors[j])[i], keys[i])) {
+                hasDuplicates = true;
+                break;
+            }
+        }
+    }
+    if (!hasDuplicates) {
+        return false;
+    }
+    duplicateRunKeys.clear();
+    duplicateRunBounds.clear();
+    nextDuplicateRun = 0;
+    for (auto i = 0u; i < numMatches; i++) {
+        const auto key = keys[i];
+        // Matches come out in list order, so the pairs the kernels made for one key are adjacent;
+        // the first of them is enough to find that key's runs.
+        if (!duplicateRunKeys.empty() && duplicateRunKeys.back() == key) {
+            continue;
+        }
+        duplicateRunKeys.push_back(key);
+        for (auto j = 0u; j < numLists; j++) {
+            const auto& list = listsToIntersect[j];
+            const auto pos = (*intersectSelVectors[j])[i];
+            auto begin = pos;
+            while (begin > 0 && getListEntry(list, begin - 1) == key) {
+                begin--;
+            }
+            auto end = pos + 1;
+            while (end < list.numElements && getListEntry(list, end) == key) {
+                end++;
+            }
+            duplicateRunBounds.push_back(begin);
+            duplicateRunBounds.push_back(end);
+        }
+    }
+    for (auto j = 0u; j < numLists; j++) {
+        duplicateRunCursor[j] = duplicateRunBounds[2 * j];
+    }
+    return true;
+}
+
+// Writes the next at most DEFAULT_VECTOR_CAPACITY rows of the cross product recorded by
+// collectDuplicateRuns into outKeyVector and intersectSelVectors, which populatePayloads reads.
+// The output can be larger than any input list, so it may take several calls.
+void Intersect::emitDuplicateRuns() {
+    const auto numLists = listsToIntersect.size();
+    auto* keys = reinterpret_cast<nodeID_t*>(outKeyVector->getData());
+    sel_t numRows = 0;
+    while (hasPendingDuplicateRuns() && numRows < DEFAULT_VECTOR_CAPACITY) {
+        keys[numRows] = duplicateRunKeys[nextDuplicateRun];
+        for (auto j = 0u; j < numLists; j++) {
+            intersectSelVectors[j]->getMutableBuffer()[numRows] = duplicateRunCursor[j];
+        }
+        numRows++;
+        // Advance like an odometer, last list fastest; once the first list wraps, every
+        // combination of this key is out and the cursor moves to the next key's runs.
+        const auto* bounds = duplicateRunBounds.data() + 2 * numLists * nextDuplicateRun;
+        for (auto j = numLists; j-- > 0;) {
+            if (++duplicateRunCursor[j] < bounds[2 * j + 1]) {
+                break;
+            }
+            duplicateRunCursor[j] = bounds[2 * j];
+            if (j == 0) {
+                nextDuplicateRun++;
+                if (hasPendingDuplicateRuns()) {
+                    const auto* nextBounds = bounds + 2 * numLists;
+                    for (auto l = 0u; l < numLists; l++) {
+                        duplicateRunCursor[l] = nextBounds[2 * l];
+                    }
+                }
+            }
+        }
+    }
+    for (auto j = 0u; j < numLists; j++) {
+        intersectSelVectors[j]->setToFiltered(numRows);
+    }
+    outKeyVector->state->getSelVectorUnsafe().setSelSize(numRows);
+}
+
 void Intersect::populatePayloads() {
     for (auto i = 0u; i < listIdxes.size(); i++) {
         auto listIdx = listIdxes[i];
@@ -203,6 +312,13 @@ bool Intersect::hasNextTuplesToIntersect() {
 
 bool Intersect::getNextTuplesInternal(ExecutionContext* context) {
     do {
+        if (hasPendingDuplicateRuns()) {
+            // The rest of the previous tuples' cross product. Their lists, flat tuples and probe
+            // row are still current: nothing below runs until the runs are drained.
+            emitDuplicateRuns();
+            populatePayloads();
+            continue;
+        }
         while (carryBuildSideIdx == -1u) {
             if (!children[0]->getNextTuple(context)) {
                 return false;
@@ -233,6 +349,9 @@ bool Intersect::getNextTuplesInternal(ExecutionContext* context) {
         swapSmallestListToFront(listsToIntersect, listIdxes);
         intersectLists();
         if (outKeyVector->state->getSelVector().getSelSize() != 0) {
+            if (collectDuplicateRuns()) {
+                emitDuplicateRuns();
+            }
             populatePayloads();
         }
         if (!hasNextTuplesToIntersect()) {

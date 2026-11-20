@@ -5,7 +5,6 @@
 
 #  Null predicate takes precedence over comparison operator
 -CASE Scenario1
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -17,7 +16,6 @@ False
 
 #  Null predicate takes precedence over comparison operator
 -CASE Scenario2
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -30,7 +28,6 @@ False|False|True
 
 #  Null predicate takes precedence over comparison operator
 -CASE Scenario3
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -43,7 +40,6 @@ True|True|False
 
 #  Null predicate takes precedence over boolean negation
 -CASE Scenario4
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok

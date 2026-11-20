@@ -115,8 +115,11 @@ public:
     // For deletions, we don't check if the deleted keys exist or not. Thus, we don't need to check
     // in the persistent storage and directly delete keys in the local storage.
     void deleteInternal(Key key) const { localStorage->deleteKey(key); }
-    // Discards from local storage, but will not insert a deletion (used for rollbacks)
-    bool discardLocal(Key key) const { return localStorage->discard(key); }
+    // Discards the entry of key for the row at `offset` from local storage, but will not insert
+    // a deletion (used for rollbacks)
+    bool discardLocal(Key key, common::offset_t offset) const {
+        return localStorage->discard(key, offset);
+    }
 
     // For insertions, we first check in the local storage. There are three cases:
     // - the key is found in the local storage, return false;
@@ -533,15 +536,17 @@ public:
         return getTypedHashIndex(key)->deleteInternal(key);
     }
 
-    bool discardLocal(common::string_t key) { return discardLocal(key.getAsStringView()); }
+    bool discardLocal(common::string_t key, common::offset_t offset) {
+        return discardLocal(key.getAsStringView(), offset);
+    }
     template<common::IndexHashable T>
-    inline bool discardLocal(T key) {
+    inline bool discardLocal(T key, common::offset_t offset) {
         DASSERT(indexInfo.keyDataTypes[0] == common::TypeUtils::getPhysicalTypeIDForType<T>());
-        return getTypedHashIndex(key)->discardLocal(key);
+        return getTypedHashIndex(key)->discardLocal(key, offset);
     }
 
     void delete_(common::ValueVector* keyVector);
-    void discardPrimaryKey(common::ValueVector* keyVector) override;
+    void discardPrimaryKey(common::ValueVector* keyVector, common::offset_t firstOffset) override;
 
     void checkpointInMemory() override;
     void checkpoint(main::ClientContext*, storage::PageAllocator& pageAllocator,

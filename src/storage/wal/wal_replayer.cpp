@@ -1,5 +1,6 @@
 #include "storage/wal/wal_replayer.h"
 
+#include <array>
 #include <optional>
 #include <string>
 
@@ -74,6 +75,38 @@ private:
     catalog::Catalog* previous;
 };
 } // namespace
+
+// A pinned checkpoint writes this marker once it is complete (shadow pages applied and synced),
+// before its cleanup removes the shadow file; the CHECKPOINT record stays in the WAL. An
+// unpinned checkpoint, and every recovery that discards the WAL, removes it. It names the offset
+// at which the CHECKPOINT record of the last completed pinned checkpoint ends (see StorageUtils).
+static std::string pinnedCheckpointMarkerPath(main::ClientContext& clientContext) {
+    return StorageUtils::getPinnedCheckpointMarkerPath(clientContext.getDatabasePath());
+}
+
+static bool pinnedCheckpointMarkerExists(main::ClientContext& clientContext) {
+    return VirtualFileSystem::GetUnsafe(clientContext)
+        ->fileOrPathExists(pinnedCheckpointMarkerPath(clientContext), &clientContext);
+}
+
+// Whether the marker says the CHECKPOINT record that ends at the given WAL offset belongs to a
+// completed pinned checkpoint. A marker without an offset (older format, partly written) says
+// nothing about any particular record.
+static bool pinnedCheckpointMarkerCovers(main::ClientContext& clientContext, uint64_t walOffset) {
+    auto* vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    const auto markerPath = pinnedCheckpointMarkerPath(clientContext);
+    if (!vfs->fileOrPathExists(markerPath, &clientContext)) {
+        return false;
+    }
+    auto fileInfo = vfs->openFile(markerPath, FileOpenFlags(FileFlags::READ_ONLY), &clientContext);
+    std::array<uint8_t, StorageUtils::PINNED_CHECKPOINT_MARKER_SIZE> content{};
+    const auto size = fileInfo->getFileSize();
+    if (size == content.size()) {
+        fileInfo->readFromFile(content.data(), content.size(), 0);
+    }
+    const auto markedOffset = StorageUtils::parsePinnedCheckpointMarker(content, size);
+    return markedOffset.has_value() && *markedOffset == walOffset;
+}
 
 static void removePartitionChildShadowFiles(main::ClientContext& clientContext) {
     auto* dbManager = main::DatabaseManager::Get(clientContext);
@@ -329,6 +362,8 @@ void WALReplayer::replay(bool throwOnWalReplayFailure, bool enableChecksums) con
     throwIfShadowOwnedByAnotherDatabase();
 
     if (!hasFrozenWAL && !hasActiveWAL) {
+        // The marker belongs to a WAL that is gone.
+        removeFileAndSyncParentDirectory(pinnedCheckpointMarkerPath(clientContext));
         removeFileAndSyncParentDirectory(shadowFilePath);
         checkpointer.readCheckpoint();
         removePartitionChildShadowFiles(clientContext);
@@ -609,6 +644,8 @@ void WALReplayer::replayFrozenWAL(Checkpointer& checkpointer, bool throwOnWalRep
     if (fileInfo->getFileSize() == 0) {
         fileInfo.reset();
         removeWALAndShadowFiles(checkpointWalPath);
+        // A marker left by an earlier pinned checkpoint belongs to the WAL that was just retired.
+        removeFileAndSyncParentDirectory(pinnedCheckpointMarkerPath(clientContext));
         checkpointer.readCheckpoint();
         removePartitionChildShadowFiles(clientContext);
         recoverGraphCheckpoints(clientContext, false, false);
@@ -628,11 +665,17 @@ void WALReplayer::replayFrozenWAL(Checkpointer& checkpointer, bool throwOnWalRep
             // pre-checkpoint prefix is already durable and only the suffix after the
             // last CHECKPOINT replays. A remaining shadow means some checkpoint may never
             // have completed: replay the pre-checkpoint prefix exactly as before and
-            // discard everything from the first CHECKPOINT record onward. Check before
+            // discard everything from the first CHECKPOINT record onward. The exception
+            // is a pinned-checkpoint marker: it proves the CHECKPOINT records in the file
+            // belong to completed pinned checkpoints (the frozen WAL was rotated from an
+            // active WAL that holds them), so the remaining shadow belongs to the next,
+            // unfinished checkpoint and the prefix is durable as well. Check before
             // deleting below.
             const bool discardCheckpointPrefix =
                 !VirtualFileSystem::GetUnsafe(clientContext)
-                     ->fileOrPathExists(shadowFilePath, &clientContext);
+                     ->fileOrPathExists(shadowFilePath, &clientContext) ||
+                (replayInfo.lastCheckpointOffset != 0 &&
+                    pinnedCheckpointMarkerExists(clientContext));
             removeFileAndSyncParentDirectory(shadowFilePath);
             checkpointer.readCheckpoint();
             removePartitionChildShadowFiles(clientContext);
@@ -646,8 +689,8 @@ void WALReplayer::replayFrozenWAL(Checkpointer& checkpointer, bool throwOnWalRep
                     walHeader.databaseID);
                 deserializer.getReader()->onObjectEnd();
             }
-            // Without a shadow the prefix is durable (skip it); with one, stop replay at
-            // the first CHECKPOINT record, whose checkpoint may be incomplete. Both
+            // When the prefix is durable skip it; otherwise stop replay at the first
+            // CHECKPOINT record, whose checkpoint may be incomplete. Both
             // bounds exclude every CHECKPOINT record structurally, so none ever reaches
             // replayWALRecord, which rejects them.
             const auto replayEnd =
@@ -715,6 +758,7 @@ void WALReplayer::replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalRep
     if (fileInfo->getFileSize() == 0) {
         fileInfo.reset();
         removeWALAndShadowFiles(walPath);
+        removeFileAndSyncParentDirectory(pinnedCheckpointMarkerPath(clientContext));
         if (!checkpointRead) {
             checkpointer.readCheckpoint();
         }
@@ -727,10 +771,22 @@ void WALReplayer::replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalRep
     try {
         const auto replayInfo = dryReplay(*fileInfo, throwOnWalReplayFailure, enableChecksums);
         const auto offsetDeserialized = replayInfo.offsetDeserialized;
+        auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+        const bool shadowExists = vfs->fileOrPathExists(shadowFilePath, &clientContext);
+        // The shadow file behind a trailing CHECKPOINT record normally holds the pages that
+        // checkpoint still has to apply. It does not when the marker says that very record
+        // belongs to a completed pinned checkpoint: the shadow file was created by the next
+        // checkpoint, which died before it wrote its own CHECKPOINT record (or is what is left
+        // of the cleanup of the completed one), so there is nothing to apply and nothing
+        // committed in it. That case is the one with commits behind the record, below.
+        const bool trailingCheckpointCompleted =
+            replayInfo.isLastRecordCheckpoint && shadowExists &&
+            pinnedCheckpointMarkerCovers(clientContext, replayInfo.lastCheckpointOffset);
         if (replayInfo.isLastRecordCheckpoint) {
             throwIfReadOnlyCheckpointState(clientContext, true /* hasFrozenWAL */, shadowFilePath);
-            auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
-            if (!vfs->fileOrPathExists(shadowFilePath, &clientContext)) {
+        }
+        if (replayInfo.isLastRecordCheckpoint && !trailingCheckpointCompleted) {
+            if (!shadowExists) {
                 replayPinnedActiveCheckpoint(checkpointer, fileInfo, replayInfo);
             } else {
                 replayCommittedCheckpoint(checkpointer, fileInfo, walPath, replayInfo);
@@ -760,7 +816,13 @@ void WALReplayer::replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalRep
                             walPath, shadowFilePath));
                 }
             }
-            const bool discardCheckpointPrefix = noShadow;
+            // A remaining shadow does not make the prefix undurable when the marker is there:
+            // the CHECKPOINT records followed by other records belong to completed pinned
+            // checkpoints, so the shadow belongs to the next, unfinished checkpoint, which
+            // never reached its own CHECKPOINT record and has nothing to recover.
+            const bool discardCheckpointPrefix =
+                noShadow || (replayInfo.lastCheckpointOffset != 0 &&
+                                pinnedCheckpointMarkerExists(clientContext));
             removeFileAndSyncParentDirectory(shadowFilePath);
             if (!checkpointRead) {
                 checkpointer.readCheckpoint();
@@ -805,6 +867,17 @@ void WALReplayer::replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalRep
             // record onward, matching the replay bound above; otherwise it only drops a
             // torn tail.
             truncateWALFile(*fileInfo, replayEnd);
+        }
+        if (trailingCheckpointCompleted) {
+            // The marker vouches for everything up to the trailing CHECKPOINT record, so nothing
+            // in this WAL is left to replay. Retire it like replayPinnedActiveCheckpoint does, with
+            // the marker last: the checkpointer only remembers CHECKPOINT records it wrote itself,
+            // so a WAL that still ends in this one would be rotated by the next unpinned
+            // checkpoint into a frozen WAL whose CHECKPOINT record has no shadow file behind it.
+            truncateWALFile(*fileInfo, 0);
+            fileInfo.reset();
+            removeFileAndSyncParentDirectory(walPath);
+            removeFileAndSyncParentDirectory(pinnedCheckpointMarkerPath(clientContext));
         }
     } catch (const std::exception&) {
         auto transactionContext = TransactionContext::Get(clientContext);
@@ -922,6 +995,8 @@ void WALReplayer::replayCommittedCheckpoint(Checkpointer& checkpointer,
     truncateWALFile(*fileInfo, 0);
     fileInfo.reset();
     removeWALAndShadowFiles(checkpointWALPath);
+    // A marker left by an earlier pinned checkpoint belongs to the WAL that was just retired.
+    removeFileAndSyncParentDirectory(pinnedCheckpointMarkerPath(clientContext));
     removePartitionChildShadowFiles(clientContext);
     removeGraphCheckpointShadows(clientContext);
 }

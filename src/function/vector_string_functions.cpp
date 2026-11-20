@@ -1,5 +1,8 @@
 #include "function/string/vector_string_functions.h"
 
+#include <limits>
+
+#include "common/exception/overflow.h"
 #include "function/string/functions/array_extract_function.h"
 #include "function/string/functions/contains_function.h"
 #include "function/string/functions/ends_with_function.h"
@@ -14,6 +17,7 @@
 #include "function/string/functions/rpad_function.h"
 #include "function/string/functions/starts_with_function.h"
 #include "function/string/functions/substr_function.h"
+#include <format>
 
 using namespace riag::common;
 
@@ -51,7 +55,20 @@ void BaseStrOperation::operation(string_t& input, string_t& result, ValueVector&
 
 void Repeat::operation(string_t& left, int64_t& right, string_t& result,
     ValueVector& resultValueVector) {
-    result.len = left.len * right;
+    // A negative count repeats nothing, as a negative pad length in lpad/rpad pads nothing.
+    // An empty pattern is the same case, and must not loop right times over nothing.
+    if (right <= 0 || left.len == 0) {
+        result.len = 0;
+        return;
+    }
+    // string_t keeps its length in 32 bits: validate the product in 64 bits before anything is
+    // allocated or written.
+    if (static_cast<uint64_t>(right) > std::numeric_limits<uint32_t>::max() / left.len) {
+        throw OverflowException(std::format("The result of repeat({} bytes, {}) exceeds the "
+                                            "maximum string length of {} bytes.",
+            left.len, right, std::numeric_limits<uint32_t>::max()));
+    }
+    result.len = left.len * static_cast<uint32_t>(right);
     if (result.len <= string_t::SHORT_STR_LENGTH) {
         repeatStr((char*)result.prefix, left.getAsString(), right);
     } else {

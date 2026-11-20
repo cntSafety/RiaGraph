@@ -27,6 +27,12 @@ protected:
         return op;
     }
 
+    virtual void visitAssert(planner::LogicalOperator* /*op*/) {}
+    virtual std::shared_ptr<planner::LogicalOperator> visitAssertReplace(
+        std::shared_ptr<planner::LogicalOperator> op) {
+        return op;
+    }
+
     virtual void visitCopyFrom(planner::LogicalOperator* /*op*/) {}
     virtual std::shared_ptr<planner::LogicalOperator> visitCopyFromReplace(
         std::shared_ptr<planner::LogicalOperator> op) {
@@ -184,6 +190,7 @@ protected:
     }
 
     virtual void visitSetProperty(planner::LogicalOperator*) {}
+    virtual void visitNamespaceMutation(planner::LogicalOperator*) {}
     virtual std::shared_ptr<planner::LogicalOperator> visitSetPropertyReplace(
         std::shared_ptr<planner::LogicalOperator> op) {
         return op;

@@ -1,5 +1,10 @@
 # Upstream cherry-picks
 
+> **Closed 2026-11-18.** RiaGraph no longer integrates changes from upstream (decision D1 in
+> [riagraph-fork-plan.md](riagraph-fork-plan.md), as revised). The log below is complete and
+> stays as the record of where the listed commits came from. The procedure is kept only to
+> explain how they were made; do not use it for new work.
+
 Every commit taken from [`ladybugdb/ladybug`](https://github.com/ladybugdb/ladybug) after
 the fork gets a row here. Without this log the next person cannot tell what has already
 been taken, and the same fix gets picked twice or missed entirely.

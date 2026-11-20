@@ -124,6 +124,7 @@ Binder exception: Table knows does not exist.
 ---- ok
 -STATEMENT MATCH (c:Comment) RETURN SUM(c.propx);
 ---- 1
+0
 
 -STATEMENT alter table Comment add propi float default 5.4;
 ---- ok
@@ -178,6 +179,7 @@ Binder exception: Table knows does not exist.
 -RELOADDB
 -STATEMENT MATCH (c:Comment) RETURN SUM(c.propx);
 ---- 1
+0
 
 -CASE AddRelPropertyRecovery
 -STATEMENT CALL auto_checkpoint=false;
@@ -197,6 +199,7 @@ Binder exception: Table knows does not exist.
 -RELOADDB
 -STATEMENT MATCH (c:Comment)-[r:replyOf]->(c2:Comment) RETURN SUM(r.propx);
 ---- 1
+0
 
 -CASE AddRelProperty
 -STATEMENT create node table Comment (id int64, PRIMARY KEY (id));
@@ -211,6 +214,7 @@ Binder exception: Table knows does not exist.
 ---- ok
 -STATEMENT MATCH (c:Comment)-[r:replyOf]->(c2:Comment) RETURN SUM(r.propx);
 ---- 1
+0
 
 -STATEMENT alter table replyOf add propy int64 default 1;
 ---- ok

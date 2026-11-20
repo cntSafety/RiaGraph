@@ -7,6 +7,7 @@
 #include "binder/expression/literal_expression.h"
 #include "common/enums/column_evaluate_type.h"
 #include "common/enums/table_type.h"
+#include "common/namespace_set.h"
 #include "common/partition_routing.h"
 #include "index_look_up_info.h"
 
@@ -24,6 +25,7 @@ struct ExtraBoundCopyFromInfo {
 };
 
 struct RIAG_API BoundCopyFromInfo {
+    common::namespace_id_t namespaceTarget = common::GLOBAL_NAMESPACE_ID;
     // Name of table to copy into.
     std::string tableName;
     // Type of table.
@@ -64,9 +66,10 @@ struct RIAG_API BoundCopyFromInfo {
 
 private:
     BoundCopyFromInfo(const BoundCopyFromInfo& other)
-        : tableName{other.tableName}, tableType{other.tableType}, offset{other.offset},
-          columnExprs{other.columnExprs}, columnEvaluateTypes{other.columnEvaluateTypes},
-          skipDuplicatePK{other.skipDuplicatePK}, partitionInfo{other.partitionInfo} {
+        : namespaceTarget{other.namespaceTarget}, tableName{other.tableName},
+          tableType{other.tableType}, offset{other.offset}, columnExprs{other.columnExprs},
+          columnEvaluateTypes{other.columnEvaluateTypes}, skipDuplicatePK{other.skipDuplicatePK},
+          partitionInfo{other.partitionInfo} {
         source = other.source ? other.source->copy() : nullptr;
         if (other.extraInfo) {
             extraInfo = other.extraInfo->copy();
@@ -107,6 +110,8 @@ public:
           info{std::move(info)} {}
 
     const BoundCopyFromInfo* getInfo() const { return &info; }
+    void setNamespaceTarget(common::namespace_id_t target) { info.namespaceTarget = target; }
+    BoundCopyFromInfo& getMutableInfo() { return info; }
 
 private:
     static BoundStatementResult createNodeCopyResult() {

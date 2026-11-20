@@ -25,6 +25,7 @@ private:
     void visitUnwind(planner::LogicalOperator* op) override;
     void visitUnion(planner::LogicalOperator* op) override;
     void visitFilter(planner::LogicalOperator* op) override;
+    void visitAssert(planner::LogicalOperator* op) override;
     void visitSetProperty(planner::LogicalOperator* op) override;
     void visitDelete(planner::LogicalOperator* op) override;
     void visitInsert(planner::LogicalOperator* op) override;

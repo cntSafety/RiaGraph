@@ -23,19 +23,36 @@ std::unique_ptr<UpdatingClause> Transformer::transformUpdatingClause(
 }
 
 std::unique_ptr<UpdatingClause> Transformer::transformCreate(CypherParser::OC_CreateContext& ctx) {
-    return std::make_unique<InsertClause>(transformPattern(*ctx.oC_Pattern()));
+    auto result = std::make_unique<InsertClause>(transformPattern(*ctx.oC_Pattern()));
+    if (ctx.iC_NamespaceScope()) {
+        result->setNamespaceSelector(
+            transformNamespaceList(*ctx.iC_NamespaceScope()->iC_NamespaceList()));
+    }
+    return result;
 }
 
 std::unique_ptr<UpdatingClause> Transformer::transformMerge(CypherParser::OC_MergeContext& ctx) {
     auto mergeClause = std::make_unique<MergeClause>(transformPattern(*ctx.oC_Pattern()));
+    if (ctx.iC_NamespaceScope()) {
+        mergeClause->setNamespaceSelector(
+            transformNamespaceList(*ctx.iC_NamespaceScope()->iC_NamespaceList()));
+    }
     for (auto& mergeActionCtx : ctx.oC_MergeAction()) {
         if (mergeActionCtx->MATCH()) {
             for (auto& setItemCtx : mergeActionCtx->oC_Set()->oC_SetItem()) {
-                mergeClause->addOnMatchSetItems(transformSetItem(*setItemCtx));
+                if (setItemCtx->iC_NamespaceName()) {
+                    mergeClause->addOnMatchNamespaceMove(transformNamespaceMove(*setItemCtx));
+                } else {
+                    mergeClause->addOnMatchSetItems(transformSetItem(*setItemCtx));
+                }
             }
         } else {
             for (auto& setItemCtx : mergeActionCtx->oC_Set()->oC_SetItem()) {
-                mergeClause->addOnCreateSetItems(transformSetItem(*setItemCtx));
+                if (setItemCtx->iC_NamespaceName()) {
+                    mergeClause->addOnCreateNamespaceMove(transformNamespaceMove(*setItemCtx));
+                } else {
+                    mergeClause->addOnCreateSetItems(transformSetItem(*setItemCtx));
+                }
             }
         }
     }
@@ -54,7 +71,11 @@ std::unique_ptr<UpdatingClause> Transformer::transformSet(CypherParser::OC_SetCo
         }
     } else {
         for (auto& setItem : ctx.oC_SetItem()) {
-            setClause->addSetItem(transformSetItem(*setItem));
+            if (setItem->iC_NamespaceName()) {
+                setClause->addNamespaceMove(transformNamespaceMove(*setItem));
+            } else {
+                setClause->addSetItem(transformSetItem(*setItem));
+            }
         }
     }
     return setClause;
@@ -63,6 +84,17 @@ std::unique_ptr<UpdatingClause> Transformer::transformSet(CypherParser::OC_SetCo
 parsed_expr_pair Transformer::transformSetItem(CypherParser::OC_SetItemContext& ctx) {
     return make_pair(transformProperty(*ctx.oC_PropertyExpression()),
         transformExpression(*ctx.oC_Expression()));
+}
+
+NamespaceMove Transformer::transformNamespaceMove(CypherParser::OC_SetItemContext& ctx) {
+    NamespaceSelector destination;
+    auto* name = ctx.iC_NamespaceName();
+    if (name->GLOBAL()) {
+        destination.global = true;
+    } else {
+        destination.names.push_back(transformSymbolicName(*name->oC_SymbolicName()));
+    }
+    return {transformVariable(*ctx.oC_Variable()), std::move(destination)};
 }
 
 std::unique_ptr<UpdatingClause> Transformer::transformDelete(CypherParser::OC_DeleteContext& ctx) {

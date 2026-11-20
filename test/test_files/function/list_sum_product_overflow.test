@@ -1,0 +1,61 @@
+-DATASET CSV EMPTY
+
+--
+
+# list_sum and list_product accumulate in the element type. They used to wrap silently where the
+# + and * operators raise (list_sum([9223372036854775807, 1]) returned -9223372036854775808).
+
+-CASE ListSumProductOverflow
+-LOG ListSumOverflow
+-STATEMENT RETURN list_sum([9223372036854775807, 1])
+---- error
+Overflow exception: Value 9223372036854775807 + 1 is not within INT64 range.
+-STATEMENT RETURN list_sum([-9223372036854775807, -2])
+---- error
+Overflow exception: Value -9223372036854775807 + -2 is not within INT64 range.
+-STATEMENT RETURN list_sum([cast(127 as INT8), cast(1 as INT8)])
+---- error
+Overflow exception: Value 127 + 1 is not within INT8 range.
+-STATEMENT RETURN list_sum([cast(200 as UINT8), cast(100 as UINT8)])
+---- error
+Overflow exception: Value 200 + 100 is not within UINT8 range.
+-STATEMENT RETURN list_sum([cast(18446744073709551615 as UINT64), cast(1 as UINT64)])
+---- error
+Overflow exception: Value 18446744073709551615 + 1 is not within UINT64 range.
+-STATEMENT RETURN list_sum([cast(170141183460469231731687303715884105727 as INT128), cast(1 as INT128)])
+---- error
+Overflow exception: INT128 is out of range: cannot add.
+
+-LOG ListProductOverflow
+-STATEMENT RETURN list_product([9223372036854775807, 2])
+---- error
+Overflow exception: Value 9223372036854775807 * 2 is not within INT64 range.
+-STATEMENT RETURN list_product([cast(127 as INT8), cast(2 as INT8)])
+---- error
+Overflow exception: Value 127 * 2 is not within INT8 range.
+-STATEMENT RETURN list_product([cast(4294967296 as UINT64), cast(4294967296 as UINT64)])
+---- error
+Overflow exception: Value 4294967296 * 4294967296 is not within UINT64 range.
+-STATEMENT RETURN list_product([cast(170141183460469231731687303715884105727 as INT128), cast(2 as INT128)])
+---- error
+Overflow exception: INT128 is out of range: cannot multiply.
+
+-LOG ListSumProductBoundaryCasesKeepWorking
+-STATEMENT RETURN list_sum([9223372036854775807, 0]), list_sum([9223372036854775806, 1]), list_sum([-9223372036854775807, -1])
+---- 1
+9223372036854775807|9223372036854775807|-9223372036854775808
+-STATEMENT RETURN list_product([9223372036854775807, 1]), list_product([4611686018427387903, 2]), list_product([-4611686018427387904, 2])
+---- 1
+9223372036854775807|9223372036854775806|-9223372036854775808
+-STATEMENT RETURN list_sum([cast(126 as INT8), cast(1 as INT8)]), list_product([cast(63 as INT8), cast(2 as INT8)])
+---- 1
+127|126
+-STATEMENT RETURN list_sum([cast(200 as UINT8), cast(55 as UINT8)]), list_product([cast(4294967296 as UINT64), cast(4294967295 as UINT64)])
+---- 1
+255|18446744069414584320
+-STATEMENT RETURN list_sum([1, NULL, 3]), list_product([2, NULL, 4]), list_sum(cast([], 'INT64[]')), list_product(cast([], 'INT64[]'))
+---- 1
+4|8|0|1
+-STATEMENT RETURN list_sum([1.5, 2.5]), list_product([1.5, 4.0])
+---- 1
+4.000000|6.000000

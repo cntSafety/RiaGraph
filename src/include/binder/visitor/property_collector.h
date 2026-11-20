@@ -20,6 +20,7 @@ private:
     void visitMatch(const BoundReadingClause& readingClause) override;
     void visitUnwind(const BoundReadingClause& readingClause) override;
     void visitLoadFrom(const BoundReadingClause& readingClause) override;
+    void visitAssert(const BoundReadingClause& readingClause) override;
     void visitTableFunctionCall(const BoundReadingClause&) override;
 
     void visitSet(const BoundUpdatingClause& updatingClause) override;

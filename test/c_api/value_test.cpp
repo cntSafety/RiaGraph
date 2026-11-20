@@ -629,6 +629,32 @@ TEST(CApiValueTestEmptyDB, CreateListOfStructsMixedIntegerWidths) {
     riag_value_destroy(value);
 }
 
+// cntSafety/RiaGraph#193: struct elements are combined by field name (union of the keys, in
+// first-occurrence order), never by position.
+TEST(CApiValueTestEmptyDB, CreateListOfStructsByFieldName) {
+    const char* names1[] = {"a", "b"};
+    const char* names2[] = {"b", "a"};
+    const char* names3[] = {"c"};
+    riag_value* fields1[] = {riag_value_create_int64(1), riag_value_create_int64(2)};
+    riag_value* fields2[] = {riag_value_create_int64(3), riag_value_create_int64(4)};
+    riag_value* fields3[] = {riag_value_create_int64(5)};
+    riag_value* elements[] = {nullptr, nullptr, nullptr};
+    ASSERT_EQ(riag_value_create_struct(2, names1, fields1, &elements[0]), RiaGSuccess);
+    ASSERT_EQ(riag_value_create_struct(2, names2, fields2, &elements[1]), RiaGSuccess);
+    ASSERT_EQ(riag_value_create_struct(1, names3, fields3, &elements[2]), RiaGSuccess);
+    riag_value* value = nullptr;
+    ASSERT_EQ(riag_value_create_list(3, elements, &value), RiaGSuccess);
+    auto cppValue = static_cast<Value*>(value->_value);
+    const auto& childType = ListType::getChildType(cppValue->getDataType());
+    ASSERT_EQ(childType.toString(), "STRUCT(a INT64, b INT64, c INT64)");
+    ASSERT_EQ(cppValue->toString(), "[{a: 1, b: 2, c: },{a: 4, b: 3, c: },{a: , b: , c: 5}]");
+    destroyValues(fields1, 2);
+    destroyValues(fields2, 2);
+    destroyValues(fields3, 1);
+    destroyValues(elements, 3);
+    riag_value_destroy(value);
+}
+
 TEST(CApiValueTestEmptyDB, CreateListOfMapsMixedIntegerWidths) {
     riag_value* keys[] = {riag_value_create_int8(1)};
     riag_value* values1[] = {riag_value_create_int8(1)};
@@ -1150,6 +1176,23 @@ TEST(CApiValueTestEmptyDB, Copy) {
     auto cppValue = static_cast<Value*>(value->_value);
     ASSERT_EQ(cppValue->getDataType().getLogicalTypeID(), LogicalTypeID::STRING);
     ASSERT_EQ(cppValue->getValue<std::string>(), "abcdefg");
+    riag_value_destroy(value);
+}
+
+TEST(CApiValueTestEmptyDB, CopyNull) {
+    riag_value* value = riag_value_create_string((char*)"abc");
+    // A null source or destination is ignored instead of dereferenced; the destination keeps its
+    // value.
+    riag_value_copy(value, nullptr);
+    riag_value_copy(nullptr, value);
+    riag_value_copy(nullptr, nullptr);
+    auto cppValue = static_cast<Value*>(value->_value);
+    ASSERT_EQ(cppValue->getDataType().getLogicalTypeID(), LogicalTypeID::STRING);
+    ASSERT_EQ(cppValue->getValue<std::string>(), "abc");
+
+    riag_value other{};
+    riag_value_copy(value, &other);
+    ASSERT_EQ(cppValue->getValue<std::string>(), "abc");
     riag_value_destroy(value);
 }
 

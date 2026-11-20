@@ -1,6 +1,8 @@
 #include "storage/local_storage/local_node_table.h"
 
+#include "catalog/catalog.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/cast.h"
 #include "common/exception/message.h"
 #include "common/exception/runtime.h"
@@ -30,6 +32,9 @@ LocalNodeTable::LocalNodeTable(const catalog::TableCatalogEntry* tableEntry, Tab
     : LocalTable{table}, overflowFileHandle(nullptr),
       nodeGroups{mm, getNodeTableColumnTypes(*tableEntry), false /*enableCompression*/} {
     initLocalHashIndex(mm);
+    if (table.cast<NodeTable>().hasLocalPrimaryKey()) {
+        namespaceIndexes = std::make_unique<NamespaceIndexes>(mm);
+    }
     startOffset = table.getNumTotalRows(nullptr /* transaction */);
 }
 
@@ -73,8 +78,13 @@ bool LocalNodeTable::insert(Transaction* transaction, TableInsertState& insertSt
     auto& nodeInsertState = insertState.constCast<NodeTableInsertState>();
     const auto nodeOffset = startOffset + nodeGroups.getNumTotalRows();
     DASSERT(nodeInsertState.pkVector.state->getSelVector().getSelSize() == 1);
-    if (!hashIndex->insert(nodeInsertState.pkVector, nodeOffset,
-            [&](offset_t offset) { return isVisible(transaction, offset); })) {
+    if (table.cast<NodeTable>().hasLocalPrimaryKey()) {
+        if (!transaction->isRecovery()) {
+            insertNamespaceKey(transaction, nodeInsertState.pkVector, nodeOffset,
+                nodeInsertState.namespaceID);
+        }
+    } else if (!hashIndex->insert(nodeInsertState.pkVector, nodeOffset,
+                   [&](offset_t offset) { return isVisible(transaction, offset); })) {
         const auto val =
             nodeInsertState.pkVector.getAsValue(nodeInsertState.pkVector.state->getSelVector()[0]);
         throw RuntimeException(ExceptionMessage::duplicatePKException(val->toString()));
@@ -109,7 +119,9 @@ bool LocalNodeTable::delete_(Transaction* transaction, TableDeleteState& deleteS
     const auto pos = nodeDeleteState.nodeIDVector.state->getSelVector()[0];
     const auto offset = nodeDeleteState.nodeIDVector.readNodeOffset(pos);
     DASSERT(offset >= startOffset);
-    hashIndex->delete_(nodeDeleteState.pkVector);
+    if (!table.cast<NodeTable>().hasLocalPrimaryKey()) {
+        hashIndex->delete_(nodeDeleteState.pkVector);
+    }
     const auto [nodeGroupIdx, rowIdxInGroup] =
         StorageUtils::getQuotientRemainder(offset - startOffset, StorageConfig::NODE_GROUP_SIZE);
     const auto nodeGroup = nodeGroups.getNodeGroup(nodeGroupIdx);
@@ -122,6 +134,9 @@ bool LocalNodeTable::addColumn(TableAddColumnState& addColumnState) {
 }
 
 void LocalNodeTable::clear(MemoryManager& mm) {
+    if (namespaceIndexes) {
+        namespaceIndexes->indexes.clear();
+    }
     auto& nodeTable = dynamic_cast_checked<const NodeTable&>(table);
     hashIndex = std::make_unique<LocalHashIndex>(mm,
         nodeTable.getColumn(nodeTable.getPKColumnID()).getDataType().getPhysicalType(),
@@ -131,9 +146,82 @@ void LocalNodeTable::clear(MemoryManager& mm) {
 
 bool LocalNodeTable::lookupPK(const Transaction* transaction, const ValueVector* keyVector,
     sel_t pos, offset_t& result) const {
+    if (table.cast<NodeTable>().hasLocalPrimaryKey()) {
+        std::vector<offset_t> results;
+        lookupPKInNamespaces(transaction, keyVector, pos, NamespaceSet{}, results);
+        if (results.size() > 1) {
+            throw RuntimeException(
+                "A LOCAL primary key is ambiguous without a namespace selector.");
+        }
+        if (results.empty()) {
+            return false;
+        }
+        result = results.front();
+        return true;
+    }
     result = hashIndex->lookup(*keyVector, pos,
         [&](offset_t offset) { return isVisible(transaction, offset); });
     return result != INVALID_OFFSET;
+}
+
+LocalHashIndex& LocalNodeTable::namespaceIndex(namespace_id_t namespaceID) {
+    DASSERT(namespaceIndexes);
+    auto& index = namespaceIndexes->indexes[namespaceID];
+    if (!index) {
+        index = std::make_unique<LocalHashIndex>(namespaceIndexes->memory,
+            table.cast<NodeTable>()
+                .getColumn(table.cast<NodeTable>().getPKColumnID())
+                .getDataType()
+                .getPhysicalType(),
+            overflowFileHandle);
+    }
+    return *index;
+}
+
+bool LocalNodeTable::lookupPKInNamespace(const Transaction* transaction,
+    const ValueVector* keyVector, sel_t pos, namespace_id_t namespaceID, offset_t& result) const {
+    DASSERT(namespaceIndexes);
+    const auto it = namespaceIndexes->indexes.find(namespaceID);
+    if (it == namespaceIndexes->indexes.end()) {
+        return false;
+    }
+    catalog::NamespaceReadState memberships(table.getOwningCatalog()->getNamespaces(), transaction,
+        table.getTableID());
+    result = it->second->lookup(*keyVector, pos, [&](offset_t offset) {
+        return isVisible(transaction, offset) && memberships.get(offset) == namespaceID;
+    });
+    return result != INVALID_OFFSET;
+}
+
+void LocalNodeTable::lookupPKInNamespaces(const Transaction* transaction,
+    const ValueVector* keyVector, sel_t pos, const NamespaceSet& scope,
+    std::vector<offset_t>& results) const {
+    const auto lookup = [&](namespace_id_t id) {
+        offset_t offset;
+        if (lookupPKInNamespace(transaction, keyVector, pos, id, offset)) {
+            results.push_back(offset);
+        }
+    };
+    if (scope.isUnrestricted()) {
+        for (const auto& [id, _] : namespaceIndexes->indexes) {
+            lookup(id);
+        }
+    } else {
+        for (auto id : scope.getIDs()) {
+            lookup(id);
+        }
+    }
+}
+
+void LocalNodeTable::insertNamespaceKey(const Transaction* transaction, const ValueVector& key,
+    offset_t offset, namespace_id_t namespaceID) {
+    catalog::NamespaceReadState memberships(table.getOwningCatalog()->getNamespaces(), transaction,
+        table.getTableID());
+    if (!namespaceIndex(namespaceID).insert(key, offset, [&](offset_t existing) {
+            return isVisible(transaction, existing) && memberships.get(existing) == namespaceID;
+        })) {
+        throw RuntimeException("Duplicate LOCAL primary key in the destination namespace.");
+    }
 }
 
 } // namespace storage

@@ -160,6 +160,9 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapOperator(const LogicalOperator*
     case LogicalOperatorType::FILTER: {
         physicalOperator = mapFilter(logicalOperator);
     } break;
+    case LogicalOperatorType::ASSERT: {
+        physicalOperator = mapAssert(logicalOperator);
+    } break;
     case LogicalOperatorType::HASH_JOIN: {
         physicalOperator = mapHashJoin(logicalOperator);
     } break;
@@ -252,6 +255,12 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapOperator(const LogicalOperator*
     } break;
     case LogicalOperatorType::USE_GRAPH: {
         physicalOperator = mapUseGraph(logicalOperator);
+    } break;
+    case LogicalOperatorType::NAMESPACE_COMMAND: {
+        physicalOperator = mapNamespace(logicalOperator);
+    } break;
+    case LogicalOperatorType::NAMESPACE_MUTATION: {
+        physicalOperator = mapNamespaceMutation(logicalOperator);
     } break;
     case LogicalOperatorType::EXTENSION_CLAUSE: {
         physicalOperator = mapExtensionClause(logicalOperator);

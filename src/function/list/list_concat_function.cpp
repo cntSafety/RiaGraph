@@ -38,6 +38,7 @@ std::unique_ptr<FunctionBindData> ListConcatFunction::bindFunc(const ScalarBindF
     ListFunctionUtils::resolveTypes(input, types, resolver::leftEmpty, resolver::leftEmpty,
         resolver::rightEmpty, resolver::finalResolver, resolver::bothNull, resolver::leftEmpty,
         resolver::rightEmpty, resolver::finalResolver);
+    ListFunctionUtils::combineMapElementTypes(types, false /* rightIsElement */);
 
     if (types[0] != types[1]) {
         throw BinderException(ExceptionMessage::listFunctionIncompatibleChildrenType(name,

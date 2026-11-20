@@ -1,5 +1,6 @@
 add_library(riag_binder_bind_read
         OBJECT
+        bind_assert.cpp
         bind_in_query_call.cpp
         bind_load_from.cpp
         bind_match.cpp

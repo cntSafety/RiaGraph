@@ -9,6 +9,7 @@
 #include "common/enums/conflict_action.h"
 #include "common/enums/table_type.h"
 #include "parsed_property_definition.h"
+#include "parser/namespace_selector.h"
 
 namespace riag {
 namespace parser {
@@ -42,6 +43,7 @@ struct CreateTableInfo {
     std::vector<ParsedPropertyDefinition> propertyDefinitions;
     std::unique_ptr<ExtraCreateTableInfo> extraInfo;
     common::ConflictAction onConflict;
+    std::optional<NamespaceSelector> namespaceSelector;
 
     CreateTableInfo(common::TableType type, std::string tableName,
         common::ConflictAction onConflict)
@@ -53,6 +55,7 @@ struct ExtraCreateNodeTableInfo final : ExtraCreateTableInfo {
     std::string pKName;
     options_t options;
     std::optional<ParsedPartitionInfo> partitionInfo;
+    bool localPrimaryKey = false;
 
     explicit ExtraCreateNodeTableInfo(std::string pKName, options_t options = {},
         std::optional<ParsedPartitionInfo> partitionInfo = std::nullopt)

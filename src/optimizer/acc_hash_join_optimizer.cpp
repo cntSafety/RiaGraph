@@ -33,6 +33,48 @@ static std::shared_ptr<LogicalOperator> appendAccumulate(std::shared_ptr<Logical
     return accumulate;
 }
 
+// A semi mask narrows a scan below a join to the keys the join keeps. An ASSERT below that scan's
+// consumer must check every row it is given (docs/assert.md), so no join above an ASSERT gets one.
+static bool containsAssert(const LogicalOperator* op) {
+    if (op->getOperatorType() == LogicalOperatorType::ASSERT) {
+        return true;
+    }
+    for (auto i = 0u; i < op->getNumChildren(); ++i) {
+        if (containsAssert(op->getChild(i).get())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A write below a semi mask's target must see every row it is given. The mask narrows the target
+// scan (or extend) to the keys its join keeps, and a write between the join and that scan would
+// apply to only those rows: MATCH (a) SET a.v = 1 WITH a MATCH (a)-[]->(b) set the one row of five
+// with an edge (#122). Collect every operator under root that has an update (SET, CREATE, MERGE,
+// DELETE) above it within root. A mask whose target lies above or beside the write is fine: the
+// write has completed before the join's probe side reads, and the join drops the same rows anyway.
+static void collectOperatorsUnderUpdate(const LogicalOperator* op, bool underUpdate,
+    std::unordered_set<const LogicalOperator*>& result) {
+    if (underUpdate) {
+        result.insert(op);
+    }
+    underUpdate = underUpdate || LogicalOperatorUtils::isUpdate(op->getOperatorType());
+    for (auto i = 0u; i < op->getNumChildren(); ++i) {
+        collectOperatorsUnderUpdate(op->getChild(i).get(), underUpdate, result);
+    }
+}
+
+// Drop the candidates under root that have an update above them.
+static void eraseCandidatesUnderUpdate(std::vector<LogicalOperator*>& candidates,
+    LogicalOperator* root) {
+    if (candidates.empty() || !root->hasUpdateRecursive()) {
+        return;
+    }
+    std::unordered_set<const LogicalOperator*> underUpdate;
+    collectOperatorsUnderUpdate(root, false, underUpdate);
+    std::erase_if(candidates, [&](const LogicalOperator* op) { return underUpdate.contains(op); });
+}
+
 static table_id_vector_t getTableIDs(const std::vector<catalog::TableCatalogEntry*>& entries) {
     table_id_vector_t result;
     for (auto& entry : entries) {
@@ -136,11 +178,12 @@ static std::shared_ptr<LogicalSemiMasker> appendSemiMasker(SemiMaskKeyType keyTy
 static void collectSemiMaskTargets(LogicalOperator* op,
     std::unordered_set<const LogicalOperator*>& targets);
 static void applyIntersectBuildToProbeSIP(LogicalOperator* op,
-    std::unordered_set<const LogicalOperator*>& maskedScans);
+    std::unordered_set<const LogicalOperator*>& maskedScans, bool planHasAssert);
 
 void HashJoinSIPOptimizer::rewrite(const LogicalPlan* plan) {
     probeLimit = nullptr;
     probeLimitTarget = nullptr;
+    planHasAssert = containsAssert(plan->getLastOperator().get());
     // A literal LIMIT at the end of a projection-only tail can be pushed into the probe
     // side of the join directly below that tail once probe-to-build SIP fires: the join
     // then emits at most `limit` rows while the capped probe seeds a much smaller build
@@ -182,7 +225,7 @@ void HashJoinSIPOptimizer::rewrite(const LogicalPlan* plan) {
     visitOperator(plan->getLastOperator().get());
     std::unordered_set<const LogicalOperator*> maskedScans;
     collectSemiMaskTargets(plan->getLastOperator().get(), maskedScans);
-    applyIntersectBuildToProbeSIP(plan->getLastOperator().get(), maskedScans);
+    applyIntersectBuildToProbeSIP(plan->getLastOperator().get(), maskedScans, planHasAssert);
 }
 
 void HashJoinSIPOptimizer::visitOperator(LogicalOperator* op) {
@@ -327,6 +370,7 @@ static std::shared_ptr<LogicalOperator> tryApplySemiMask(std::shared_ptr<Express
     // GDS at the same time
     auto recursiveExtendInputNodeCandidates =
         getRecursiveExtendInputNodeCandidates(*nodeID, toRoot);
+    eraseCandidatesUnderUpdate(recursiveExtendInputNodeCandidates, toRoot);
     if (!recursiveExtendInputNodeCandidates.empty()) {
         for (auto& op : recursiveExtendInputNodeCandidates) {
             op->cast<LogicalRecursiveExtend>().setInputNodeMask();
@@ -337,6 +381,7 @@ static std::shared_ptr<LogicalOperator> tryApplySemiMask(std::shared_ptr<Express
             recursiveExtendInputNodeCandidates, std::move(fromRoot));
     }
     auto recursiveExtendNodeCandidates = getRecursiveExtendOutputNodeCandidates(*nodeID, toRoot);
+    eraseCandidatesUnderUpdate(recursiveExtendNodeCandidates, toRoot);
     if (!recursiveExtendNodeCandidates.empty()) {
         for (auto& op : recursiveExtendNodeCandidates) {
             op->cast<LogicalRecursiveExtend>().setOutputNodeMask();
@@ -349,6 +394,8 @@ static std::shared_ptr<LogicalOperator> tryApplySemiMask(std::shared_ptr<Express
     auto scanNodeCandidates = getScanNodeCandidates(*nodeID, toRoot);
     std::vector<LogicalOperator*> extendNbrCandidates;
     collectExtendNbrCandidates(*nodeID, toRoot, extendNbrCandidates);
+    eraseCandidatesUnderUpdate(scanNodeCandidates, toRoot);
+    eraseCandidatesUnderUpdate(extendNbrCandidates, toRoot);
     if (isProbeToBuild) {
         std::erase_if(extendNbrCandidates, [](const LogicalOperator* op) {
             return op->getCardinality() < MIN_EXTEND_OUTPUT_FOR_PROBE_TO_BUILD_SIP;
@@ -418,6 +465,13 @@ static bool tryProbeToBuildHJSIP(LogicalOperator* op,
     }
     auto probeRoot = hashJoin.getChild(0);
     auto buildRoot = hashJoin.getChild(1);
+    // Probe-to-build SIP runs the probe side before the build side. A write on the build side
+    // (the planner puts it there so that it completes before the probe side reads) would then
+    // run after the probe side has read: MATCH (a) SET a.v = 1 WITH a MATCH (a)-[]->(b) RETURN
+    // b.v returned the value from before the write. Build-to-probe SIP keeps the order.
+    if (buildRoot->hasUpdateRecursive()) {
+        return false;
+    }
     auto hasSemiMaskApplied = false;
     for (auto& nodeID : hashJoin.getJoinNodeIDs()) {
         auto newProbeRoot =
@@ -511,6 +565,9 @@ void HashJoinSIPOptimizer::visitHashJoin(LogicalOperator* op) {
     if (LogicalOperatorUtils::isAccHashJoin(hashJoin)) {
         return;
     }
+    if (planHasAssert && containsAssert(op)) {
+        return;
+    }
     if (hashJoin.getSIPInfo().position == SemiMaskPosition::PROHIBIT) {
         return;
     }
@@ -539,6 +596,7 @@ static void tryBuildToProbeIntersectSIP(LogicalIntersect& intersect,
     for (auto i = 1u; i < intersect.getNumChildren(); ++i) {
         auto keyNodeID = intersect.getKeyNodeID(i - 1);
         auto candidates = getScanNodeCandidates(*keyNodeID, probeRoot);
+        eraseCandidatesUnderUpdate(candidates, probeRoot);
         std::erase_if(candidates,
             [&](const LogicalOperator* op) { return maskedScans.contains(op); });
         if (candidates.empty() ||
@@ -573,18 +631,22 @@ static void collectSemiMaskTargets(LogicalOperator* op,
 
 // Runs after every other SIP decision, so all masks the intersects must not replace are known.
 static void applyIntersectBuildToProbeSIP(LogicalOperator* op,
-    std::unordered_set<const LogicalOperator*>& maskedScans) {
+    std::unordered_set<const LogicalOperator*>& maskedScans, bool planHasAssert) {
     for (auto i = 0u; i < op->getNumChildren(); ++i) {
-        applyIntersectBuildToProbeSIP(op->getChild(i).get(), maskedScans);
+        applyIntersectBuildToProbeSIP(op->getChild(i).get(), maskedScans, planHasAssert);
     }
     if (op->getOperatorType() == LogicalOperatorType::INTERSECT &&
         op->constCast<LogicalIntersect>().getSIPInfo().position ==
-            SemiMaskPosition::PROHIBIT_PROBE_TO_BUILD) {
+            SemiMaskPosition::PROHIBIT_PROBE_TO_BUILD &&
+        !(planHasAssert && containsAssert(op))) {
         tryBuildToProbeIntersectSIP(op->cast<LogicalIntersect>(), maskedScans);
     }
 }
 
 void HashJoinSIPOptimizer::visitIntersect(LogicalOperator* op) {
+    if (planHasAssert && containsAssert(op)) {
+        return;
+    }
     auto& intersect = op->cast<LogicalIntersect>();
     switch (intersect.getSIPInfo().position) {
     case SemiMaskPosition::PROHIBIT:
@@ -599,13 +661,21 @@ void HashJoinSIPOptimizer::visitIntersect(LogicalOperator* op) {
     if (!isProbeSideQualified(op->getChild(0).get())) {
         return;
     }
+    // Probe-to-build SIP runs the probe side before the build sides, see tryProbeToBuildHJSIP.
+    for (auto i = 1u; i < intersect.getNumChildren(); ++i) {
+        if (intersect.getChild(i)->hasUpdateRecursive()) {
+            return;
+        }
+    }
     auto probeRoot = intersect.getChild(0);
     auto hasSemiMaskApplied = false;
     for (auto& nodeID : intersect.getKeyNodeIDs()) {
         std::vector<LogicalOperator*> ops;
         for (auto i = 1u; i < intersect.getNumChildren(); ++i) {
             auto buildRoot = intersect.getChild(i);
-            for (auto& op_ : getScanNodeCandidates(*nodeID, buildRoot.get())) {
+            auto candidates = getScanNodeCandidates(*nodeID, buildRoot.get());
+            eraseCandidatesUnderUpdate(candidates, buildRoot.get());
+            for (auto& op_ : candidates) {
                 ops.push_back(op_);
             }
         }
@@ -626,6 +696,9 @@ void HashJoinSIPOptimizer::visitIntersect(LogicalOperator* op) {
 }
 
 void HashJoinSIPOptimizer::visitPathPropertyProbe(LogicalOperator* op) {
+    if (planHasAssert && containsAssert(op)) {
+        return;
+    }
     auto& pathPropertyProbe = op->cast<LogicalPathPropertyProbe>();
     switch (pathPropertyProbe.getSIPInfo().position) {
     case SemiMaskPosition::PROHIBIT_PROBE_TO_BUILD:

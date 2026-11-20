@@ -165,6 +165,18 @@ public:
     // Deletes key, maintaining gapless structure by replacing it with the last entry in the
     // slot
     bool deleteKey(KeyType key) {
+        return deleteKeyIf(key, [](common::offset_t) { return true; });
+    }
+    // Deletes only the entry of key whose value is `value`. An entry for an equal key pointing at
+    // another row stays.
+    bool deleteKey(KeyType key, common::offset_t value) {
+        return deleteKeyIf(key,
+            [value](common::offset_t entryValue) { return entryValue == value; });
+    }
+
+private:
+    template<typename ValuePredicate>
+    bool deleteKeyIf(KeyType key, ValuePredicate matchesValue) {
         if (this->indexHeader.numEntries == 0) {
             return false;
         }
@@ -177,7 +189,8 @@ public:
             for (auto entryPos = 0u; entryPos < SLOT_CAPACITY; entryPos++) {
                 if (iter.slot->header.isEntryValid(entryPos) &&
                     iter.slot->header.fingerprints[entryPos] == fingerprint &&
-                    equals(key, iter.slot->entries[entryPos].key)) {
+                    equals(key, iter.slot->entries[entryPos].key) &&
+                    matchesValue(iter.slot->entries[entryPos].value)) {
                     deletedPos = entryPos;
                     break;
                 }
@@ -212,7 +225,6 @@ public:
         return false;
     }
 
-private:
     // Assumes that space has already been allocated for the entry
     bool appendInternal(OwnedType&& key, common::offset_t value, common::hash_t hash,
         visible_func isVisible) {

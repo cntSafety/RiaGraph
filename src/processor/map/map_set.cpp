@@ -1,8 +1,10 @@
 #include "binder/expression/property_expression.h"
 #include "binder/expression/rel_expression.h"
 #include "main/client_context.h"
+#include "planner/operator/persistent/logical_namespace_mutation.h"
 #include "planner/operator/persistent/logical_set.h"
 #include "processor/expression_mapper.h"
+#include "processor/operator/persistent/namespace_mutation.h"
 #include "processor/operator/persistent/set.h"
 #include "processor/plan_mapper.h"
 #include "storage/partition_storage_registry.h"
@@ -19,6 +21,24 @@ using namespace riag::storage;
 
 namespace riag {
 namespace processor {
+
+std::unique_ptr<PhysicalOperator> PlanMapper::mapNamespaceMutation(
+    const LogicalOperator* logicalOperator) {
+    const auto& mutation = logicalOperator->constCast<LogicalNamespaceMutation>();
+    auto previous = mapOperator(logicalOperator->getChild(0).get());
+    const auto* schema = logicalOperator->getSchema();
+    std::vector<NamespaceMutationInfo> infos;
+    for (const auto& move : mutation.moves) {
+        if (move.entity->isEmpty()) {
+            continue;
+        }
+        infos.push_back({getDataPos(*move.entity->getInternalID(), *schema), move.target,
+            move.entity->getEntry(0)->getOwningCatalog(),
+            move.entity->getDataType().getLogicalTypeID() == LogicalTypeID::REL});
+    }
+    return std::make_unique<NamespaceMutation>(std::move(infos), std::move(previous),
+        getOperatorID());
+}
 
 static column_id_t getColumnID(const TableCatalogEntry& entry,
     const PropertyExpression& propertyExpr) {
@@ -44,6 +64,41 @@ static RelTableSetInfo getRelTableSetInfo(const RelGroupCatalogEntry& entry, tab
     auto table = storageManager->getTable(relEntryInfo->oid)->ptrCast<RelTable>();
     auto columnID = getColumnID(entry, expr.constCast<PropertyExpression>());
     return RelTableSetInfo(table, columnID);
+}
+
+// A refresh reads the stored column straight into the projected vector, so it needs the column to
+// have the projected type in every table (a scan of any other column casts or extracts from JSON).
+static bool storedTypeIsProjectedType(const BoundSetPropertyInfo& info) {
+    auto& property = info.column->constCast<PropertyExpression>();
+    for (auto entry : info.pattern->constCast<NodeOrRelExpression>().getEntries()) {
+        if (!property.hasProperty(entry->getTableID())) {
+            continue;
+        }
+        if (!entry->containsProperty(property.getPropertyName()) ||
+            entry->getProperty(property.getPropertyName()).getType() != property.getDataType()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// For each SET item, the items whose target property its right-hand side reads. The input is
+// accumulated before the SET, so that property was scanned before any row was written: an item
+// reading it would miss what earlier rows wrote to the same node or rel, as in
+// `UNWIND [1,2,3] AS k MATCH (a {id:0}) SET a.v = a.v + 1`. Those properties are read again from
+// storage before the item is evaluated.
+std::vector<std::vector<idx_t>> PlanMapper::getColumnsToRefresh(
+    const std::vector<BoundSetPropertyInfo>& infos, const Schema& schema) {
+    std::vector<std::vector<idx_t>> result(infos.size());
+    for (auto i = 0u; i < infos.size(); ++i) {
+        for (const auto j : LogicalSetProperty::getItemsReadBy(infos, i)) {
+            if (schema.isExpressionInScope(*infos[j].column) &&
+                storedTypeIsProjectedType(infos[j])) {
+                result[i].push_back(j);
+            }
+        }
+    }
+    return result;
 }
 
 std::unique_ptr<NodeSetExecutor> PlanMapper::getNodeSetExecutor(
@@ -105,8 +160,9 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapSetNodeProperty(
         expressions.emplace_back(info.column, info.columnData);
     }
     auto printInfo = std::make_unique<SetPropertyPrintInfo>(expressions);
-    return std::make_unique<SetNodeProperty>(std::move(executors), std::move(prevOperator),
-        getOperatorID(), std::move(printInfo));
+    return std::make_unique<SetNodeProperty>(std::move(executors),
+        getColumnsToRefresh(set->getInfos(), *inSchema), std::move(prevOperator), getOperatorID(),
+        std::move(printInfo));
 }
 
 std::unique_ptr<RelSetExecutor> PlanMapper::getRelSetExecutor(const BoundSetPropertyInfo& boundInfo,
@@ -163,8 +219,9 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapSetRelProperty(
         expressions.emplace_back(info.column, info.columnData);
     }
     auto printInfo = std::make_unique<SetPropertyPrintInfo>(expressions);
-    return std::make_unique<SetRelProperty>(std::move(executors), std::move(prevOperator),
-        getOperatorID(), std::move(printInfo));
+    return std::make_unique<SetRelProperty>(std::move(executors),
+        getColumnsToRefresh(set->getInfos(), *inSchema), std::move(prevOperator), getOperatorID(),
+        std::move(printInfo));
 }
 
 } // namespace processor

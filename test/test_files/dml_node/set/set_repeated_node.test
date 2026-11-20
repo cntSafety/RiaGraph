@@ -1,0 +1,167 @@
+-DATASET CSV empty
+
+--
+
+# One SET statement that writes the same node from several rows. The input is accumulated
+# before the SET, so the properties the right-hand sides read were scanned before any row was
+# written; each row must still see what the earlier rows stored.
+
+-CASE SetRepeatedNodeReadsEarlierRows
+-STATEMENT CREATE NODE TABLE A(id STRING, v INT64, w INT64, s STRING, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE (:A {id: 'pre', v: 1, w: 0, s: ''}), (:A {id: 'b', v: 10}), (:A {id: 'c', v: 100});
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A {id: 'pre'}) SET a.v = a.v + 1 RETURN k, a.v;
+---- 3
+1|2
+2|3
+3|4
+-STATEMENT MATCH (a:A {id: 'pre'}) RETURN a.v;
+---- 1
+4
+-STATEMENT UNWIND ['x', 'y', 'z'] AS t MATCH (a:A {id: 'pre'}) SET a.s = a.s + t RETURN t, a.s;
+---- 3
+x|x
+y|xy
+z|xyz
+# An item reading the target of a later item sees the earlier rows' writes too.
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A {id: 'pre'}) SET a.w = a.v, a.v = a.v * 2 RETURN k, a.v, a.w;
+---- 3
+1|8|4
+2|16|8
+3|32|16
+-STATEMENT MATCH (a:A {id: 'pre'}) RETURN a.v, a.w;
+---- 1
+32|16
+# A second SET clause reads what the first one stored for every row.
+-STATEMENT MATCH (a:A {id: 'pre'}) SET a.v = 1;
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A {id: 'pre'}) SET a.v = a.v + 1 SET a.v = a.v * 2 RETURN k, a.v;
+---- 3
+1|8
+2|16
+3|32
+-STATEMENT MATCH (a:A {id: 'pre'}) RETURN a.v;
+---- 1
+32
+# Several nodes, each repeated, interleaved.
+-STATEMENT UNWIND ['b', 'c', 'b', 'c', 'b'] AS i MATCH (a:A {id: i}) SET a.v = a.v + 1 RETURN a.id, a.v;
+---- 5
+b|11
+b|12
+b|13
+c|101
+c|102
+-STATEMENT MATCH (a:A) WHERE a.id IN ['b', 'c'] RETURN a.id, a.v;
+---- 2
+b|13
+c|102
+# A NULL property stays NULL through the arithmetic; coalesce starts it.
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A {id: 'b'}) SET a.w = coalesce(a.w, 0) + k RETURN k, a.w;
+---- 3
+1|1
+2|3
+3|6
+
+-CASE SetRepeatedNodeAcrossVectors
+-STATEMENT CREATE NODE TABLE A(id STRING, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE (:A {id: 'pre', v: 1});
+---- ok
+-STATEMENT UNWIND range(1, 5000) AS k MATCH (a:A {id: 'pre'}) SET a.v = a.v + 1 WITH a.v AS v RETURN count(*), count(DISTINCT v), min(v), max(v);
+---- 1
+5000|5000|2|5001
+-STATEMENT MATCH (a:A {id: 'pre'}) RETURN a.v;
+---- 1
+5001
+
+-CASE SetRepeatedNodeCreatedInStatement
+-STATEMENT CREATE NODE TABLE A(id STRING, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE (a:A {id: 'new', v: 1}) WITH a UNWIND [1, 2, 3] AS k SET a.v = a.v + 1 RETURN k, a.v;
+---- 3
+1|2
+2|3
+3|4
+-STATEMENT MATCH (a:A {id: 'new'}) RETURN a.v;
+---- 1
+4
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:A {id: 'tx', v: 1});
+---- ok
+-STATEMENT UNWIND range(1, 3000) AS k MATCH (a:A {id: 'tx'}) SET a.v = a.v + 1 RETURN count(*);
+---- 1
+3000
+-STATEMENT COMMIT;
+---- ok
+-STATEMENT MATCH (a:A {id: 'tx'}) RETURN a.v;
+---- 1
+3001
+
+-CASE SetRepeatedNodeMultiLabel
+-STATEMENT CREATE NODE TABLE A(id STRING, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE B(id STRING, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE (:A {id: 'a', v: 1}), (:B {id: 'b', v: 10});
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A:B) SET a.v = a.v + 1 RETURN a.id, a.v;
+---- 6
+a|2
+a|3
+a|4
+b|11
+b|12
+b|13
+-STATEMENT MATCH (a:A:B) RETURN a.id, a.v;
+---- 2
+a|4
+b|13
+
+# Boundary: distinct nodes per row, and right-hand sides that read no target property, behave
+# as before.
+-CASE SetDistinctNodesUnchanged
+-STATEMENT CREATE NODE TABLE A(id INT64, v INT64, w INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND range(1, 3000) AS k CREATE (:A {id: k, v: k});
+---- ok
+-STATEMENT MATCH (a:A) SET a.v = a.v * 2, a.w = a.v + 1 RETURN sum(a.v), sum(a.w);
+---- 1
+9003000|9006000
+-STATEMENT MATCH (a:A) RETURN sum(a.v), sum(a.w);
+---- 1
+9003000|9006000
+-STATEMENT UNWIND [7, 8, 9] AS k MATCH (a:A {id: 1}) SET a.w = k RETURN k, a.w;
+---- 3
+7|7
+8|8
+9|9
+-STATEMENT MATCH (a:A {id: 1}) RETURN a.v, a.w;
+---- 1
+2|9
+
+# A node matched once per neighbour is written once per row, not once per node.
+-CASE SetRepeatedNodeOncePerRow
+-STATEMENT CREATE NODE TABLE A(id INT64, deg INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM A TO A);
+---- ok
+-STATEMENT UNWIND range(1, 4) AS k CREATE (:A {id: k, deg: 0});
+---- ok
+-STATEMENT MATCH (a:A {id: 1}), (b:A) WHERE b.id > 1 CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:A {id: 2}), (b:A {id: 3}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:A)-[:R]->(b:A) SET a.deg = a.deg + 1 RETURN a.id, b.id, a.deg;
+---- 4
+1|2|1
+1|3|2
+1|4|3
+2|3|1
+-STATEMENT MATCH (a:A) RETURN a.id, a.deg;
+---- 4
+1|3
+2|1
+3|0
+4|0

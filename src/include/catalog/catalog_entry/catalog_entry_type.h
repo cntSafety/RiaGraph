@@ -28,6 +28,9 @@ enum class CatalogEntryType : uint8_t {
     INDEX_ENTRY = 42,
     // Graph entries
     GRAPH_ENTRY = 50,
+    NAMESPACE_ENTRY = 51,
+    NAMESPACE_POLICY_ENTRY = 52,
+    NAMESPACE_MEMBERSHIP_ENTRY = 53,
     // Dummy entry
     DUMMY_ENTRY = 100,
 };

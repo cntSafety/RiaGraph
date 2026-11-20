@@ -9,6 +9,7 @@
 #include "binder/query/query_graph.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/copier_config/file_scan_info.h"
+#include "common/namespace_set.h"
 #include "common/partition_routing.h"
 #include "parser/ddl/parsed_property_definition.h"
 #include "parser/query/graph_pattern/pattern_element.h"
@@ -238,6 +239,8 @@ public:
         const parser::ReadingClause& readingClause);
     std::unique_ptr<BoundReadingClause> bindInQueryCall(const parser::ReadingClause& readingClause);
     std::unique_ptr<BoundReadingClause> bindLoadFrom(const parser::ReadingClause& readingClause);
+    std::unique_ptr<BoundReadingClause> bindAssertClause(
+        const parser::ReadingClause& readingClause);
 
     /*** bind updating clause ***/
     std::unique_ptr<BoundUpdatingClause> bindUpdatingClause(
@@ -271,15 +274,27 @@ public:
     BoundProjectionList bindProjectionList(const parser::ProjectionBody& projectionBody);
     BoundProjectionBody bindProjectionBody(const parser::ProjectionBody& projectionBody,
         const BoundProjectionList& projectionList);
+    // The aggregates that a bound expression computes itself (an aggregate already in scope was
+    // computed by an earlier clause), validated against nesting as in a projection.
+    expression_vector getNewAggregateExpressions(const std::shared_ptr<Expression>& expression);
 
     expression_vector bindOrderByExpressions(
         const std::vector<std::unique_ptr<parser::ParsedExpression>>& parsedExprs);
     std::shared_ptr<Expression> bindSkipLimitExpression(const parser::ParsedExpression& expression);
 
     /*** bind graph pattern ***/
-    BoundGraphPattern bindGraphPattern(const std::vector<parser::PatternElement>& graphPattern);
+    BoundGraphPattern bindGraphPattern(const std::vector<parser::PatternElement>& graphPattern,
+        bool namespaceWrite = false);
+    common::NamespaceSet bindNamespaceSelector(const parser::NamespaceSelector& selector) const;
+    std::shared_ptr<Expression> bindNamespaceReadPredicate(const parser::NodePattern& pattern,
+        NodeOrRelExpression& entity);
+    void prepareNamespaceWrites(const std::optional<parser::NamespaceSelector>& selector,
+        const std::unordered_set<std::string>& existing, bool merge);
+    void bindNamespaceWriteTarget(const parser::NodePattern& pattern, NodeOrRelExpression& entity,
+        expression_vector& matchPredicates);
 
-    QueryGraph bindPatternElement(const parser::PatternElement& patternElement);
+    QueryGraph bindPatternElement(const parser::PatternElement& patternElement,
+        expression_vector& namespacePredicates, bool namespaceWrite);
     std::shared_ptr<Expression> createPath(const std::string& pathName,
         const expression_vector& children);
 
@@ -353,6 +368,13 @@ private:
     ExpressionBinder expressionBinder;
     main::ClientContext* clientContext;
     std::vector<extension::BinderExtension*> binderExtensions;
+    common::NamespaceSet namespaceReadBase;
+    std::optional<common::namespace_id_t> namespaceWriteDefault;
+    std::unordered_set<std::string> namespaceExistingPatterns;
+    std::unordered_map<std::string, common::namespace_id_t> namespaceNewTargets;
+    expression_vector namespaceWriteAssertions;
+    bool namespaceMergeBinding = false;
+    bool namespaceMayMutate = false;
 };
 
 } // namespace binder

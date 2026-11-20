@@ -4,6 +4,7 @@
 #include <unordered_set>
 
 #include "common/case_insensitive_map.h"
+#include "common/namespace_set.h"
 #include "expression.h"
 #include "property_expression.h"
 
@@ -77,6 +78,9 @@ public:
         return propertyExprs[propertyNameToIdx.at(propertyName)];
     }
     virtual std::shared_ptr<PropertyExpression> getInternalID() const = 0;
+    common::namespace_id_t namespaceWriteTarget = common::GLOBAL_NAMESPACE_ID;
+    bool namespaceMutable = false;
+    common::NamespaceSet namespaceDeleteScope;
 
     // Label expression
     void setLabelExpression(std::shared_ptr<Expression> expression) {

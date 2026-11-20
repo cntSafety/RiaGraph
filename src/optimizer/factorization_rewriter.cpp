@@ -4,6 +4,7 @@
 #include "planner/operator/factorization/flatten_resolver.h"
 #include "planner/operator/logical_accumulate.h"
 #include "planner/operator/logical_aggregate.h"
+#include "planner/operator/logical_assert.h"
 #include "planner/operator/logical_distinct.h"
 #include "planner/operator/logical_filter.h"
 #include "planner/operator/logical_flatten.h"
@@ -140,6 +141,12 @@ void FactorizationRewriter::visitFilter(planner::LogicalOperator* op) {
     auto& filter = op->cast<LogicalFilter>();
     auto groupsPosToFlatten = filter.getGroupsPosToFlatten();
     filter.setChild(0, appendFlattens(filter.getChild(0), groupsPosToFlatten));
+}
+
+void FactorizationRewriter::visitAssert(planner::LogicalOperator* op) {
+    auto& assertOp = op->cast<LogicalAssert>();
+    auto groupsPosToFlatten = assertOp.getGroupsPosToFlatten();
+    assertOp.setChild(0, appendFlattens(assertOp.getChild(0), groupsPosToFlatten));
 }
 
 void FactorizationRewriter::visitSetProperty(planner::LogicalOperator* op) {

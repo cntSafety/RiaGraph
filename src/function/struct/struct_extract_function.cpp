@@ -17,6 +17,7 @@ std::unique_ptr<FunctionBindData> StructExtractFunctions::bindFunc(
     if (input.arguments[1]->expressionType != ExpressionType::LITERAL) {
         throw BinderException("Key name for struct/union extract must be STRING literal.");
     }
+    ExpressionUtil::validateDataType(*input.arguments[1], LogicalTypeID::STRING);
     auto key =
         input.arguments[1]->constPtrCast<LiteralExpression>()->getValue().getValue<std::string>();
     auto fieldIdx = StructType::getFieldIdx(structType, key);

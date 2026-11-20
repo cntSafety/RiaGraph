@@ -164,6 +164,139 @@ static bool subInt64WithBorrow(int64_t a, int64_t b, int borrow, int64_t& out) {
     return true;
 }
 
+// The operations below that need an absolute value work on magnitudes: the bit pattern of
+// |value| as an unsigned 128-bit number. The magnitude of INT128_MIN is 2^127, which has no
+// int128_t, so it cannot be formed with negateInPlace; unsigned wrapping arithmetic has no such
+// gap and, unlike negating the signed halves, no signed overflow.
+struct Magnitude {
+    uint64_t low;
+    uint64_t high;
+};
+
+static Magnitude negateMagnitude(Magnitude value) {
+    // Two's complement: ~value + 1.
+    Magnitude result{};
+    result.low = uint64_t(0) - value.low;
+    result.high = ~value.high + (result.low == 0 ? 1 : 0);
+    return result;
+}
+
+static Magnitude toMagnitude(int128_t value, bool& negative) {
+    negative = value.high < 0;
+    Magnitude result{value.low, static_cast<uint64_t>(value.high)};
+    return negative ? negateMagnitude(result) : result;
+}
+
+// Whether the signed value with this sign and magnitude is representable: at most 2^127 - 1 if
+// positive and at most 2^127 if negative.
+static bool magnitudeFits(Magnitude value, bool negative) {
+    constexpr uint64_t signBit = uint64_t(1) << 63;
+    if (value.high < signBit) {
+        return true;
+    }
+    return negative && value.high == signBit && value.low == 0;
+}
+
+// Precondition: magnitudeFits(value, negative).
+static int128_t fromMagnitude(Magnitude value, bool negative) {
+    if (negative) {
+        value = negateMagnitude(value);
+    }
+    return int128_t{value.low, static_cast<int64_t>(value.high)};
+}
+
+// Full 64 x 64 -> 128 bit product from 32-bit limbs, which needs no compiler support.
+static void multiplyFull(uint64_t lhs, uint64_t rhs, uint64_t& high, uint64_t& low) {
+    uint64_t lhsLow = lhs & 0xffffffff;
+    uint64_t lhsHigh = lhs >> 32;
+    uint64_t rhsLow = rhs & 0xffffffff;
+    uint64_t rhsHigh = rhs >> 32;
+    uint64_t lowLow = lhsLow * rhsLow;
+    uint64_t lowHigh = lhsLow * rhsHigh;
+    uint64_t highLow = lhsHigh * rhsLow;
+    uint64_t highHigh = lhsHigh * rhsHigh;
+    // At most 3 * (2^32 - 1): no overflow.
+    uint64_t middle = (lowLow >> 32) + (lowHigh & 0xffffffff) + (highLow & 0xffffffff);
+    low = (lowLow & 0xffffffff) | (middle << 32);
+    high = highHigh + (lowHigh >> 32) + (highLow >> 32) + (middle >> 32);
+}
+
+// lhs * rhs as unsigned 128-bit numbers; false if the product needs more than 128 bits.
+[[maybe_unused]] static bool multiplyMagnitudePortable(Magnitude lhs, Magnitude rhs,
+    Magnitude& result) {
+    // With lhs = lhs.high * 2^64 + lhs.low and the same for rhs, both high parts non-zero means
+    // a product of at least 2^128.
+    if (lhs.high != 0 && rhs.high != 0) {
+        return false;
+    }
+    uint64_t high = 0;
+    uint64_t low = 0;
+    multiplyFull(lhs.low, rhs.low, high, low);
+    // The product of a high part and a low part is shifted by 64 bits: it has to fit in 64.
+    uint64_t crossHigh = 0;
+    uint64_t crossLow = 0;
+    if (lhs.high != 0) {
+        multiplyFull(lhs.high, rhs.low, crossHigh, crossLow);
+    } else if (rhs.high != 0) {
+        multiplyFull(lhs.low, rhs.high, crossHigh, crossLow);
+    }
+    if (crossHigh != 0 || high + crossLow < high) {
+        return false;
+    }
+    result.low = low;
+    result.high = high + crossLow;
+    return true;
+}
+
+static bool multiplyMagnitude(Magnitude lhs, Magnitude rhs, Magnitude& result) {
+#if ((__GNUC__ >= 5) || defined(__clang__)) && defined(__SIZEOF_INT128__)
+    __uint128_t left = __uint128_t(lhs.low) + (__uint128_t(lhs.high) << 64);
+    __uint128_t right = __uint128_t(rhs.low) + (__uint128_t(rhs.high) << 64);
+    __uint128_t product = 0;
+    if (__builtin_mul_overflow(left, right, &product)) {
+        return false;
+    }
+    result.low = uint64_t(product & 0xffffffffffffffff);
+    result.high = uint64_t(product >> 64);
+    return true;
+#else
+    return multiplyMagnitudePortable(lhs, rhs, result);
+#endif
+}
+
+static uint32_t magnitudeBitsAmount(Magnitude value) {
+    if (value.high != 0) {
+        return 128 - std::countl_zero(value.high);
+    }
+    return 64 - std::countl_zero(value.low);
+}
+
+static bool magnitudeGreaterThanOrEquals(Magnitude lhs, Magnitude rhs) {
+    return lhs.high > rhs.high || (lhs.high == rhs.high && lhs.low >= rhs.low);
+}
+
+// Schoolbook shift-subtract division of unsigned 128-bit numbers. The remainder stays below
+// rhs <= 2^127 and so does not lose a bit when it is shifted. Precondition: rhs != 0.
+static void divModMagnitude(Magnitude lhs, Magnitude rhs, Magnitude& quotient,
+    Magnitude& remainder) {
+    quotient = Magnitude{0, 0};
+    remainder = Magnitude{0, 0};
+    for (uint32_t bit = magnitudeBitsAmount(lhs); bit > 0; bit--) {
+        quotient.high = (quotient.high << 1) | (quotient.low >> 63);
+        quotient.low <<= 1;
+        remainder.high = (remainder.high << 1) | (remainder.low >> 63);
+        remainder.low <<= 1;
+        uint64_t lhsBit = bit - 1 < 64 ? (lhs.low >> (bit - 1)) & 1 : (lhs.high >> (bit - 65)) & 1;
+        remainder.low |= lhsBit;
+        if (magnitudeGreaterThanOrEquals(remainder, rhs)) {
+            uint64_t borrow = remainder.low < rhs.low ? 1 : 0;
+            remainder.low -= rhs.low;
+            remainder.high -= rhs.high + borrow;
+            quotient.low |= 1;
+        }
+    }
+}
+
 bool Int128_t::addInPlace(int128_t& lhs, int128_t rhs) {
     bool lhsPositive = lhs.high >= 0;
     bool rhsPositive = rhs.high >= 0;
@@ -188,11 +321,10 @@ bool Int128_t::subInPlace(int128_t& lhs, int128_t rhs) {
     if (!subInt64WithBorrow(lhs.high, rhs.high, borrow, highDiff)) {
         return false;
     }
+    // The difference of the high parts, with the borrow, is within int64 exactly when the
+    // 128-bit difference is within int128, INT128_MIN included.
     lhs.high = highDiff;
     lhs.low -= rhs.low;
-    if (lhs.high == INT64_MIN && lhs.low == 0) {
-        return false;
-    }
     return true;
 }
 
@@ -211,98 +343,18 @@ int128_t Int128_t::Sub(int128_t lhs, const int128_t rhs) {
 }
 
 bool Int128_t::tryMultiply(int128_t lhs, int128_t rhs, int128_t& result) {
-    bool lhs_negative = lhs.high < 0;
-    bool rhs_negative = rhs.high < 0;
-    if (lhs_negative) {
-        negateInPlace(lhs);
-    }
-    if (rhs_negative) {
-        negateInPlace(rhs);
-    }
-#if ((__GNUC__ >= 5) || defined(__clang__)) && defined(__SIZEOF_INT128__)
-    __uint128_t left = __uint128_t(lhs.low) + (__uint128_t(lhs.high) << 64);
-    __uint128_t right = __uint128_t(rhs.low) + (__uint128_t(rhs.high) << 64);
-    __uint128_t result_i128 = 0;
-    if (__builtin_mul_overflow(left, right, &result_i128)) {
+    bool lhsNegative = false;
+    bool rhsNegative = false;
+    Magnitude product{};
+    if (!multiplyMagnitude(toMagnitude(lhs, lhsNegative), toMagnitude(rhs, rhsNegative), product)) {
         return false;
     }
-    auto high = uint64_t(result_i128 >> 64);
-    if (high & 0x8000000000000000) {
+    // A zero product is representable with either sign.
+    bool negative = lhsNegative != rhsNegative;
+    if (!magnitudeFits(product, negative)) {
         return false;
     }
-    result.high = int64_t(high);
-    result.low = uint64_t(result_i128 & 0xffffffffffffffff);
-#else
-    // Multiply code adapted from:
-    // https://github.com/calccrypto/uint128_t/blob/master/uint128_t.cpp
-    // License: https://github.com/calccrypto/uint128_t/blob/c%2B%2B11_14/LICENSE
-    uint64_t top[4] = {uint64_t(lhs.high) >> 32, uint64_t(lhs.high) & 0xffffffff, lhs.low >> 32,
-        lhs.low & 0xffffffff};
-    uint64_t bottom[4] = {uint64_t(rhs.high) >> 32, uint64_t(rhs.high) & 0xffffffff, rhs.low >> 32,
-        rhs.low & 0xffffffff};
-    uint64_t products[4][4];
-
-    // multiply each component of the values
-    for (auto x = 0; x < 4; x++) {
-        for (auto y = 0; y < 4; y++) {
-            products[x][y] = top[x] * bottom[y];
-        }
-    }
-
-    // if any of these products are set to a non-zero value, there is always an overflow
-    if (products[0][0] || products[0][1] || products[0][2] || products[1][0] || products[2][0] ||
-        products[1][1]) {
-        return false;
-    }
-    // if the high bits of any of these are set, there is always an overflow
-    if ((products[0][3] & 0xffffffff80000000) || (products[1][2] & 0xffffffff80000000) ||
-        (products[2][1] & 0xffffffff80000000) || (products[3][0] & 0xffffffff80000000)) {
-        return false;
-    }
-
-    // otherwise we merge the result of the different products together in-order
-
-    // first row
-    uint64_t fourth32 = (products[3][3] & 0xffffffff);
-    uint64_t third32 = (products[3][2] & 0xffffffff) + (products[3][3] >> 32);
-    uint64_t second32 = (products[3][1] & 0xffffffff) + (products[3][2] >> 32);
-    uint64_t first32 = (products[3][0] & 0xffffffff) + (products[3][1] >> 32);
-
-    // second row
-    third32 += (products[2][3] & 0xffffffff);
-    second32 += (products[2][2] & 0xffffffff) + (products[2][3] >> 32);
-    first32 += (products[2][1] & 0xffffffff) + (products[2][2] >> 32);
-
-    // third row
-    second32 += (products[1][3] & 0xffffffff);
-    first32 += (products[1][2] & 0xffffffff) + (products[1][3] >> 32);
-
-    // fourth row
-    first32 += (products[0][3] & 0xffffffff);
-
-    // move carry to next digit
-    third32 += fourth32 >> 32;
-    second32 += third32 >> 32;
-    first32 += second32 >> 32;
-
-    // check if the combination of the different products resulted in an overflow
-    if (first32 & 0xffffff80000000) {
-        return false;
-    }
-
-    // remove carry from current digit
-    fourth32 &= 0xffffffff;
-    third32 &= 0xffffffff;
-    second32 &= 0xffffffff;
-    first32 &= 0xffffffff;
-
-    // combine components
-    result.low = (third32 << 32) | fourth32;
-    result.high = (first32 << 32) | second32;
-#endif
-    if (lhs_negative ^ rhs_negative) {
-        negateInPlace(result);
-    }
+    result = fromMagnitude(product, negative);
     return true;
 }
 
@@ -314,48 +366,29 @@ int128_t Int128_t::Mul(int128_t lhs, int128_t rhs) {
     return result;
 }
 
+// The remainder takes the sign of lhs, the quotient is negative if the signs differ. The
+// quotient is returned as a magnitude because INT128_MIN / -1 = 2^127 has no int128_t; the
+// remainder is always smaller than |rhs| and fits.
+static void divModSigned(int128_t lhs, int128_t rhs, Magnitude& quotient, bool& quotientNegative,
+    int128_t& remainder) {
+    bool lhsNegative = false;
+    bool rhsNegative = false;
+    Magnitude remainderMagnitude{};
+    divModMagnitude(toMagnitude(lhs, lhsNegative), toMagnitude(rhs, rhsNegative), quotient,
+        remainderMagnitude);
+    quotientNegative = lhsNegative != rhsNegative;
+    remainder = fromMagnitude(remainderMagnitude, lhsNegative);
+}
+
 int128_t Int128_t::divMod(int128_t lhs, int128_t rhs, int128_t& remainder) {
-    bool lhs_negative = lhs.high < 0;
-    bool rhs_negative = rhs.high < 0;
-    if (lhs_negative) {
-        negateInPlace(lhs);
+    Magnitude quotient{};
+    bool quotientNegative = false;
+    divModSigned(lhs, rhs, quotient, quotientNegative, remainder);
+    if (!magnitudeFits(quotient, quotientNegative)) {
+        // Only INT128_MIN / -1.
+        throw common::OverflowException("INT128 is out of range: cannot divide.");
     }
-    if (rhs_negative) {
-        negateInPlace(rhs);
-    }
-
-    // divMod code adapted from:
-    // https://github.com/calccrypto/uint128_t/blob/master/uint128_t.cpp
-    // License: https://github.com/calccrypto/uint128_t/blob/c%2B%2B11_14/LICENSE
-    // initialize the result and remainder to 0
-    int128_t div_result{0};
-    remainder.low = 0;
-    remainder.high = 0;
-
-    // now iterate over the amount of bits that are set in the LHS
-    for (uint8_t x = positiveInt128BitsAmount(lhs); x > 0; x--) {
-        // left-shift the current result and remainder by 1
-        div_result = positiveInt128LeftShift(div_result, 1);
-        remainder = positiveInt128LeftShift(remainder, 1);
-
-        // we get the value of the bit at position X, where position 0 is the least-significant bit
-        if (positiveInt128IsBitSet(lhs, x - 1)) {
-            // increment the remainder
-            addInPlace(remainder, 1);
-        }
-        if (greaterThanOrEquals(remainder, rhs)) {
-            // the remainder has passed the division multiplier: add one to the divide result
-            remainder = Sub(remainder, rhs);
-            addInPlace(div_result, 1);
-        }
-    }
-    if (lhs_negative ^ rhs_negative) {
-        negateInPlace(div_result);
-    }
-    if (lhs_negative) {
-        negateInPlace(remainder);
-    }
-    return div_result;
+    return fromMagnitude(quotient, quotientNegative);
 }
 
 int128_t Int128_t::Div(int128_t lhs, int128_t rhs) {
@@ -370,9 +403,12 @@ int128_t Int128_t::Mod(int128_t lhs, int128_t rhs) {
     if (rhs.high == 0 && rhs.low == 0) {
         throw common::RuntimeException("Modulo by zero.");
     }
-    int128_t result{};
-    divMod(lhs, rhs, result);
-    return result;
+    // The remainder of INT128_MIN % -1 is 0, so unlike Div this must not look at the quotient.
+    Magnitude quotient{};
+    bool quotientNegative = false;
+    int128_t remainder{};
+    divModSigned(lhs, rhs, quotient, quotientNegative, remainder);
+    return remainder;
 }
 
 int128_t Int128_t::Xor(int128_t lhs, int128_t rhs) {

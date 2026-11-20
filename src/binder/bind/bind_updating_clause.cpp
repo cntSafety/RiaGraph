@@ -12,6 +12,7 @@
 #include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/assert.h"
 #include "common/exception/binder.h"
 #include "common/json.h"
@@ -74,10 +75,13 @@ std::unique_ptr<BoundUpdatingClause> Binder::bindInsertClause(
     const UpdatingClause& updatingClause) {
     auto& insertClause = updatingClause.constCast<InsertClause>();
     auto patternsScope = populatePatternsScope(scope);
+    prepareNamespaceWrites(insertClause.getNamespaceSelector(), patternsScope, false);
     // bindGraphPattern will update scope.
-    auto boundGraphPattern = bindGraphPattern(insertClause.getPatternElementsRef());
+    auto boundGraphPattern = bindGraphPattern(insertClause.getPatternElementsRef(), true);
     auto insertInfos = bindInsertInfos(boundGraphPattern.queryGraphCollection, patternsScope);
-    return std::make_unique<BoundInsertClause>(std::move(insertInfos));
+    auto result = std::make_unique<BoundInsertClause>(std::move(insertInfos));
+    result->namespaceAssertions = std::move(namespaceWriteAssertions);
+    return result;
 }
 
 static expression_vector getColumnDataExprs(QueryGraphCollection& collection) {
@@ -96,20 +100,44 @@ static expression_vector getColumnDataExprs(QueryGraphCollection& collection) {
 std::unique_ptr<BoundUpdatingClause> Binder::bindMergeClause(const UpdatingClause& updatingClause) {
     auto& mergeClause = updatingClause.constCast<MergeClause>();
     auto patternsScope = populatePatternsScope(scope);
+    prepareNamespaceWrites(mergeClause.getNamespaceSelector(), patternsScope, true);
     // bindGraphPattern will update scope.
-    auto boundGraphPattern = bindGraphPattern(mergeClause.getPatternElementsRef());
+    auto boundGraphPattern = bindGraphPattern(mergeClause.getPatternElementsRef(), true);
     auto columnDataExprs = getColumnDataExprs(boundGraphPattern.queryGraphCollection);
+    auto createInfos = bindInsertInfos(boundGraphPattern.queryGraphCollection, patternsScope);
+    // The query graph is kept for the existence check, and rewriteMatchPattern plans a self-loop
+    // (a)-[r]->(a) there as (a)-[r]->(a') WHERE a = a' by moving r's dst node. The rel this
+    // MERGE creates, sets and returns must keep ending at a: a' is NULL when nothing matched, and
+    // the insert skipped such a row. So the rewrite gets its own copy of each self-loop rel.
+    for (auto i = 0u; i < boundGraphPattern.queryGraphCollection.getNumQueryGraphs(); ++i) {
+        auto queryGraph = boundGraphPattern.queryGraphCollection.getQueryGraphUnsafe(i);
+        for (auto& queryRel : queryGraph->getQueryRels()) {
+            if (queryRel->isSelfLoop() && !queryRel->isRecursive()) {
+                queryGraph->replaceQueryRel(queryRel->copy());
+            }
+        }
+    }
     // Rewrite key value pairs in MATCH clause as predicate
     rewriteMatchPattern(boundGraphPattern);
     auto existenceMark =
         expressionBinder.createVariableExpression(LogicalType::BOOL(), std::string("__existence"));
     auto distinctMark =
         expressionBinder.createVariableExpression(LogicalType::BOOL(), std::string("__distinct"));
-    auto createInfos = bindInsertInfos(boundGraphPattern.queryGraphCollection, patternsScope);
     auto boundMergeClause =
         std::make_unique<BoundMergeClause>(columnDataExprs, std::move(existenceMark),
             std::move(distinctMark), std::move(boundGraphPattern.queryGraphCollection),
             std::move(boundGraphPattern.where), std::move(createInfos));
+    boundMergeClause->namespaceAssertions = std::move(namespaceWriteAssertions);
+    const auto bindMoves = [&](const auto& moves, auto& destination) {
+        SetClause parsed;
+        for (const auto& move : moves) {
+            parsed.addNamespaceMove(move);
+        }
+        auto bound = bindSetClause(parsed);
+        destination = bound->constCast<BoundSetClause>().namespaceMoves;
+    };
+    bindMoves(mergeClause.getOnMatchNamespaceMoves(), boundMergeClause->onMatchNamespaceMoves);
+    bindMoves(mergeClause.getOnCreateNamespaceMoves(), boundMergeClause->onCreateNamespaceMoves);
     if (mergeClause.hasOnMatchSetItems()) {
         for (auto& [lhs, rhs] : mergeClause.getOnMatchSetItemsRef()) {
             auto setPropertyInfo = bindSetPropertyInfo(lhs.get(), rhs.get());
@@ -551,6 +579,64 @@ std::unique_ptr<BoundUpdatingClause> Binder::bindSetClause(const UpdatingClause&
     for (auto& setItem : setClause.getSetItemsRef()) {
         boundSetClause->addInfo(bindSetPropertyInfo(setItem.first.get(), setItem.second.get()));
     }
+    for (const auto& move : setClause.getNamespaceMoves()) {
+        if (move.destination.all || move.destination.names.size() + move.destination.global != 1) {
+            throw BinderException("A namespace move requires one destination namespace.");
+        }
+        const auto target = *bindNamespaceSelector(move.destination).getSingleton();
+        auto expression = expressionBinder.bindVariableExpression(move.variable);
+        if (expression->expressionType != ExpressionType::PATTERN ||
+            (expression->getDataType().getLogicalTypeID() != LogicalTypeID::NODE &&
+                expression->getDataType().getLogicalTypeID() != LogicalTypeID::REL)) {
+            throw BinderException(
+                "Only node and relationship variables can move between namespaces.");
+        }
+        auto entity = std::static_pointer_cast<NodeOrRelExpression>(expression);
+        for (auto* entry : entity->getEntries()) {
+            // Entries a remote partition provider hands out have no owning catalog.
+            const auto* owner = entry->getOwningCatalog();
+            if (owner == nullptr) {
+                throw BinderException("Namespace moves require a table of a selected catalog.");
+            }
+            if (target != GLOBAL_NAMESPACE_ID) {
+                for (const auto* index : owner->getIndexEntries(
+                         transaction::Transaction::Get(*clientContext), entry->getTableID())) {
+                    const auto type = StringUtils::getUpper(index->getIndexType());
+                    if (type != "HASH" && type != "ART" && type != "NAMESPACE_HASH") {
+                        throw BinderException(
+                            "Namespace moves are not supported for tables with FTS/vector or other "
+                            "extension indexes in this version.");
+                    }
+                }
+            }
+            const auto* namespaces = owner->getNamespaces();
+            const auto* policy =
+                namespaces ? namespaces->getPolicy(transaction::Transaction::Get(*clientContext),
+                                 entry->getTableID()) :
+                             nullptr;
+            if (policy && !policy->allowed.contains(target)) {
+                throw BinderException(
+                    "The destination namespace is not allowed for table " + entry->getName() + ".");
+            }
+            if (entry->getType() == CatalogEntryType::NODE_TABLE_ENTRY) {
+                const auto& node = entry->constCast<NodeTableCatalogEntry>();
+                if (node.isPartitioned() || node.isPartitionChild() || node.getScanFunction() ||
+                    node.getStorageFormat() != StorageFormat::NONE || !node.getStorage().empty()) {
+                    throw BinderException(
+                        "Namespace moves require native, unpartitioned stored tables.");
+                }
+            } else {
+                const auto& rel = entry->constCast<RelGroupCatalogEntry>();
+                if (rel.getScanFunction() || rel.getStorageFormat() != StorageFormat::NONE ||
+                    !rel.getStorage().empty()) {
+                    throw BinderException("Namespace moves require native stored tables.");
+                }
+            }
+        }
+        entity->namespaceMutable = true;
+        namespaceMayMutate = true;
+        boundSetClause->namespaceMoves.push_back({std::move(entity), target});
+    }
     return boundSetClause;
 }
 
@@ -645,6 +731,7 @@ std::unique_ptr<BoundUpdatingClause> Binder::bindDeleteClause(
         if (ExpressionUtil::isNodePattern(*pattern)) {
             auto deleteNodeInfo = BoundDeleteInfo(deleteType, TableType::NODE, pattern);
             auto& node = pattern->constCast<NodeExpression>();
+            deleteNodeInfo.namespaceScope = node.namespaceDeleteScope;
             auto catalog = Catalog::Get(*clientContext);
             auto transaction = transaction::Transaction::Get(*clientContext);
             for (auto entry : node.getEntries()) {

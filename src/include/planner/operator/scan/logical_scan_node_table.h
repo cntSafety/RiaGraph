@@ -1,6 +1,7 @@
 #pragma once
 
 #include "binder/expression/expression_util.h"
+#include "common/namespace_set.h"
 #include "planner/operator/logical_operator.h"
 #include "storage/predicate/column_predicate.h"
 
@@ -30,6 +31,7 @@ struct PrimaryKeyScanInfo final : ExtraScanNodeTableInfo {
     bool lowerInclusive = true;
     bool upperInclusive = true;
     bool isRange = false;
+    bool nonUnique = false;
 
     explicit PrimaryKeyScanInfo(std::shared_ptr<binder::Expression> key) : key{std::move(key)} {}
     PrimaryKeyScanInfo(std::shared_ptr<binder::Expression> lowerBound, bool lowerInclusive,
@@ -42,7 +44,9 @@ struct PrimaryKeyScanInfo final : ExtraScanNodeTableInfo {
             return std::make_unique<PrimaryKeyScanInfo>(lowerBound, lowerInclusive, upperBound,
                 upperInclusive);
         }
-        return std::make_unique<PrimaryKeyScanInfo>(key);
+        auto result = std::make_unique<PrimaryKeyScanInfo>(key);
+        result->nonUnique = nonUnique;
+        return result;
     }
 };
 
@@ -81,6 +85,7 @@ class LogicalScanNodeTable final : public LogicalOperator {
     static constexpr LogicalScanNodeTableType defaultScanType = LogicalScanNodeTableType::SCAN;
 
 public:
+    common::NamespaceSet namespaceScope;
     LogicalScanNodeTable(std::shared_ptr<binder::Expression> nodeID,
         std::vector<common::table_id_t> nodeTableIDs, binder::expression_vector properties,
         common::cardinality_t cardinality = 0)

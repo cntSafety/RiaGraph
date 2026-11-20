@@ -8,6 +8,7 @@
 #include "binder/expression/parameter_expression.h"
 #include "common/exception/binder.h"
 #include "common/exception/runtime.h"
+#include "common/string_utils.h"
 #include "common/type_utils.h"
 #include "common/types/value/nested.h"
 #include <format>
@@ -304,12 +305,17 @@ static bool compatible(const LogicalType& type, const LogicalType& target) {
         return compatible(ArrayType::getChildType(type), ArrayType::getChildType(target));
     }
     case LogicalTypeID::STRUCT: {
+        // A static cast only relabels the type and keeps the fields where they are, so the
+        // names must line up position by position. A STRUCT with the same field types but other
+        // names (or another order) needs a real, name-based cast (cntSafety/RiaGraph#193).
         if (StructType::getNumFields(type) != StructType::getNumFields(target)) {
             return false;
         }
         for (auto i = 0u; i < StructType::getNumFields(type); ++i) {
-            if (!compatible(StructType::getField(type, i).getType(),
-                    StructType::getField(target, i).getType())) {
+            const auto& field = StructType::getField(type, i);
+            const auto& targetField = StructType::getField(target, i);
+            if (!StringUtils::caseInsensitiveEquals(field.getName(), targetField.getName()) ||
+                !compatible(field.getType(), targetField.getType())) {
                 return false;
             }
         }
@@ -374,6 +380,23 @@ static bool compatible(const Value& value, const LogicalType& targetType) {
             auto key = NestedVal::getChildVal(childVal, 0);
             auto val = NestedVal::getChildVal(childVal, 1);
             if (!compatible(*key, keyType) || !compatible(*val, valType)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    case LogicalTypeID::STRUCT: {
+        // Same positional-name rule as for the type; a NULL field value fits any field type.
+        const auto& type = value.getDataType();
+        if (StructType::getNumFields(type) != StructType::getNumFields(targetType) ||
+            NestedVal::getChildrenSize(&value) != StructType::getNumFields(targetType)) {
+            return false;
+        }
+        for (auto i = 0u; i < NestedVal::getChildrenSize(&value); ++i) {
+            if (!StringUtils::caseInsensitiveEquals(StructType::getField(type, i).getName(),
+                    StructType::getField(targetType, i).getName()) ||
+                !compatible(*NestedVal::getChildVal(&value, i),
+                    StructType::getField(targetType, i).getType())) {
                 return false;
             }
         }

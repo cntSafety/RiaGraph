@@ -1,0 +1,134 @@
+-DATASET CSV empty
+
+--
+
+# LimitPushDownOptimizer caps a DISTINCT at skip + limit rows when a SKIP/LIMIT sits above it.
+# With several SKIP/LIMIT clauses stacked above the DISTINCT, each one overwrote the skip or
+# limit the clause above it had contributed instead of composing with it, so the cap came out
+# too small and the query lost rows (2 instead of 5 for the first query below).
+#
+# Which distinct values survive SKIP/LIMIT over an unordered DISTINCT is not defined, so every
+# query returns a constant: only the number of rows is checked and the result does not depend on
+# the order in which DISTINCT emits its groups.
+
+-CASE LimitPushDownStackedSkipOverDistinct
+# The row counts below are the same with CALL enable_plan_optimizer=false.
+# Two SKIPs in separate clauses and a LIMIT (12 distinct values, 5 skipped in total).
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x SKIP 2 WITH x SKIP 3 LIMIT 5 RETURN 1;
+---- 5
+1
+1
+1
+1
+1
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x WITH x SKIP 2 WITH x SKIP 3 LIMIT 5 RETURN 1;
+---- 5
+1
+1
+1
+1
+1
+# Three SKIPs.
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x SKIP 2 WITH x SKIP 3 WITH x SKIP 1 LIMIT 3 RETURN 1;
+---- 3
+1
+1
+1
+# Controls that were already correct.
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x SKIP 5 LIMIT 5 RETURN 1;
+---- 5
+1
+1
+1
+1
+1
+-STATEMENT UNWIND range(1, 12) AS x WITH x SKIP 2 WITH x SKIP 3 LIMIT 5 RETURN 1;
+---- 5
+1
+1
+1
+1
+1
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x SKIP 2 WITH x LIMIT 5 RETURN 1;
+---- 5
+1
+1
+1
+1
+1
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x SKIP 2 WITH x SKIP 3 RETURN 1;
+---- 7
+1
+1
+1
+1
+1
+1
+1
+
+-CASE LimitPushDownStackedLimitOverDistinct
+# Mixed stacks: the clause above only sees the rows the clause below lets through, so the
+# composed demand on the DISTINCT is the inner skip plus the part of the inner limit that is left
+# after the outer skip, capped by the outer limit.
+# LIMIT below SKIP + LIMIT.
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x LIMIT 4 WITH x SKIP 1 LIMIT 10 RETURN 1;
+---- 3
+1
+1
+1
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x LIMIT 4 WITH x SKIP 3 LIMIT 10 RETURN 1;
+---- 1
+1
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x LIMIT 4 WITH x SKIP 6 LIMIT 10 RETURN 1;
+---- 0
+# LIMIT below LIMIT, in both orders.
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x LIMIT 6 WITH x LIMIT 2 RETURN 1;
+---- 2
+1
+1
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x LIMIT 2 WITH x LIMIT 6 RETURN 1;
+---- 2
+1
+1
+# SKIP + LIMIT below SKIP + LIMIT.
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x SKIP 2 LIMIT 6 WITH x SKIP 1 LIMIT 3 RETURN 1;
+---- 3
+1
+1
+1
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x SKIP 2 LIMIT 6 WITH x SKIP 1 LIMIT 9 RETURN 1;
+---- 5
+1
+1
+1
+1
+1
+# SKIP below LIMIT below SKIP.
+-STATEMENT UNWIND range(1, 12) AS x WITH DISTINCT x SKIP 2 WITH x LIMIT 4 WITH x SKIP 1 RETURN 1;
+---- 3
+1
+1
+1
+
+-CASE LimitPushDownStackedSkipOverDistinctOnTable
+-STATEMENT CREATE NODE TABLE T(id INT64, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT COPY T FROM (UNWIND range(1, 24) AS i RETURN i, (i - 1) % 12);
+---- ok
+# 24 nodes, 12 distinct values of v.
+-STATEMENT MATCH (t:T) WITH DISTINCT t.v AS x SKIP 2 WITH x SKIP 3 LIMIT 5 RETURN 1;
+---- 5
+1
+1
+1
+1
+1
+-STATEMENT MATCH (t:T) WITH DISTINCT t.v AS x SKIP 2 WITH x SKIP 3 RETURN 1;
+---- 7
+1
+1
+1
+1
+1
+1
+1

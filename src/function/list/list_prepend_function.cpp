@@ -40,6 +40,7 @@ static std::unique_ptr<FunctionBindData> bindFunc(const ScalarBindFuncInput& inp
     ListFunctionUtils::resolveTypes(input, types, resolver::anyEmpty, resolver::anyEmpty,
         resolver::anyEmpty, resolver::finalResolver, resolver::bothNull, resolver::leftNull,
         resolver::rightNull, resolver::finalResolver);
+    ListFunctionUtils::combineMapElementTypes(types, true /* rightIsElement */);
 
     if (types[0].getLogicalTypeID() != LogicalTypeID::ANY &&
         types[1] != ListType::getChildType(types[0])) {

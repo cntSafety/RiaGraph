@@ -2,6 +2,7 @@
 
 #include "binder/query/query_graph.h"
 #include "bound_insert_info.h"
+#include "bound_namespace_move.h"
 #include "bound_set_info.h"
 #include "bound_updating_clause.h"
 
@@ -28,6 +29,9 @@ public:
     const QueryGraphCollection* getQueryGraphCollection() const { return &queryGraphCollection; }
     bool hasPredicate() const { return predicate != nullptr; }
     std::shared_ptr<Expression> getPredicate() const { return predicate; }
+    expression_vector namespaceAssertions;
+    std::vector<BoundNamespaceMove> onMatchNamespaceMoves;
+    std::vector<BoundNamespaceMove> onCreateNamespaceMoves;
 
     const std::vector<BoundInsertInfo>& getInsertInfosRef() const { return insertInfos; }
     const std::vector<BoundSetPropertyInfo>& getOnMatchSetInfosRef() const {

@@ -7,6 +7,7 @@
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
 #include "catalog/catalog_entry/sequence_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/copier_config/csv_reader_config.h"
 #include "common/file_system/virtual_file_system.h"
 #include "common/string_utils.h"
@@ -134,14 +135,52 @@ std::string getSchemaCypher(ClientContext* clientContext) {
     exportLoadedExtensions(ss, clientContext);
     const auto catalog = Catalog::Get(*clientContext);
     auto transaction = Transaction::Get(*clientContext);
+    const auto* namespaces = catalog->getNamespaces();
+    if (namespaces) {
+        for (const auto* entry : namespaces->getDefinitions(transaction)) {
+            ss << "CREATE NAMESPACE " << StringUtils::quoteIdentifier(entry->getName().substr(2))
+               << ";\n";
+        }
+    }
+    const auto policySQL = [&](const TableCatalogEntry* entry, std::string sql, bool node) {
+        const auto* policy =
+            namespaces ? namespaces->getPolicy(transaction, entry->getTableID()) : nullptr;
+        if (!policy) {
+            return sql;
+        }
+        if (policy->localPrimaryKey) {
+            const auto key = std::format(" PRIMARY KEY({}))",
+                StringUtils::quoteIdentifier(
+                    entry->constCast<NodeTableCatalogEntry>().getPrimaryKeyName()));
+            const auto position = sql.rfind(key);
+            if (position != std::string::npos) {
+                sql.insert(position + 1, "LOCAL ");
+            }
+        }
+        if (!policy->allowed.isUnrestricted()) {
+            auto selector = std::string(" IN ");
+            for (auto id : policy->allowed.getIDs()) {
+                if (selector.size() > 4) {
+                    selector += ", ";
+                }
+                selector += id == GLOBAL_NAMESPACE_ID ?
+                                "GLOBAL" :
+                                StringUtils::quoteIdentifier(namespaces->getName(transaction, id));
+            }
+            const auto prefix = std::string(node ? "CREATE NODE TABLE " : "CREATE REL TABLE ") +
+                                StringUtils::quoteIdentifier(entry->getName());
+            sql.insert(prefix.size(), selector);
+        }
+        return sql;
+    };
     ToCypherInfo toCypherInfo;
     for (const auto& nodeTableEntry :
         catalog->getNodeTableEntries(transaction, false /* useInternal */)) {
-        ss << nodeTableEntry->toCypher(toCypherInfo) << std::endl;
+        ss << policySQL(nodeTableEntry, nodeTableEntry->toCypher(toCypherInfo), true) << std::endl;
     }
     RelGroupToCypherInfo relTableToCypherInfo{clientContext};
     for (const auto& entry : catalog->getRelGroupEntries(transaction, false /* useInternal */)) {
-        ss << entry->toCypher(relTableToCypherInfo) << std::endl;
+        ss << policySQL(entry, entry->toCypher(relTableToCypherInfo), false) << std::endl;
     }
     RelGroupToCypherInfo relGroupToCypherInfo{clientContext};
     for (const auto sequenceEntry : catalog->getSequenceEntries(transaction)) {
@@ -194,8 +233,14 @@ void ExportDB::executeInternal(ExecutionContext* context) {
     // write the copy.cypher file
     // for every table, we write COPY FROM statement
     writeStringStreamToFile(clientContext,
-        getCopyCypher(clientContext, &boundFileInfo, sharedState->canUseParallelReader),
+        namespaceAware ?
+            std::string{} :
+            getCopyCypher(clientContext, &boundFileInfo, sharedState->canUseParallelReader),
         boundFileInfo.filePaths[0] + "/" + PortDBConstants::COPY_FILE_NAME);
+    if (namespaceAware) {
+        writeStringStreamToFile(clientContext, namespaceImport,
+            boundFileInfo.filePaths[0] + "/namespace-copy.cypher");
+    }
     // write the index.cypher file
     writeStringStreamToFile(clientContext, getIndexCypher(clientContext, boundFileInfo),
         boundFileInfo.filePaths[0] + "/" + PortDBConstants::INDEX_FILE_NAME);

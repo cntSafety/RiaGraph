@@ -628,15 +628,17 @@ void FactorizedTable::readUnflatCol(const uint8_t* tupleToRead, const SelectionV
     memcpy(&vectorOverflowValue, tupleToRead + tableSchema.getColOffset(colIdx),
         sizeof(overflow_value_t));
     DASSERT(vector.state->getSelVector().isUnfiltered());
+    // One output row per selected position. Positions may repeat (Intersect expands parallel
+    // edges into their cross product), so there can be more rows than the list has elements.
     if (hasNoNullGuarantee(colIdx)) {
         vector.setAllNonNull();
         auto val = vectorOverflowValue.value;
-        for (auto i = 0u; i < vectorOverflowValue.numElements; i++) {
+        for (auto i = 0u; i < selVector.getSelSize(); i++) {
             auto pos = selVector[i];
             vector.copyFromRowData(i, val + (pos * vector.getNumBytesPerValue()));
         }
     } else {
-        for (auto i = 0u; i < vectorOverflowValue.numElements; i++) {
+        for (auto i = 0u; i < selVector.getSelSize(); i++) {
             auto pos = selVector[i];
             if (isOverflowColNull(vectorOverflowValue.value + vectorOverflowValue.numElements *
                                                                   vector.getNumBytesPerValue(),

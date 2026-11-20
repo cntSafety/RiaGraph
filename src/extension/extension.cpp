@@ -5,6 +5,7 @@
 #include <filesystem>
 
 #include "common/exception/io.h"
+#include "common/file_system/file_system.h"
 #include "common/string_utils.h"
 #include "common/system_message.h"
 #include "main/client_context.h"
@@ -377,7 +378,9 @@ static std::string dlMissingDependencyHint(const std::string& path) {
     // Capture the code before touching the filesystem, which would overwrite it -- the caller still
     // needs GetLastError() intact for dlErrMessage().
     const auto errorCode = GetLastError();
-    const auto extensionExists = std::filesystem::exists(path);
+    std::error_code ec;
+    const auto extensionExists =
+        std::filesystem::exists(common::FileSystem::pathFromUTF8(path), ec);
     SetLastError(errorCode);
     if (errorCode != ERROR_MOD_NOT_FOUND || !extensionExists) {
         return "";

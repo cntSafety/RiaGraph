@@ -18,6 +18,7 @@
 #include "function/list/vector_list_functions.h"
 #include "function/map/vector_map_functions.h"
 #include "function/path/vector_path_functions.h"
+#include "function/schema/namespace_functions.h"
 #include "function/schema/vector_node_rel_functions.h"
 #include "function/sequence/sequence_functions.h"
 #include "function/string/vector_string_functions.h"
@@ -197,9 +198,10 @@ FunctionCollection* FunctionCollection::getFunctions() {
 
         // Node/rel functions
         SCALAR_FUNCTION(OffsetFunction), REWRITE_FUNCTION(RowIDFunction),
-        REWRITE_FUNCTION(IDFunction), REWRITE_FUNCTION(StartNodeFunction),
-        REWRITE_FUNCTION(EndNodeFunction), REWRITE_FUNCTION(LabelFunction),
-        REWRITE_FUNCTION_ALIAS(LabelsFunction), REWRITE_FUNCTION(CostFunction),
+        REWRITE_FUNCTION(NamespaceFunction), REWRITE_FUNCTION(IDFunction),
+        REWRITE_FUNCTION(StartNodeFunction), REWRITE_FUNCTION(EndNodeFunction),
+        REWRITE_FUNCTION(LabelFunction), REWRITE_FUNCTION_ALIAS(LabelsFunction),
+        REWRITE_FUNCTION(CostFunction),
 
         // Path functions
         SCALAR_FUNCTION(NodesFunction), SCALAR_FUNCTION(RelsFunction),
@@ -232,6 +234,7 @@ FunctionCollection* FunctionCollection::getFunctions() {
         TABLE_FUNCTION(CurrentSettingFunction), TABLE_FUNCTION(CatalogVersionFunction),
         TABLE_FUNCTION(DBVersionFunction), TABLE_FUNCTION(StorageVersionFunction),
         TABLE_FUNCTION(ShowTablesFunction), TABLE_FUNCTION(ShowGraphsFunction),
+        TABLE_FUNCTION(ShowNamespacesFunction), TABLE_FUNCTION(NamespaceInfoFunction),
         TABLE_FUNCTION(FreeSpaceInfoFunction), TABLE_FUNCTION(ShowWarningsFunction),
         TABLE_FUNCTION(TableInfoFunction), TABLE_FUNCTION(ShowConnectionFunction),
         TABLE_FUNCTION(StatsInfoFunction), TABLE_FUNCTION(StorageInfoFunction),

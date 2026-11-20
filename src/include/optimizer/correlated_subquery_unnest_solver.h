@@ -16,6 +16,8 @@ private:
     void visitExpressionsScan(planner::LogicalOperator* op) final;
 
     void solveAccHashJoin(planner::LogicalOperator* op) const;
+    static bool isAccCrossProduct(const planner::LogicalOperator& op);
+    void solveAccCrossProduct(planner::LogicalOperator* op) const;
 
 private:
     planner::LogicalOperator* accumulateOp;

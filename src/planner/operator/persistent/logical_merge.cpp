@@ -58,6 +58,7 @@ void LogicalMerge::computeSuppressDuplicateCreatedOutput() {
     auto childSchema = children[0]->getSchema();
     auto storesInsertedPatternIDs = onMatchSetNodeInfos.empty() && onMatchSetRelInfos.empty();
     suppressDuplicateCreatedOutput =
+        onMatchNamespaceMoves.empty() && onCreateNamespaceMoves.empty() &&
         storesInsertedPatternIDs && insertRelInfos.empty() && onCreateSetNodeInfos.empty() &&
         onCreateSetRelInfos.empty() &&
         !hasNonKeyPayload(*childSchema, keys, insertNodeInfos, insertRelInfos, *existenceMark);
@@ -105,6 +106,8 @@ f_group_pos_set LogicalMerge::getGroupsPosToFlatten() {
 
 std::unique_ptr<LogicalOperator> LogicalMerge::copy() {
     auto merge = std::make_unique<LogicalMerge>(existenceMark, keys, children[0]->copy());
+    merge->onMatchNamespaceMoves = onMatchNamespaceMoves;
+    merge->onCreateNamespaceMoves = onCreateNamespaceMoves;
     merge->insertNodeInfos = copyVector(insertNodeInfos);
     merge->insertRelInfos = copyVector(insertRelInfos);
     merge->onCreateSetNodeInfos = copyVector(onCreateSetNodeInfos);

@@ -97,7 +97,8 @@ public:
     bool hasDefaultGraph() const { return defaultGraph != "" && defaultGraph != "main"; }
     std::string getDefaultGraphName() const { return defaultGraph; }
     std::vector<catalog::Catalog*> getGraphs() const;
-    void bumpGraphCatalogVersions(const std::unordered_set<catalog::Catalog*>& catalogs);
+    void bumpGraphCatalogVersions(const std::unordered_set<catalog::Catalog*>& catalogs,
+        bool invalidatePlans = true);
     storage::StorageManager* getDefaultGraphStorageManager() const;
 
     RIAG_API void invalidateCache();

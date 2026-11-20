@@ -5,6 +5,7 @@
 #include "binder/bound_explain.h"
 #include "binder/bound_extension_statement.h"
 #include "binder/bound_graph_statement.h"
+#include "binder/bound_namespace_statement.h"
 #include "binder/bound_standalone_call.h"
 #include "binder/bound_standalone_call_function.h"
 #include "binder/bound_transaction_statement.h"
@@ -33,6 +34,7 @@
 #include "planner/operator/simple/logical_detach_database.h"
 #include "planner/operator/simple/logical_extension.h"
 #include "planner/operator/simple/logical_graph.h"
+#include "planner/operator/simple/logical_namespace.h"
 #include "planner/operator/simple/logical_use_database.h"
 #include "planner/planner.h"
 
@@ -195,6 +197,12 @@ LogicalPlan Planner::planUseGraph(const BoundStatement& statement) {
     auto& boundUseGraph = statement.constCast<BoundUseGraph>();
     auto op = std::make_shared<LogicalUseGraph>(boundUseGraph.getGraphName());
     return getSimplePlan(std::move(op));
+}
+
+LogicalPlan Planner::planNamespace(const BoundStatement& statement) {
+    const auto& bound = statement.constCast<BoundNamespaceStatement>();
+    return getSimplePlan(std::make_shared<LogicalNamespace>(bound.action, bound.name, bound.newName,
+        bound.ifExists, bound.selector));
 }
 
 } // namespace planner

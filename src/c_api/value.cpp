@@ -82,9 +82,13 @@ static bool canCopyValueForNested(const Value& value, const LogicalType& targetT
         return true;
     }
     if (targetType.getLogicalTypeID() == LogicalTypeID::STRUCT) {
+        // STRUCT fields are matched by name, never by position (cntSafety/RiaGraph#193).
+        const auto& type = value.getDataType();
         for (auto i = 0u; i < NestedVal::getChildrenSize(nested); ++i) {
-            if (!canCopyValueForNested(*NestedVal::getChildVal(nested, i),
-                    StructType::getFieldType(targetType, static_cast<struct_field_idx_t>(i)))) {
+            const auto& name = StructType::getField(type, i).getName();
+            if (!StructType::hasField(targetType, name) ||
+                !canCopyValueForNested(*NestedVal::getChildVal(nested, i),
+                    StructType::getFieldType(targetType, name))) {
                 return false;
             }
         }
@@ -186,10 +190,18 @@ static std::unique_ptr<Value> copyValueForNested(const Value& value,
     }
     if (value.getDataType().getLogicalTypeID() == LogicalTypeID::STRUCT &&
         targetType.getLogicalTypeID() == LogicalTypeID::STRUCT) {
+        // Each target field takes the value of the same name; a key this value does not have
+        // is NULL (the target is the union of the elements' keys, see tryCombineStructTypes).
         std::vector<std::unique_ptr<Value>> children;
-        for (auto i = 0u; i < NestedVal::getChildrenSize(&value); ++i) {
-            children.push_back(copyValueForNested(*NestedVal::getChildVal(&value, i),
-                StructType::getFieldType(targetType, static_cast<struct_field_idx_t>(i))));
+        for (const auto& targetField : StructType::getFields(targetType)) {
+            auto idx = StructType::getFieldIdx(value.getDataType(), targetField.getName());
+            if (idx == INVALID_STRUCT_FIELD_IDX) {
+                children.push_back(
+                    std::make_unique<Value>(Value::createNullValue(targetField.getType())));
+            } else {
+                children.push_back(copyValueForNested(*NestedVal::getChildVal(&value, idx),
+                    targetField.getType()));
+            }
         }
         return std::make_unique<Value>(targetType.copy(), std::move(children));
     }
@@ -634,7 +646,8 @@ riag_value* riag_value_clone(riag_value* value) {
 }
 
 void riag_value_copy(riag_value* value, riag_value* other) {
-    if (value == nullptr || value->_value == nullptr) {
+    if (value == nullptr || value->_value == nullptr || other == nullptr ||
+        other->_value == nullptr) {
         return;
     }
     RIAG_C_API_GUARD_BEGIN

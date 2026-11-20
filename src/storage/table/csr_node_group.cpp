@@ -627,13 +627,28 @@ NodeGroupScanResult CSRNodeGroup::scanCommittedPersistentWithCache(const Transac
 
 bool CSRNodeGroupScanState::refillCache(const Transaction* transaction,
     RelTableScanState& tableScanState) {
-    if (nextRowToScan == numTotalRows ||
-        tableScanState.currBoundNodeIdx >= tableScanState.cachedBoundNodeSelVector.getSelSize()) {
+    if (tableScanState.currBoundNodeIdx >= tableScanState.cachedBoundNodeSelVector.getSelSize()) {
         return false;
     }
     const auto currNodeOffset = tableScanState.nodeIDVector->readNodeOffset(
         tableScanState.cachedBoundNodeSelVector[tableScanState.currBoundNodeIdx]);
     const auto offsetInGroup = currNodeOffset % StorageConfig::NODE_GROUP_SIZE;
+    if (numCachedRows > 0) {
+        // The bound nodes are sorted by offset, so the window only moves forward -- except that
+        // the same bound node can occur more than once (an extend reaching it over parallel
+        // edges). Each occurrence reads the whole list again, and when the list straddles the end
+        // of a window an earlier occurrence has moved the window past its start. Resume this
+        // occurrence where it stands (nextCachedRowToScan is its progress, 0 before it starts)
+        // instead of skipping the part of its list that lies behind the window.
+        const auto resumeRow =
+            std::max(header->getStartCSROffset(offsetInGroup), nextCachedRowToScan);
+        if (header->getCSRLength(offsetInGroup) > 0 && resumeRow < nextRowToScan - numCachedRows) {
+            nextRowToScan = resumeRow;
+        }
+    }
+    if (nextRowToScan == numTotalRows) {
+        return false;
+    }
     const auto csrLength = header->getCSRLength(offsetInGroup);
     if (csrLength == 0) {
         tableScanState.currBoundNodeIdx++;

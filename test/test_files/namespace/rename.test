@@ -1,0 +1,173 @@
+-DATASET CSV empty
+
+--
+
+# ALTER NAMESPACE <name> RENAME TO <new_name> (namespace.md, section 4.1) changes only the
+# definition's name. The namespace keeps its ID, so its members, the table policies that name it
+# and its LOCAL primary-key domain stay attached to it.
+
+-CASE RenameKeepsMembersPoliciesAndLocalKeys
+-STATEMENT CREATE NAMESPACE team_a
+---- ok
+-STATEMENT CREATE NAMESPACE team_b
+---- ok
+-STATEMENT CREATE NODE TABLE Person IN GLOBAL, team_a, team_b (id INT64 LOCAL PRIMARY KEY, name STRING)
+---- ok
+-STATEMENT CREATE REL TABLE Knows IN team_a (FROM Person TO Person)
+---- ok
+-STATEMENT CREATE (:Person {id: 1, name: 'Shared'}), (:Person {id: 1, name: 'Alice'} IN team_a), (:Person {id: 1, name: 'Bob'} IN team_b)
+---- ok
+-STATEMENT MATCH (a:Person IN team_a), (b:Person IN team_b) CREATE (a)-[:Knows IN team_a]->(b)
+---- ok
+-STATEMENT CALL show_namespaces() RETURN name, id ORDER BY id
+---- 3
+GLOBAL|0
+team_a|1
+team_b|2
+-STATEMENT ALTER NAMESPACE team_a RENAME TO team_x
+---- 1
+Namespace command completed.
+-STATEMENT CALL show_namespaces() RETURN name, id ORDER BY id
+---- 3
+GLOBAL|0
+team_x|1
+team_b|2
+-STATEMENT MATCH (p:Person) RETURN namespace(p), p.name ORDER BY p.name
+---- 3
+team_x|Alice
+team_b|Bob
+|Shared
+-STATEMENT MATCH (a:Person IN team_x)-[r:Knows IN team_x]->(b:Person IN team_b) RETURN a.name, namespace(r), b.name
+---- 1
+Alice|team_x|Bob
+-STATEMENT CALL namespace_info('Person') RETURN allowed_namespaces, primary_key_scope, element_counts
+---- 1
+GLOBAL, `team_x`, `team_b`|LOCAL|GLOBAL=1, `team_x`=1, `team_b`=1
+-STATEMENT CALL namespace_info('Knows') RETURN allowed_namespaces
+---- 1
+`team_x`
+-STATEMENT CREATE (:Person {id: 1, name: 'Duplicate'} IN team_x)
+---- error
+Runtime exception: Duplicate LOCAL primary key in the destination namespace.
+-STATEMENT MATCH (p:Person {id: 1} IN team_x) RETURN p.name
+---- 1
+Alice
+-LOG OldNameIsUnknown
+-STATEMENT MATCH (p:Person) IN team_a RETURN p.name
+---- error
+Catalog exception: Namespace team_a does not exist.
+-STATEMENT USE NAMESPACE team_a
+---- error
+Catalog exception: Namespace team_a does not exist.
+-STATEMENT MATCH (p:Person) WHERE namespace(p) = 'team_a' RETURN count(*)
+---- 1
+0
+-LOG SessionSelectionUsesNewName
+-STATEMENT USE NAMESPACE team_x
+---- ok
+-STATEMENT MATCH (p:Person) RETURN p.name
+---- 1
+Alice
+-STATEMENT CREATE (p:Person {id: 2, name: 'Cara'}) RETURN namespace(p)
+---- 1
+team_x
+-STATEMENT USE NAMESPACE ALL NAMESPACES
+---- ok
+-LOG OldNameIsFreeForANewIdentity
+-STATEMENT CREATE NAMESPACE team_a
+---- ok
+-STATEMENT CALL show_namespaces() WHERE name = 'team_a' RETURN id > 2
+---- 1
+True
+-STATEMENT MATCH (p:Person) IN team_a RETURN count(*)
+---- 1
+0
+-STATEMENT MATCH (p:Person) IN team_x RETURN count(*)
+---- 1
+2
+-RELOADDB
+-STATEMENT CALL show_namespaces() RETURN name ORDER BY id
+---- 4
+GLOBAL
+team_x
+team_b
+team_a
+-STATEMENT MATCH (a:Person IN team_x)-[r:Knows IN team_x]->(b:Person IN team_b) RETURN a.name, b.name
+---- 1
+Alice|Bob
+-STATEMENT CREATE (:Person {id: 1, name: 'Duplicate'} IN team_x)
+---- error
+Runtime exception: Duplicate LOCAL primary key in the destination namespace.
+
+-CASE RenameErrors
+-STATEMENT CREATE NAMESPACE team_a
+---- ok
+-STATEMENT CREATE NAMESPACE team_b
+---- ok
+-STATEMENT ALTER NAMESPACE missing RENAME TO team_c
+---- error
+Catalog exception: Namespace missing does not exist.
+-STATEMENT ALTER NAMESPACE team_a RENAME TO team_b
+---- error
+Catalog exception: Namespace team_b already exists.
+-STATEMENT ALTER NAMESPACE team_a RENAME TO team_a
+---- error
+Catalog exception: Namespace team_a already exists.
+-STATEMENT ALTER NAMESPACE team_a RENAME TO TEAM_A
+---- error
+Catalog exception: Namespace TEAM_A already exists.
+-STATEMENT ALTER NAMESPACE GLOBAL RENAME TO team_c
+---- error
+Catalog exception: GLOBAL is the implicit namespace and cannot be used as a named namespace.
+-STATEMENT ALTER NAMESPACE `global` RENAME TO team_c
+---- error
+Catalog exception: GLOBAL is the implicit namespace and cannot be used as a named namespace.
+-STATEMENT ALTER NAMESPACE team_a RENAME TO Global
+---- error
+Catalog exception: GLOBAL is the implicit namespace and cannot be used as a named namespace.
+-STATEMENT ALTER NAMESPACE team_a RENAME TO `GLOBAL`
+---- error
+Catalog exception: GLOBAL is the implicit namespace and cannot be used as a named namespace.
+-STATEMENT ALTER NAMESPACE IF EXISTS team_a RENAME TO team_c
+---- error(regex)
+^Parser exception: mismatched input 'EXISTS' expecting RENAME[\s\S]*
+-STATEMENT CALL show_namespaces() RETURN name ORDER BY id
+---- 3
+GLOBAL
+team_a
+team_b
+
+-CASE RenameRollsBack
+-STATEMENT CREATE NAMESPACE team_a
+---- ok
+-STATEMENT CREATE NODE TABLE Person(id INT64 PRIMARY KEY)
+---- ok
+-STATEMENT CREATE (:Person {id: 1}) IN team_a
+---- ok
+-STATEMENT BEGIN TRANSACTION
+---- ok
+-STATEMENT ALTER NAMESPACE team_a RENAME TO team_x
+---- ok
+-STATEMENT MATCH (p:Person) RETURN namespace(p)
+---- 1
+team_x
+-STATEMENT ROLLBACK
+---- ok
+-STATEMENT MATCH (p:Person) RETURN namespace(p)
+---- 1
+team_a
+-STATEMENT MATCH (p:Person) IN team_x RETURN p
+---- error
+Catalog exception: Namespace team_x does not exist.
+-STATEMENT BEGIN TRANSACTION READ ONLY
+---- ok
+-STATEMENT ALTER NAMESPACE team_a RENAME TO team_x
+---- error
+Can not execute a write query inside a read-only transaction.
+-STATEMENT ROLLBACK
+---- error
+No active transaction for ROLLBACK.
+-STATEMENT CALL show_namespaces() RETURN name ORDER BY id
+---- 2
+GLOBAL
+team_a

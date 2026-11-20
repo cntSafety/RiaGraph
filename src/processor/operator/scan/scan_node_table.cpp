@@ -1,7 +1,10 @@
 #include "processor/operator/scan/scan_node_table.h"
 
 #include "binder/expression/expression_util.h"
+#include "catalog/catalog.h"
+#include "catalog/namespace_catalog.h"
 #include "common/file_system/virtual_file_system.h"
+#include "common/roaring_mask.h"
 #include "main/client_context.h"
 #include "processor/execution_context.h"
 #include "storage/buffer_manager/memory_manager.h"
@@ -17,6 +20,101 @@ namespace riag {
 namespace processor {
 
 static constexpr double MORSELS_PER_THREAD_TARGET = 8.0;
+
+namespace {
+// Namespace membership and SIP remain independent: the SIP build side may fill
+// its mask after global initialization. Reads intersect the two numeric masks.
+class NamespaceScanMask final : public SemiMask {
+public:
+    NamespaceScanMask(std::unique_ptr<SemiMask> membership, SemiMask* sip)
+        : SemiMask{membership->getMaxOffset()}, membership{std::move(membership)}, sip{sip} {
+        enable();
+    }
+    void mask(offset_t) override { UNREACHABLE_CODE; }
+    void maskRange(offset_t, offset_t) override { UNREACHABLE_CODE; }
+    bool isMasked(offset_t offset) override {
+        return membership->isMasked(offset) && (!sip->isEnabled() || sip->isMasked(offset));
+    }
+    offset_vec_t range(offset_t start, offset_t end) override {
+        auto result = membership->range(start, end);
+        if (sip->isEnabled()) {
+            std::erase_if(result, [&](auto offset) { return !sip->isMasked(offset); });
+        }
+        return result;
+    }
+    MaskRange getRange(offset_t start, offset_t end) override {
+        if (const auto* mask = dynamic_cast<const Roaring32BitmapSemiMask*>(membership.get());
+            mask && mask->roaring->containsRange(start, end)) {
+            return sip->isEnabled() ? sip->getRange(start, end) : MaskRange{{}, true};
+        }
+        return {range(start, end), false};
+    }
+    uint64_t getNumMaskedNodes() const override {
+        if (!sip->isEnabled()) {
+            return membership->getNumMaskedNodes();
+        }
+        uint64_t count = 0;
+        visit([&](offset_t) {
+            ++count;
+            return false;
+        });
+        return count;
+    }
+    offset_vec_t collectMaskedNodes(uint64_t size) const override {
+        offset_vec_t result;
+        if (size == 0) {
+            return result;
+        }
+        result.reserve(std::min(size, membership->getNumMaskedNodes()));
+        visit([&](offset_t offset) {
+            result.push_back(offset);
+            return result.size() == size;
+        });
+        return result;
+    }
+
+private:
+    template<class Visitor>
+    void visit(Visitor&& visitor) const {
+        const auto visitBitmap = [&](const auto& bitmap) {
+            for (const auto offset : bitmap) {
+                if ((!sip->isEnabled() || sip->isMasked(offset)) && visitor(offset)) {
+                    break;
+                }
+            }
+        };
+        if (const auto* mask32 = dynamic_cast<const Roaring32BitmapSemiMask*>(membership.get())) {
+            visitBitmap(*mask32->roaring);
+        } else {
+            visitBitmap(*static_cast<const Roaring64BitmapSemiMask*>(membership.get())->roaring);
+        }
+    }
+    std::unique_ptr<SemiMask> membership;
+    SemiMask* sip;
+};
+} // namespace
+
+void ScanNodeTableSharedState::initializeNamespace(const transaction::Transaction* transaction,
+    const NamespaceSet& scope) {
+    namespaceMask.reset();
+    if (scope.isUnrestricted()) {
+        return;
+    }
+    const auto* namespaces = table->getOwningCatalog()->getNamespaces();
+    if (scope.contains(GLOBAL_NAMESPACE_ID)) {
+        const auto* policy =
+            namespaces ? namespaces->getPolicy(transaction, table->getTableID()) : nullptr;
+        if (!policy || !policy->hasMembership) {
+            return;
+        }
+    }
+    auto membership = SemiMaskUtil::createMask(table->getNumTotalRows(transaction));
+    if (namespaces) {
+        namespaces->populateMask(transaction, table->getTableID(), scope,
+            table->getNumTotalRows(transaction), *membership);
+    }
+    namespaceMask = std::make_unique<NamespaceScanMask>(std::move(membership), semiMask.get());
+}
 
 std::unique_ptr<TableScanState> createNodeTableScanState(NodeTable* table,
     ValueVector* nodeIDVector, const std::vector<ValueVector*>& outVectors,
@@ -223,7 +321,7 @@ void ScanNodeTable::initCurrentTable(ExecutionContext* context) {
     scanState = createNodeTableScanState(currentInfo.table->ptrCast<NodeTable>(), nodeIDVector,
         outVectors, MemoryManager::Get(*context->clientContext));
     currentInfo.initScanState(*scanState, outVectors, context->clientContext);
-    scanState->semiMask = sharedStates[currentTableIdx]->getSemiMask();
+    scanState->semiMask = sharedStates[currentTableIdx]->getEffectiveMask();
     // Call table->initScanState for IceDiskNodeTable or ArrowNodeTable
     if (dynamic_cast<IceDiskNodeTable*>(tableInfos[currentTableIdx].table) ||
         dynamic_cast<ArrowNodeTable*>(tableInfos[currentTableIdx].table)) {
@@ -242,6 +340,11 @@ void ScanNodeTable::initGlobalStateInternal(ExecutionContext* context) {
         sharedStates[i]->initialize(transaction::Transaction::Get(*context->clientContext),
             tableInfos[i].table->ptrCast<NodeTable>(), *progressSharedState,
             context->clientContext);
+        if (tableInfos[i].namespaceScope) {
+            sharedStates[i]->initializeNamespace(
+                transaction::Transaction::Get(*context->clientContext),
+                *tableInfos[i].namespaceScope);
+        }
     }
 }
 

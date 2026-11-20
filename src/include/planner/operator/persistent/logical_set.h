@@ -19,6 +19,11 @@ public:
 
     f_group_pos_set getGroupsPosToFlatten(uint32_t idx) const;
 
+    // The items of infos whose target property the right-hand side of item idx reads, one per
+    // property. SET and MERGE ... ON MATCH SET read those again from storage before the item.
+    static std::vector<common::idx_t> getItemsReadBy(
+        const std::vector<binder::BoundSetPropertyInfo>& infos, uint32_t idx);
+
     std::string getExpressionsForPrinting() const override;
 
     common::TableType getTableType() const;

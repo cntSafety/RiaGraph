@@ -23,6 +23,8 @@ std::string PhysicalOperatorUtils::operatorTypeToString(PhysicalOperatorType ope
         return "AGGREGATE_SCAN";
     case PhysicalOperatorType::ANALYZE:
         return "ANALYZE";
+    case PhysicalOperatorType::ASSERT:
+        return "ASSERT";
     case PhysicalOperatorType::ATTACH_DATABASE:
         return "ATTACH_DATABASE";
     case PhysicalOperatorType::BATCH_INSERT:
@@ -155,6 +157,10 @@ std::string PhysicalOperatorUtils::operatorTypeToString(PhysicalOperatorType ope
         return "CREATE_GRAPH";
     case PhysicalOperatorType::USE_GRAPH:
         return "USE_GRAPH";
+    case PhysicalOperatorType::NAMESPACE_COMMAND:
+        return "NAMESPACE_COMMAND";
+    case PhysicalOperatorType::NAMESPACE_MUTATION:
+        return "NAMESPACE_MUTATION";
     case PhysicalOperatorType::UNINSTALL_EXTENSION:
         return "UNINSTALL_EXTENSION";
     }

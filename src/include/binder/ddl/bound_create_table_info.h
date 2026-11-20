@@ -8,6 +8,7 @@
 #include "common/enums/extend_direction.h"
 #include "common/enums/rel_multiplicity.h"
 #include "common/enums/storage_format.h"
+#include "common/namespace_set.h"
 #include "function/table/bind_data.h"
 #include "function/table/table_function.h"
 #include "property_definition.h"
@@ -40,6 +41,8 @@ struct BoundCreateTableInfo {
     std::unique_ptr<BoundExtraCreateCatalogEntryInfo> extraInfo;
     bool isInternal = false;
     bool hasParent = false;
+    common::NamespaceSet namespacePolicy;
+    bool localPrimaryKey = false;
 
     BoundCreateTableInfo() = default;
     BoundCreateTableInfo(catalog::CatalogEntryType type, std::string tableName,
@@ -56,7 +59,8 @@ private:
     BoundCreateTableInfo(const BoundCreateTableInfo& other)
         : type{other.type}, tableName{other.tableName}, onConflict{other.onConflict},
           extraInfo{other.extraInfo->copy()}, isInternal{other.isInternal},
-          hasParent{other.hasParent} {}
+          hasParent{other.hasParent}, namespacePolicy{other.namespacePolicy},
+          localPrimaryKey{other.localPrimaryKey} {}
 };
 
 struct RIAG_API BoundExtraCreateTableInfo : BoundExtraCreateCatalogEntryInfo {

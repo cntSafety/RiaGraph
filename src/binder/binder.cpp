@@ -1,12 +1,16 @@
 #include "binder/binder.h"
 
+#include "binder/bound_namespace_statement.h"
 #include "binder/bound_statement_rewriter.h"
 #include "catalog/catalog.h"
+#include "catalog/namespace_catalog.h"
 #include "common/copier_config/csv_reader_config.h"
 #include "common/exception/binder.h"
 #include "common/string_utils.h"
 #include "function/built_in_function_utils.h"
 #include "function/table/table_function.h"
+#include "main/client_context.h"
+#include "main/database_manager.h"
 #include "parser/statement.h"
 #include "processor/operator/persistent/reader/csv/parallel_csv_reader.h"
 #include "processor/operator/persistent/reader/csv/serial_csv_reader.h"
@@ -25,6 +29,32 @@ namespace riag {
 namespace binder {
 
 std::unique_ptr<BoundStatement> Binder::bind(const Statement& statement) {
+    auto* activeCatalog = Catalog::Get(*clientContext);
+    if (clientContext->getNamespaceSelectionOwner() &&
+        clientContext->getNamespaceSelectionOwner() != activeCatalog) {
+        clientContext->resetNamespaceSelection();
+    }
+    const bool replacingSelection =
+        statement.getStatementType() == StatementType::TRANSACTION ||
+        statement.getStatementType() == StatementType::USE_GRAPH ||
+        statement.getStatementType() == StatementType::USE_DATABASE ||
+        (statement.getStatementType() == StatementType::NAMESPACE &&
+            statement.constCast<NamespaceStatement>().action == NamespaceAction::USE);
+    if (!replacingSelection) {
+        const auto& selected = clientContext->getNamespaceSelection();
+        for (const auto id : selected.getIDs()) {
+            if (id == GLOBAL_NAMESPACE_ID) {
+                continue;
+            }
+            const auto* namespaces = activeCatalog->getNamespaces();
+            if (!namespaces) {
+                throw BinderException("The selected namespace no longer exists; use USE NAMESPACE "
+                                      "to replace the selection.");
+            }
+            namespaces->getName(transaction::Transaction::Get(*clientContext), id);
+        }
+    }
+    namespaceReadBase = clientContext->getNamespaceSelection();
     std::unique_ptr<BoundStatement> boundStatement;
     switch (statement.getStatementType()) {
     case StatementType::CREATE_TABLE: {
@@ -95,6 +125,16 @@ std::unique_ptr<BoundStatement> Binder::bind(const Statement& statement) {
     } break;
     case StatementType::USE_GRAPH: {
         boundStatement = bindUseGraph(statement);
+    } break;
+    case StatementType::NAMESPACE: {
+        const auto& parsed = statement.constCast<NamespaceStatement>();
+        if (main::DatabaseManager::Get(*clientContext)->isDefaultGraphAny(*clientContext) &&
+            (parsed.action != NamespaceAction::USE || !parsed.selector.names.empty())) {
+            throw BinderException(
+                "Named namespaces require a native graph with user-defined tables.");
+        }
+        boundStatement =
+            std::make_unique<BoundNamespaceStatement>(statement.constCast<NamespaceStatement>());
     } break;
     case StatementType::EXTENSION_CLAUSE: {
         boundStatement = bindExtensionClause(statement);

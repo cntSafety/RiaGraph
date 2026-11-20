@@ -26,8 +26,13 @@ std::string ParserErrorListener::formatUnderLineError(Recognizer& recognizer,
     for (auto i = 0u; i < charPositionInLine; ++i) {
         underLine += " ";
     }
-    for (auto i = offendingToken.getStartIndex(); i <= offendingToken.getStopIndex(); ++i) {
-        underLine += "^";
+    // The lexer emits the EOF token with stop = start - 1, which on an empty input is
+    // INVALID_INDEX (SIZE_MAX): `i <= stop` would never end. Treat it as a token without a span.
+    const auto stopIndex = offendingToken.getStopIndex();
+    if (stopIndex != INVALID_INDEX) {
+        for (auto i = offendingToken.getStartIndex(); i <= stopIndex; ++i) {
+            underLine += "^";
+        }
     }
     return "\"" + errorLine + "\"\n" + underLine;
 }

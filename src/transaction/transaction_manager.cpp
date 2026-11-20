@@ -3,14 +3,17 @@
 #include <algorithm>
 #include <thread>
 
+#include "catalog/catalog.h"
 #include "common/exception/checkpoint.h"
 #include "common/exception/transaction_manager.h"
 #include "common/task_system/progress_bar.h"
 #include "main/attached_database.h"
 #include "main/client_context.h"
 #include "main/database.h"
+#include "main/database_manager.h"
 #include "main/db_config.h"
 #include "storage/checkpointer.h"
+#include "storage/storage_manager.h"
 #include "storage/wal/local_wal.h"
 #include "storage/wal/wal.h"
 #include <format>
@@ -56,24 +59,34 @@ private:
 
 Transaction* TransactionManager::beginTransaction(main::ClientContext& clientContext,
     TransactionType type) {
-    std::unique_lock publicFunctionLck{mtxForSerializingPublicFunctionCalls};
+    std::unique_lock publicFunctionLck{mtxForSerializingPublicFunctionCalls, std::defer_lock};
     // Only acquire the write gate for write/recovery transactions. Read-only transactions
     // can start freely during checkpoint since they use snapshot isolation.
     std::unique_lock newTransactionLck{mtxForStartingNewTransactions, std::defer_lock};
-    if (type != TransactionType::READ_ONLY) {
-        newTransactionLck.lock();
-    }
-    while (type != TransactionType::READ_ONLY && !clientContext.getDBConfig()->enableMultiWrites &&
-           hasActiveWriteTransactionNoLock() &&
-           activeWriteTransactionCount.load(std::memory_order_acquire) ==
-               committingWriteTransactionCount.load(std::memory_order_acquire)) {
+    while (true) {
+        // Lock order is write gate, then public lock. The gate is held by a checkpoint for as
+        // long as it drains and runs, and a draining checkpoint is waiting for the active
+        // writers to commit or roll back, which they can only do under the public lock. So a
+        // writer must never wait for the gate while holding the public lock.
+        if (type != TransactionType::READ_ONLY) {
+            newTransactionLck.lock();
+        }
+        publicFunctionLck.lock();
+        if (type == TransactionType::READ_ONLY || clientContext.getDBConfig()->enableMultiWrites ||
+            !hasActiveWriteTransactionNoLock() ||
+            activeWriteTransactionCount.load(std::memory_order_acquire) !=
+                committingWriteTransactionCount.load(std::memory_order_acquire)) {
+            break;
+        }
+        // The only active writers are committing. Wait for them with the gate released (so a
+        // checkpoint can drain them) and then retake both locks in order and recheck.
         newTransactionLck.unlock();
         cvForCommittingWriteTransaction.wait(publicFunctionLck, [&]() {
             return !hasActiveWriteTransactionNoLock() ||
                    activeWriteTransactionCount.load(std::memory_order_acquire) !=
                        committingWriteTransactionCount.load(std::memory_order_acquire);
         });
-        newTransactionLck.lock();
+        publicFunctionLck.unlock();
     }
     switch (type) {
     case TransactionType::READ_ONLY: {
@@ -87,10 +100,15 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
     case TransactionType::RECOVERY:
     case TransactionType::WRITE: {
         wal.throwIfPoisoned();
-        if (!clientContext.getDBConfig()->enableMultiWrites && hasActiveWriteTransactionNoLock()) {
-            throw TransactionManagerException(
-                "Cannot start a new write transaction in the system. "
-                "Only one write transaction at a time is allowed in the system.");
+        if (!clientContext.getDBConfig()->enableMultiWrites) {
+            if (hasActiveWriteTransactionNoLock()) {
+                throw TransactionManagerException(
+                    "Cannot start a new write transaction in the system. "
+                    "Only one write transaction at a time is allowed in the system.");
+            }
+        } else if (namespaceDDLTransactionID != 0) {
+            throw TransactionManagerException("A namespace schema change is active; retry the "
+                                              "write transaction after it completes.");
         }
         auto transaction = std::make_unique<Transaction>(clientContext, type, ++lastTransactionID,
             lastTimestamp.load(std::memory_order_acquire));
@@ -106,6 +124,21 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
     }
         // LCOV_EXCL_STOP
     }
+}
+
+void TransactionManager::claimNamespaceDDL(main::ClientContext& context,
+    const Transaction& transaction) {
+    if (!context.getDBConfig()->enableMultiWrites || !transaction.isWriteTransaction()) {
+        return;
+    }
+    std::lock_guard lock{mtxForSerializingPublicFunctionCalls};
+    if (activeWriteTransactionCount.load(std::memory_order_acquire) != 1 ||
+        lastTimestamp.load(std::memory_order_acquire) > transaction.getStartTS()) {
+        throw TransactionManagerException(
+            "Namespace schema changes require the only active writer and a current snapshot; "
+            "retry the transaction.");
+    }
+    namespaceDDLTransactionID = transaction.getID();
 }
 
 void TransactionManager::commit(main::ClientContext& clientContext, Transaction* transaction) {
@@ -141,6 +174,9 @@ void TransactionManager::commit(main::ClientContext& clientContext, Transaction*
                 }
                 shouldForceCheckpoint = transaction->shouldForceCheckpoint();
                 shouldAutoCheckpoint = Checkpointer::canAutoCheckpoint(clientContext, *transaction);
+                if (transaction->hasDroppedTableStorage() && clientContext.isInMemory()) {
+                    hasUnreclaimedDroppedTables.store(true, std::memory_order_release);
+                }
                 clearTransactionNoLock(transaction->getID());
                 activeWriteTransactionCount.fetch_sub(1, std::memory_order_release);
                 committingWriteTransactionCount.fetch_sub(1, std::memory_order_release);
@@ -170,6 +206,10 @@ void TransactionManager::commit(main::ClientContext& clientContext, Transaction*
             cvForCommittingWriteTransaction.notify_all();
         }
         throw;
+    }
+    if (hasUnreclaimedDroppedTables.load(std::memory_order_acquire)) {
+        std::unique_lock lck{mtxForSerializingPublicFunctionCalls};
+        reclaimDroppedTablesIfIdleNoLock(clientContext);
     }
     // Checkpoint outside the public function lock so active writers can finish
     // (commit/rollback) during the drain phase instead of deadlocking. The transaction has
@@ -214,6 +254,7 @@ void TransactionManager::rollback(main::ClientContext& clientContext, transactio
         throw TransactionManagerException("Invalid transaction type to rollback.");
     }
     }
+    reclaimDroppedTablesIfIdleNoLock(clientContext);
 }
 
 void TransactionManager::checkpoint(main::ClientContext& clientContext) {
@@ -280,6 +321,9 @@ bool TransactionManager::hasNoActiveTransactions() const {
 }
 
 void TransactionManager::clearTransactionNoLock(transaction_t transactionID) {
+    if (namespaceDDLTransactionID == transactionID) {
+        namespaceDDLTransactionID = 0;
+    }
     DASSERT(std::ranges::any_of(activeTransactions.begin(), activeTransactions.end(),
         [transactionID](const auto& activeTransaction) {
             return activeTransaction->getID() == transactionID;
@@ -291,27 +335,49 @@ void TransactionManager::clearTransactionNoLock(transaction_t transactionID) {
     recomputeHorizonNoLock();
 }
 
-void TransactionManager::registerTransactionNoLock(transaction_t transactionID,
-    transaction_t startTS) {
-    openTxnStartTS[transactionID] = startTS;
-    if (cachedHorizon == INVALID_TRANSACTION || startTS < cachedHorizon) {
-        cachedHorizon = startTS;
+void TransactionManager::reclaimDroppedTablesIfIdleNoLock(main::ClientContext& clientContext) {
+    // A transaction that began before the drop still binds the table through its snapshot
+    // catalog, so wait until none is open. Transactions that begin later cannot see it.
+    if (!activeTransactions.empty() ||
+        !hasUnreclaimedDroppedTables.load(std::memory_order_acquire)) {
+        return;
     }
-}
-
-void TransactionManager::recomputeHorizonNoLock() {
-    cachedHorizon = INVALID_TRANSACTION;
-    for (const auto& entry : openTxnStartTS) {
-        const auto startTS = entry.second;
-        if (cachedHorizon == INVALID_TRANSACTION || startTS < cachedHorizon) {
-            cachedHorizon = startTS;
+    auto* database = clientContext.getDatabase();
+    if (database->getTransactionManager() != this) {
+        return;
+    }
+    hasUnreclaimedDroppedTables.store(false, std::memory_order_release);
+    database->getStorageManager()->reclaimDroppedTables(*database->getCatalog());
+    for (auto* graphCatalog : database->getDatabaseManager()->getGraphs()) {
+        if (auto* graphStorageManager = graphCatalog->getStorageManager()) {
+            graphStorageManager->reclaimDroppedTables(*graphCatalog);
         }
     }
 }
 
+void TransactionManager::registerTransactionNoLock(transaction_t transactionID,
+    transaction_t startTS) {
+    openTxnStartTS[transactionID] = startTS;
+    const auto horizon = cachedHorizon.load(std::memory_order_relaxed);
+    if (horizon == INVALID_TRANSACTION || startTS < horizon) {
+        cachedHorizon.store(startTS, std::memory_order_release);
+    }
+}
+
+void TransactionManager::recomputeHorizonNoLock() {
+    auto horizon = INVALID_TRANSACTION;
+    for (const auto& entry : openTxnStartTS) {
+        const auto startTS = entry.second;
+        if (horizon == INVALID_TRANSACTION || startTS < horizon) {
+            horizon = startTS;
+        }
+    }
+    cachedHorizon.store(horizon, std::memory_order_release);
+}
+
 transaction_t TransactionManager::snapshotHorizon() {
     std::unique_lock lck{mtxForSerializingPublicFunctionCalls};
-    return cachedHorizon;
+    return cachedHorizon.load(std::memory_order_relaxed);
 }
 
 TransactionManager::HorizonPinInfo TransactionManager::snapshotHorizonInfo() {
@@ -355,14 +421,6 @@ void TransactionManager::tryCheckpoint(main::ClientContext& clientContext) {
 
 void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     QueryProgressScope progress{clientContext, 0.01};
-    // Capture the retention horizon before acquiring the write gate. Taking the
-    // public-function lock here is safe because the gate is not held yet; the value is
-    // threaded through the checkpointer so no later stage re-acquires that lock under
-    // the gate.
-    const auto preHorizonPin = snapshotHorizonInfo();
-    auto retentionHorizon = preHorizonPin.horizon;
-    auto openStartTSs = snapshotOpenStartTSs();
-    auto pinningTxnID = preHorizonPin.pinningTxnID;
     // We only need to wait for active write transactions to leave the system before
     // checkpointing. Read transactions can continue because they use MVCC snapshot isolation.
     // Column chunk metadata of in-place checkpointed data is published before the shadow pages
@@ -382,55 +440,42 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     auto checkpointer = initCheckpointerFunc(clientContext);
     try {
         // lastTimestamp is atomic, so we can snapshot it without taking
-        // mtxForSerializingPublicFunctionCalls. Grabbing that mutex here would invert the
-        // lock order against beginTransaction() (which takes public -> start) while the
-        // checkpoint holds the write gate (start), deadlocking concurrent writers during an
-        // auto-checkpoint triggered from commit().
+        // mtxForSerializingPublicFunctionCalls.
         //
-        // A reader that begins between the pre-gate capture above and the write gate (or
-        // during the storage phase) would be missing from the pre-gate horizon and lose its
-        // snapshot. Isolate newcomers by bumping lastTimestamp: the checkpoint snapshot is
-        // the pre-bump value, and every transaction that begins afterwards observes the
-        // collapsed post-checkpoint base with a larger start timestamp, so it needs no
-        // retention. Readers that began before the bump keep startTS <= snapshotTimestamp
-        // and must be covered by retention below.
+        // Readers that begin while the gate is held, or during the storage phase, must not lose
+        // their snapshot, and so must readers that began before the gate was taken. Isolate
+        // newcomers by bumping lastTimestamp: the checkpoint snapshot is the pre-bump value, and
+        // every transaction that begins afterwards observes the collapsed post-checkpoint base
+        // with a larger start timestamp, so it needs no retention. Readers that began before the
+        // bump keep startTS <= snapshotTimestamp and are covered by retention below.
         transaction_t snapshotTimestamp = lastTimestamp.load(std::memory_order_acquire);
         lastTimestamp.fetch_add(1, std::memory_order_acq_rel);
-        // Re-sample the registry to include gap readers without deadlocking: a waiting
-        // writer holds the public lock while blocked on the gate, so only try_lock here.
+        // Sample the registry under the public lock. Waiting for it here is safe: the lock order
+        // is write gate, then public lock (see beginTransaction()), and this thread holds the
+        // gate and mtxForCheckpoint but nothing else. No holder of the public lock waits for the
+        // gate or for the checkpoint mutex (commit()'s and beginTransaction()'s condition
+        // variable waits release the public lock, and beginTransaction() leaves the gate before
+        // it waits), and the drain above has seen every active writer leave. So the lock is
+        // only ever held for the short, non-blocking stretch of a begin, commit or rollback. It
+        // must be taken: a begin that read lastTimestamp before the bump but has not registered
+        // its transaction yet is exactly the reader this sample exists to find.
         // Keep only start timestamps at or below the checkpoint snapshot; anything larger
         // began after the bump and observes the post-checkpoint base.
+        transaction_t retentionHorizon = INVALID_TRANSACTION;
+        transaction_t pinningTxnID = INVALID_TRANSACTION;
+        std::vector<transaction_t> openStartTSs;
         {
-            std::unique_lock tryLck{mtxForSerializingPublicFunctionCalls, std::try_to_lock};
-            if (tryLck.owns_lock()) {
-                transaction_t postHorizon = INVALID_TRANSACTION;
-                transaction_t postPin = INVALID_TRANSACTION;
-                std::vector<transaction_t> postOpen;
-                postOpen.reserve(openTxnStartTS.size());
-                for (const auto& entry : openTxnStartTS) {
-                    if (entry.second > snapshotTimestamp) {
-                        continue;
-                    }
-                    postOpen.push_back(entry.second);
-                    if (postHorizon == INVALID_TRANSACTION || entry.second < postHorizon) {
-                        postHorizon = entry.second;
-                        postPin = entry.first;
-                    }
+            std::unique_lock lck{mtxForSerializingPublicFunctionCalls};
+            openStartTSs.reserve(openTxnStartTS.size());
+            for (const auto& entry : openTxnStartTS) {
+                if (entry.second > snapshotTimestamp) {
+                    continue;
                 }
-                retentionHorizon = postHorizon;
-                openStartTSs = std::move(postOpen);
-                pinningTxnID = postPin;
-            } else if (retentionHorizon == INVALID_TRANSACTION) {
-                // A writer is waiting on the gate and holds the public lock. Fall back to a
-                // conservative horizon: any gap reader holds startTS == snapshotTimestamp.
-                // This over-retains only when a writer races the checkpoint with no actual
-                // gap reader, which is rare and still correct.
-                retentionHorizon = snapshotTimestamp;
-                openStartTSs.push_back(snapshotTimestamp);
-            } else if (std::ranges::find(openStartTSs, snapshotTimestamp) == openStartTSs.end()) {
-                // Pre-gate horizon already covers gap readers (their startTS >= horizon),
-                // but CSR coverage needs their timestamp present to take a snapshot.
-                openStartTSs.push_back(snapshotTimestamp);
+                openStartTSs.push_back(entry.second);
+                if (retentionHorizon == INVALID_TRANSACTION || entry.second < retentionHorizon) {
+                    retentionHorizon = entry.second;
+                    pinningTxnID = entry.first;
+                }
             }
         }
         checkpointer->beginCheckpoint(snapshotTimestamp, retentionHorizon, openStartTSs,

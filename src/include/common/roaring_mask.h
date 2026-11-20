@@ -23,7 +23,8 @@ public:
     offset_vec_t collectMaskedNodes(uint64_t size) const override;
 
     // include&exclude
-    offset_vec_t range(uint32_t start, uint32_t end) override;
+    offset_vec_t range(offset_t start, offset_t end) override;
+    MaskRange getRange(offset_t start, offset_t end) override { return {range(start, end), false}; }
 
     std::shared_ptr<roaring::Roaring> roaring;
 };
@@ -45,7 +46,8 @@ public:
     offset_vec_t collectMaskedNodes(uint64_t size) const override;
 
     // include&exclude
-    offset_vec_t range(uint32_t start, uint32_t end) override;
+    offset_vec_t range(offset_t start, offset_t end) override;
+    MaskRange getRange(offset_t start, offset_t end) override { return {range(start, end), false}; }
 
     std::shared_ptr<roaring::Roaring64Map> roaring;
 };

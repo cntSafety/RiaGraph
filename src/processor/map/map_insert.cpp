@@ -7,6 +7,7 @@
 #include "planner/operator/persistent/logical_insert.h"
 #include "processor/expression_mapper.h"
 #include "processor/operator/persistent/insert.h"
+#include "processor/operator/persistent/namespace_mutation.h"
 #include "processor/plan_mapper.h"
 #include "storage/partition_storage_registry.h"
 #include "storage/storage_manager.h"
@@ -41,6 +42,7 @@ NodeInsertExecutor PlanMapper::getNodeInsertExecutor(const LogicalInsertInfo* bo
     auto nodeIDPos = getDataPos(*node.getInternalID(), outSchema);
     auto columnsPos = populateReturnColumnsPos(*boundInfo, outSchema);
     auto info = NodeInsertInfo(nodeIDPos, columnsPos, boundInfo->conflictAction);
+    info.namespaceTarget = node.namespaceWriteTarget;
     evaluator_vector_t evaluators;
     auto exprMapper = ExpressionMapper(&inSchema);
     for (auto& expr : boundInfo->columnDataExprs) {
@@ -126,6 +128,7 @@ RelInsertExecutor PlanMapper::getRelInsertExecutor(const LogicalInsertInfo* boun
     auto dstNodeIDPos = getDataPos(*dstNode->getInternalID(), inSchema);
     auto columnsPos = populateReturnColumnsPos(*boundInfo, outSchema);
     auto info = RelInsertInfo(srcNodeIDPos, dstNodeIDPos, std::move(columnsPos));
+    info.namespaceTarget = rel.namespaceWriteTarget;
     auto storageManager = StorageManager::Get(*clientContext);
     DASSERT(srcNode->getNumEntries() == 1 && dstNode->getNumEntries() == 1);
     auto srcTableID = srcNode->getEntry(0)->getTableID();
@@ -170,8 +173,9 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapInsert(const LogicalOperator* l
     }
     auto printInfo =
         std::make_unique<InsertPrintInfo>(expressions, logicalInsert.getInfos()[0].conflictAction);
-    return std::make_unique<Insert>(std::move(nodeExecutors), std::move(relExecutors),
-        std::move(prevOperator), getOperatorID(), std::move(printInfo));
+    std::unique_ptr<PhysicalOperator> result = std::make_unique<Insert>(std::move(nodeExecutors),
+        std::move(relExecutors), std::move(prevOperator), getOperatorID(), std::move(printInfo));
+    return result;
 }
 
 } // namespace processor

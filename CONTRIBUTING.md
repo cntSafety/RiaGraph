@@ -6,6 +6,7 @@ Before submitting your contribution though, please make sure to take a moment an
 RiaGraph is a fork of [ladybug](https://github.com/ladybugdb/ladybug), which is itself a fork of [Kùzu](https://github.com/kuzudb/kuzu). <!-- riag-rename:skip lineage, plan section 1 -->
 Where ladybug's emphasis is feature breadth, **RiaGraph's emphasis is quality and reliability**. <!-- riag-rename:skip lineage, plan section 1 -->
 Changes that make the system more predictable, better tested or easier to reason about are welcome even when they add no features.
+RiaGraph is developed independently of both projects: changes are made here on their own merits and are neither taken from upstream nor kept mergeable with it.
 
 If you have a question or need help, open an [issue](https://github.com/cntSafety/RiaGraph/issues) or start a [discussion](https://github.com/cntSafety/RiaGraph/discussions).
 

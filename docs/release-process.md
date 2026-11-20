@@ -58,7 +58,7 @@ commit of every submodule that went in.
 | `nodejs` | `riagraph-nodejs-<version>-<platform>.tar.gz` (static OpenSSL, glibc >= 2.28) | selected platforms |
 | `java` | multiplatform jar, Maven bundle | needs `linux_x64`; natives for the selected platforms |
 | `rust` | the `.crate`, built against the engine | needs `linux_x64` |
-| `wasm` | `riag-wasm.tar.gz`. **Disabled:** the build refuses it until `RiaGraphExtension` is ported from namespace `lbug` to `riag`; then re-enable in `release-build.yml` (see `package-wasm.yml`) | none (Emscripten) |
+| `wasm` | `riag-wasm.tar.gz`. **Disabled:** the build refuses it until `RiaGraphExtension` is ported from namespace `lbug` to `riag`; then re-enable in `release-build.yml` (see `package-wasm.yml`) | none (Emscripten) | <!-- riag-rename:skip upstream extension namespace -->
 
 Platforms: `linux_x64` (manylinux_2_28), `macos_arm64`, `windows_x64`. Adding a
 platform means adding a row to the table in the `plan` job of `release-build.yml`

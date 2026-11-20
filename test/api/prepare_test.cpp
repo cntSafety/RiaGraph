@@ -92,6 +92,40 @@ TEST_F(ApiTest, RepeatedExecuteRegexpParameter) {
     check("^Al", "A.*", "Alice|Al|[Al]|[ice]|#ice\n");
 }
 
+// =~ binds a parameter of unknown type as a STRING on either side, and rejects a parameter whose
+// value is not a STRING, as in Cypher (#195).
+TEST_F(ApiTest, RegexpFullMatchParameterOperand) {
+    auto preparedStatement = conn->prepare("RETURN $p =~ 'A.*', 'Alice' =~ $p");
+    ASSERT_TRUE(preparedStatement->isSuccess()) << preparedStatement->getErrorMessage();
+    auto result = conn->execute(preparedStatement.get(), std::make_pair(std::string("p"), "Al.*"));
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_TRUE(result->hasNext());
+    checkTuple(result->getNext().get(), "True|True\n");
+    result = conn->execute(preparedStatement.get(), std::make_pair(std::string("p"), "B.*"));
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_TRUE(result->hasNext());
+    checkTuple(result->getNext().get(), "False|False\n");
+    // A value of another type rebinds the statement, and the rebinding rejects it.
+    result = conn->execute(preparedStatement.get(), std::make_pair(std::string("p"), (int64_t)5));
+    ASSERT_FALSE(result->isSuccess());
+    ASSERT_STREQ("Binder exception: Type mismatch: the operands of =~ must be STRING, but $p has "
+                 "data type INT64.",
+        result->getErrorMessage().c_str());
+    std::unordered_map<std::string, std::unique_ptr<Value>> params;
+    params["p"] = std::make_unique<Value>(int64_t{5});
+    auto typedStatement = conn->prepareWithParams("RETURN $p =~ '5'", std::move(params));
+    ASSERT_FALSE(typedStatement->isSuccess());
+    ASSERT_STREQ("Binder exception: Type mismatch: the operands of =~ must be STRING, but $p has "
+                 "data type INT64.",
+        typedStatement->getErrorMessage().c_str());
+    // regexp_replace casts a non-STRING argument, as the other regexp functions do.
+    auto replaceStatement = conn->prepare("RETURN regexp_replace('15', $p, 'x')");
+    result = conn->execute(replaceStatement.get(), std::make_pair(std::string("p"), (int64_t)1));
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_TRUE(result->hasNext());
+    checkTuple(result->getNext().get(), "x5\n");
+}
+
 TEST_F(ApiTest, PrepareBool) {
     auto preparedStatement =
         conn->prepare("MATCH (a:person) WHERE a.isStudent = $1 RETURN COUNT(*)");
@@ -1394,4 +1428,100 @@ TEST_F(ApiTest, PreparedRelScanAfterCheckpointRenumbersColumns) {
         ASSERT_EQ(std::vector<std::string>{"5"}, TestHelper::convertResultToString(*result));
         ASSERT_TRUE(conn->query("CHECKPOINT")->isSuccess());
     }
+}
+
+TEST_F(ApiTest, PreparedCastToUnionExecutedTwice) {
+    // bindCastToUnionFunction's bind lambda refers to the target type of the cast. It runs only
+    // while the cast is bound, so the cached plan must keep working on every later execution,
+    // including once the prepare call and its binder frames are long gone.
+    auto cast =
+        conn->prepareWithParams("RETURN CAST($x, 'UNION(a INT64, b STRING)')", paramMap("x", 7));
+    ASSERT_TRUE(cast->isSuccess()) << cast->getErrorMessage();
+    for (auto i = 0; i < 3; i++) {
+        auto result = conn->executeWithParams(cast.get(), paramMap("x", 7 + i));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        ASSERT_EQ(std::vector<std::string>{std::to_string(7 + i)},
+            TestHelper::convertResultToString(*result));
+    }
+    auto castList = conn->prepareWithParams("RETURN CAST([$x, 2], 'UNION(a INT64, b STRING)[]'), "
+                                            "typeof(CAST($x, 'UNION(a INT64, b STRING)'))",
+        paramMap("x", 5));
+    ASSERT_TRUE(castList->isSuccess()) << castList->getErrorMessage();
+    for (auto i = 0; i < 2; i++) {
+        auto result = conn->executeWithParams(castList.get(), paramMap("x", 5));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        ASSERT_EQ(std::vector<std::string>{"[5,2]|UNION(a INT64, b STRING)"},
+            TestHelper::convertResultToString(*result));
+    }
+}
+
+// A write prepared earlier skips prepareNoLock when executed, so the read-only check there never
+// ran: the statement was accepted inside BEGIN TRANSACTION READ ONLY and discarded at COMMIT.
+TEST_F(ApiTest, PreparedWriteIsRefusedInReadOnlyTransactionAndEndsIt) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")->isSuccess());
+    auto write = conn->prepare("CREATE (:P {id: $x})");
+    ASSERT_TRUE(write->isSuccess()) << write->getErrorMessage();
+    auto read = conn->prepare("MATCH (n:P) RETURN count(*)");
+    ASSERT_TRUE(read->isSuccess()) << read->getErrorMessage();
+    // In auto-commit mode the prepared write still works.
+    ASSERT_TRUE(conn->executeWithParams(write.get(), paramMap("x", 1))->isSuccess());
+
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION READ ONLY")->isSuccess());
+    // A prepared read-only statement still executes in the read-only transaction.
+    auto count = conn->executeWithParams(read.get(), {});
+    ASSERT_TRUE(count->isSuccess()) << count->getErrorMessage();
+    ASSERT_EQ(std::vector<std::string>{"1"}, TestHelper::convertResultToString(*count));
+    auto refused = conn->executeWithParams(write.get(), paramMap("x", 2));
+    ASSERT_FALSE(refused->isSuccess());
+    ASSERT_EQ("Can not execute a write query inside a read-only transaction.",
+        refused->getErrorMessage());
+    // The refusal ended the transaction, like the unprepared refusal does.
+    auto commit = conn->query("COMMIT");
+    ASSERT_FALSE(commit->isSuccess());
+    ASSERT_EQ("No active transaction for COMMIT.", commit->getErrorMessage());
+    // Nothing was written, and the prepared statements work again in auto-commit mode.
+    count = conn->executeWithParams(read.get(), {});
+    ASSERT_EQ(std::vector<std::string>{"1"}, TestHelper::convertResultToString(*count));
+    ASSERT_TRUE(conn->executeWithParams(write.get(), paramMap("x", 3))->isSuccess());
+}
+
+TEST_F(ApiTest, PreparedWriteFromWriteTransactionIsRefusedInReadOnlyTransaction) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")->isSuccess());
+    // Prepared while a write transaction is open, executed after a read-only one replaced it.
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION")->isSuccess());
+    auto write = conn->prepare("CREATE (:P {id: $x})");
+    ASSERT_TRUE(write->isSuccess()) << write->getErrorMessage();
+    ASSERT_TRUE(conn->executeWithParams(write.get(), paramMap("x", 1))->isSuccess());
+    ASSERT_TRUE(conn->query("COMMIT")->isSuccess());
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION READ ONLY")->isSuccess());
+    auto refused = conn->executeWithParams(write.get(), paramMap("x", 2));
+    ASSERT_FALSE(refused->isSuccess());
+    ASSERT_EQ("Can not execute a write query inside a read-only transaction.",
+        refused->getErrorMessage());
+    ASSERT_FALSE(conn->query("COMMIT")->isSuccess());
+    auto count = conn->query("MATCH (n:P) RETURN count(*)");
+    ASSERT_EQ(std::vector<std::string>{"1"}, TestHelper::convertResultToString(*count));
+}
+
+// A WITH of a parameter or of constants, with no reading clause before it, is one row: a write
+// after it runs once, and a LIMIT $n on it keeps min(n, 1) rows (cntSafety/RiaGraph#203). The
+// prepared plan is executed again with other values, so the row count must not be planned in.
+TEST_F(ApiTest, PreparedWriteAfterConstantWith) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE W(id INT64, PRIMARY KEY(id))")->isSuccess());
+    auto create = conn->prepare("WITH $x AS x CREATE (:W {id: x})");
+    ASSERT_TRUE(create->isSuccess()) << create->getErrorMessage();
+    for (auto x : {1, 2}) {
+        auto result = conn->executeWithParams(create.get(), paramMap("x", x));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    auto limited = conn->prepare("WITH 10 AS base LIMIT $n CREATE (:W {id: base + $n})");
+    ASSERT_TRUE(limited->isSuccess()) << limited->getErrorMessage();
+    for (auto n : {0, 1, 5}) {
+        auto result = conn->executeWithParams(limited.get(), paramMap("n", n));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    auto ids = conn->query("MATCH (w:W) RETURN w.id ORDER BY w.id");
+    ASSERT_TRUE(ids->isSuccess()) << ids->getErrorMessage();
+    ASSERT_EQ((std::vector<std::string>{"1", "2", "11", "15"}),
+        TestHelper::convertResultToString(*ids, true /* checkOutputOrder */));
 }

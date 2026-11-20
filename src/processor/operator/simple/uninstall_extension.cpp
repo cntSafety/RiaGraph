@@ -24,7 +24,9 @@ void UninstallExtension::executeInternal(ExecutionContext* context) {
     }
     std::error_code errCode;
     if (!std::filesystem::remove_all(
-            extension::ExtensionUtils::getLocalDirForExtension(clientContext, path), errCode)) {
+            FileSystem::pathFromUTF8(
+                extension::ExtensionUtils::getLocalDirForExtension(clientContext, path)),
+            errCode)) {
         // LCOV_EXCL_START
         throw RuntimeException{
             std::format("An error occurred while uninstalling extension: {}. Error: {}.", path,

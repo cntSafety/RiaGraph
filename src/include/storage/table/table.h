@@ -11,6 +11,9 @@
 #include "storage/table/node_group.h"
 
 namespace riag {
+namespace catalog {
+class NamespaceWriteState;
+}
 namespace evaluator {
 class ExpressionEvaluator;
 } // namespace evaluator
@@ -128,8 +131,10 @@ struct RIAG_API TableUpdateState {
     }
 };
 
+struct NamespaceDeleteState;
 struct RIAG_API TableDeleteState {
     bool logToWAL;
+    std::unique_ptr<NamespaceDeleteState> namespaces;
 
     TableDeleteState();
 
@@ -202,6 +207,9 @@ public:
 
     void setHasChanges() { changeEpoch.fetch_add(1, std::memory_order_relaxed); }
     uint64_t getChangeEpoch() const { return changeEpoch.load(std::memory_order_acquire); }
+    catalog::Catalog* getOwningCatalog() const;
+    void clearNamespaceMembership(transaction::Transaction* transaction, common::offset_t offset,
+        TableDeleteState& state);
 
     template<class TARGET>
     TARGET& cast() {

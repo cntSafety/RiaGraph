@@ -75,6 +75,11 @@ struct SetSeedFunctionWrapper {
         auto& inputVector_ = *(common::ValueVector*)inputVector;
         auto& resultVector_ = *(common::ValueVector*)resultVector;
         resultVector_.setNull(resultPos, true /* isNull */);
+        // The executors already skip NULL operands; checking here as well keeps FUNC from ever
+        // reading the unspecified slot of a NULL input.
+        if (inputVector_.isNull(inputPos)) {
+            return;
+        }
         FUNC::operation(inputVector_.getValue<OPERAND_TYPE>(inputPos), dataPtr);
     }
 };

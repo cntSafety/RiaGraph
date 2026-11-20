@@ -59,6 +59,7 @@ public:
         DASSERT(prev);
         return prev.get();
     }
+    bool hasPrev() const { return prev != nullptr; }
     std::unique_ptr<CatalogEntry> movePrev() {
         if (this->prev) {
             this->prev->setNext(nullptr);

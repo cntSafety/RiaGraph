@@ -101,7 +101,7 @@ void DefaultErrorStrategy::sync(Parser *recognizer) {
   size_t la = tokens->LA(1);
 
   // try cheaper subset first; might get lucky. seems to shave a wee bit off
-  auto nextTokens = recognizer->getATN().nextTokens(s);
+  const auto &nextTokens = recognizer->getATN().nextTokens(s);
   if (nextTokens.contains(Token::EPSILON) || nextTokens.contains(la)) {
     return;
   }

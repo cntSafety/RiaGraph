@@ -281,3 +281,101 @@ True
 -STATEMENT MATCH ()-[k:K]->() RETURN count(*);
 ---- 1
 2
+
+-CASE RefusedBeginLeavesConnectionUsable
+# A BEGIN refused because another connection holds the write transaction must leave the
+# connection in auto-commit mode; its next statement used to run with no transaction at all.
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-CREATE_CONNECTION conn2
+-STATEMENT [conn2] BEGIN TRANSACTION;
+---- error
+Cannot start a new write transaction in the system. Only one write transaction at a time is allowed in the system.
+-STATEMENT [conn2] MATCH (n:P) RETURN count(*);
+---- 1
+0
+-STATEMENT [conn2] ROLLBACK;
+---- error
+No active transaction for ROLLBACK.
+-STATEMENT [conn2] CREATE (:P {id: 2});
+---- error
+Cannot start a new write transaction in the system. Only one write transaction at a time is allowed in the system.
+-STATEMENT COMMIT;
+---- ok
+# With the writer gone, the refused connection both begins and commits normally.
+-STATEMENT [conn2] BEGIN TRANSACTION;
+---- ok
+-STATEMENT [conn2] CREATE (:P {id: 2});
+---- ok
+-STATEMENT [conn2] COMMIT;
+---- ok
+-STATEMENT MATCH (n:P) RETURN n.id;
+---- 1
+2
+
+-CASE RefusedBeginEndsTransactionOfEarlierError
+# The second way in: the connection's own transaction was already ended by an error, then its BEGIN
+# is refused. The follow-up COMMIT must report that there is no transaction.
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE (:P {id: 1});
+---- ok
+-CREATE_CONNECTION conn2
+-STATEMENT [conn2] BEGIN TRANSACTION READ ONLY;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:P {id: 7});
+---- ok
+-STATEMENT [conn2] RETURN make_date(2011,1,32)
+---- error
+Conversion exception: Date out of range: 2011-1-32.
+-STATEMENT [conn2] BEGIN TRANSACTION;
+---- error
+Cannot start a new write transaction in the system. Only one write transaction at a time is allowed in the system.
+-STATEMENT [conn2] COMMIT;
+---- error
+No active transaction for COMMIT.
+-STATEMENT COMMIT;
+---- ok
+
+-CASE RefusedWriteInReadOnlyTransactionEndsIt
+# Every error inside an explicit transaction ends it. That includes a write refused up front
+# because the transaction is read-only.
+-STATEMENT CREATE NODE TABLE P(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE (:P {id: 1});
+---- ok
+-STATEMENT BEGIN TRANSACTION READ ONLY;
+---- ok
+-STATEMENT CREATE (:P {id: 2});
+---- error
+Can not execute a write query inside a read-only transaction.
+-STATEMENT COMMIT;
+---- error
+No active transaction for COMMIT.
+# DDL is refused the same way.
+-STATEMENT BEGIN TRANSACTION READ ONLY;
+---- ok
+-STATEMENT CREATE NODE TABLE Q(id INT64, PRIMARY KEY(id));
+---- error
+Can not execute a write query inside a read-only transaction.
+-STATEMENT ROLLBACK;
+---- error
+No active transaction for ROLLBACK.
+# The connection is back in auto-commit mode and can start a new transaction.
+-STATEMENT BEGIN TRANSACTION READ ONLY;
+---- ok
+-STATEMENT MATCH (n:P) RETURN count(*);
+---- 1
+1
+-STATEMENT COMMIT;
+---- ok
+# A refused write outside any transaction is unaffected.
+-STATEMENT CREATE (:P {id: 3});
+---- ok
+-STATEMENT MATCH (n:P) RETURN count(*);
+---- 1
+2

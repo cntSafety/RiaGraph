@@ -70,6 +70,7 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapCopyNodeFrom(
         std::move(warningColumnTypes), std::move(columnEvaluators),
         copyFromInfo->columnEvaluateTypes, copyFromInfo->getSkipDuplicatePKOption(),
         copyFromInfo->partitionInfo);
+    info->namespaceTarget = copyFromInfo->namespaceTarget;
     auto printInfo = std::make_unique<NodeBatchInsertPrintInfo>(copyFromInfo->tableName);
     auto batchInsert = std::make_unique<NodeBatchInsert>(std::move(info), std::move(sharedState),
         std::move(prevOperator), getOperatorID(), std::move(printInfo));
@@ -105,6 +106,7 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapPartitioner(
     auto dataInfo = PartitionerDataInfo(copyFromInfo.tableName, extraInfo.fromTableName,
         extraInfo.toTableName, LogicalType::copy(columnTypes), std::move(columnEvaluators),
         copyFromInfo.columnEvaluateTypes);
+    dataInfo.namespaceTarget = copyFromInfo.namespaceTarget;
     auto sharedState =
         std::make_shared<CopyPartitionerSharedState>(*MemoryManager::Get(*clientContext));
     expression_vector expressions;

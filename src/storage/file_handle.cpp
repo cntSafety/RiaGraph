@@ -118,12 +118,15 @@ void FileHandle::unpinPage(page_idx_t pageIdx) {
 }
 
 void FileHandle::resetToZeroPagesAndPageCapacity() {
-    removePageIdxAndTruncateIfNecessary(0 /* pageIdx */);
     if (isInMemoryMode()) {
+        // Unpin before the truncation below: it sets numPages to 0 and shrinks pageStates, so
+        // afterwards there is nothing left to unpin and the pages would stay LOCKED.
         for (auto i = 0u; i < numPages; i++) {
             bm->unpin(*this, i);
         }
-    } else {
+    }
+    removePageIdxAndTruncateIfNecessary(0 /* pageIdx */);
+    if (!isInMemoryMode()) {
         fileInfo->truncate(0 /* size */);
     }
 }

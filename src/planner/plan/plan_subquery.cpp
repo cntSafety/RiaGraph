@@ -47,7 +47,7 @@ static bool isNodePrimaryKey(const Expression& expression, const NodeExpression&
     }
     auto& property = expression.constCast<PropertyExpression>();
     return property.getVariableName() == node.getInternalID()->getVariableName() &&
-           property.isPrimaryKey(tableID);
+           property.isPrimaryKey(tableID) && !property.localPrimaryKey;
 }
 
 // Correlated variant of tryPlanQueryPrimaryKeyLookup for OPTIONAL MATCH: when the optional
@@ -495,6 +495,7 @@ bool isNullFreeOperator(LogicalOperatorType type) {
     case LogicalOperatorType::ACCUMULATE:
     case LogicalOperatorType::ALTER:
     case LogicalOperatorType::ANALYZE:
+    case LogicalOperatorType::ASSERT:
     case LogicalOperatorType::ATTACH_DATABASE:
     case LogicalOperatorType::COPY_FROM:
     case LogicalOperatorType::COPY_TO:
@@ -520,6 +521,8 @@ bool isNullFreeOperator(LogicalOperatorType type) {
     case LogicalOperatorType::NOOP:
     case LogicalOperatorType::PARTITIONER:
     case LogicalOperatorType::SET_PROPERTY:
+    case LogicalOperatorType::NAMESPACE_MUTATION:
+    case LogicalOperatorType::NAMESPACE_COMMAND:
     case LogicalOperatorType::STANDALONE_CALL:
     case LogicalOperatorType::TABLE_FUNCTION_CALL:
     case LogicalOperatorType::TRANSACTION:
@@ -1006,7 +1009,7 @@ bool Planner::tryPlanPropertySeededChain(const QueryGraphCollection& queryGraphC
         return false;
     }
     auto seedTableID = seedNode->getTableIDs()[0];
-    if (!elemPropRef.isPrimaryKey(seedTableID)) {
+    if (!elemPropRef.isPrimaryKey(seedTableID) || elemPropRef.localPrimaryKey) {
         return false;
     }
     auto seedTable = storage::StorageManager::Get(*clientContext)
@@ -1642,7 +1645,7 @@ static bool isKDetermined(const std::shared_ptr<Expression>& needExpr,
             }
         } else if (expr->expressionType == ExpressionType::PROPERTY) {
             auto& prop = expr->constCast<PropertyExpression>();
-            if (prop.getVariableName() == varName && prop.isPrimaryKey() &&
+            if (prop.getVariableName() == varName && prop.isGloballyUniquePrimaryKey() &&
                 (kNames.contains(ename) || kPackDeps.contains(ename))) {
                 return true;
             }

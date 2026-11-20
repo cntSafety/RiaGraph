@@ -1,0 +1,336 @@
+-DATASET CSV tinysnb
+
+--
+
+-CASE AssertStatementLevel
+-LOG GraphPreconditions
+-STATEMENT ASSERT EXISTS { MATCH (a) } AS 'Graph shall contain at least one node'
+---- ok
+-STATEMENT ASSERT NOT EXISTS { MATCH (a:person {fName: 'Zoe'}) } AS 'Graph shall not contain Zoe'
+---- ok
+-STATEMENT ASSERT NOT EXISTS { MATCH (a:person {fName: 'Alice'}) } AS 'Graph shall not contain Alice'
+---- error
+Assertion failed: Graph shall not contain Alice
+-STATEMENT ASSERT COUNT { MATCH (a:person) } = 8
+---- ok
+-LOG DefaultMessageIsTheConditionAsWritten
+-STATEMENT ASSERT COUNT { MATCH (a:person) } > 8
+---- error
+Assertion failed: COUNT { MATCH (a:person) } > 8
+-LOG ListQuantifiers
+-STATEMENT ASSERT none(e IN [1, 2, 3] WHERE e < 0) AS 'No negative elements'
+---- ok
+-STATEMENT ASSERT none(e IN [1, -2, 3] WHERE e < 0) AS 'No negative elements'
+---- error
+Assertion failed: No negative elements
+-LOG Literals
+-STATEMENT ASSERT true
+---- ok
+-STATEMENT ASSERT false
+---- error
+Assertion failed: false
+-STATEMENT ASSERT 1 + 1 = 3 AS "double quoted message"
+---- error
+Assertion failed: double quoted message
+-STATEMENT ASSERT false AS 'it\'s escaped: "quoted"'
+---- error
+Assertion failed: it's escaped: "quoted"
+-LOG Chained
+-STATEMENT ASSERT true AS 'first' ASSERT false AS 'second' ASSERT false AS 'third'
+---- error
+Assertion failed: second
+-STATEMENT ASSERT 1 < 2 ASSERT 2 < 3 RETURN 'both held'
+---- 1
+both held
+-LOG ResultHasNoColumns
+-CHECK_COLUMN_NAMES
+-STATEMENT ASSERT true RETURN 1 AS one
+---- 2
+one
+1
+
+-CASE AssertNull
+-STATEMENT ASSERT NULL
+---- error
+Assertion failed: NULL
+-STATEMENT ASSERT NULL AS 'null fails'
+---- error
+Assertion failed: null fails
+-STATEMENT MATCH (a:person) ASSERT CASE WHEN a.ID = 7 THEN NULL ELSE true END AS 'null for one row' RETURN count(*)
+---- error
+Assertion failed: null for one row
+-STATEMENT MATCH (a:person) ASSERT CASE WHEN a.ID = 7 THEN NULL ELSE true END IS NULL OR true RETURN count(*)
+---- 1
+8
+-STATEMENT MATCH (a:person) ASSERT coalesce(CASE WHEN a.ID = 7 THEN NULL ELSE true END, true) RETURN count(*)
+---- 1
+8
+
+-CASE AssertPerRow
+-LOG PassesRowsUnchanged
+-STATEMENT MATCH (a:person) ASSERT a.age > 0 AS 'Age shall be positive' RETURN a.fName ORDER BY a.fName
+---- 8
+Alice
+Bob
+Carol
+Dan
+Elizabeth
+Farooq
+Greg
+Hubert Blaine Wolfeschlegelsteinhausenbergerdorff
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'Age shall be below 80' RETURN a.fName
+---- error
+Assertion failed: Age shall be below 80
+-STATEMENT MATCH (a:person) ASSERT a.age < 80
+---- error
+Assertion failed: a.age < 80
+-STATEMENT MATCH (a:person) WHERE a.age < 80 ASSERT a.age < 80
+---- ok
+-LOG PropertyOnlyUsedByAssert
+-STATEMENT MATCH (a:person) ASSERT a.fName <> 'Greg' RETURN a.ID
+---- error
+Assertion failed: a.fName <> 'Greg'
+-LOG EmptyInputPasses
+-STATEMENT MATCH (a:person) WHERE a.age > 100 ASSERT false AS 'never checked' RETURN count(*)
+---- 1
+0
+-LOG OneHop
+-STATEMENT MATCH (a:person)-[:knows]->(b:person) ASSERT a <> b AS 'No self loops' RETURN count(*)
+---- 1
+14
+-STATEMENT MATCH (a:person)-[:knows]->(b:person) ASSERT a.age <= b.age AS 'Knows only older' RETURN count(*)
+---- error
+Assertion failed: Knows only older
+-LOG CorrelatedSubquery
+-STATEMENT MATCH (a:person) WHERE a.ID < 6 ASSERT EXISTS { MATCH (a)-[:knows]->(:person) } RETURN count(*)
+---- 1
+4
+-STATEMENT MATCH (a:person) ASSERT EXISTS { MATCH (a)-[:knows]->(:person) } AS 'Everyone knows someone' RETURN count(*)
+---- error
+Assertion failed: Everyone knows someone
+-STATEMENT MATCH (a:person) ASSERT COUNT { MATCH (a)-[:knows]->(:person) } <= 3 RETURN count(*)
+---- 1
+8
+-LOG AfterUnwind
+-STATEMENT UNWIND [1, 2, 3] AS x ASSERT x > 0 RETURN sum(x)
+---- 1
+6
+-STATEMENT UNWIND [1, 2, 3] AS x ASSERT x <> 2 AS 'two' RETURN sum(x)
+---- error
+Assertion failed: two
+-LOG AfterWith
+-STATEMENT MATCH (a:person) WITH a.age AS age ASSERT age >= 20 RETURN min(age)
+---- 1
+20
+-STATEMENT MATCH (a:person) WITH count(*) AS n ASSERT n = 8 AS 'eight people' RETURN n
+---- 1
+8
+-STATEMENT MATCH (a:person) WITH count(*) AS n ASSERT n = 9 AS 'nine people' RETURN n
+---- error
+Assertion failed: nine people
+-LOG FollowedByMatch
+-STATEMENT MATCH (a:person) WHERE a.ID = 0 ASSERT a.fName = 'Alice' MATCH (a)-[:knows]->(b:person) RETURN b.fName ORDER BY b.fName
+---- 3
+Bob
+Carol
+Dan
+-STATEMENT MATCH (a:person) ASSERT a.age > 0 MATCH (o:organisation) RETURN count(*)
+---- 1
+24
+-LOG FollowedByOptionalMatch
+-STATEMENT MATCH (a:person) ASSERT a.age > 0 OPTIONAL MATCH (a)-[:knows]->(b:person) RETURN count(b)
+---- 1
+14
+-LOG AssertIsCheckedWhenTheLaterMatchIsEmpty
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'checked anyway' MATCH (o:organisation) WHERE o.ID > 1000 RETURN count(*)
+---- error
+Assertion failed: checked anyway
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'checked anyway' MATCH (a)-[:knows]->(b:person) WHERE b.ID > 1000 RETURN count(*)
+---- error
+Assertion failed: checked anyway
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'checked anyway' CALL show_tables() WHERE name = 'nope' RETURN count(*)
+---- error
+Assertion failed: checked anyway
+-STATEMENT MATCH (a:person) ASSERT a.age < 100 CALL show_tables() WHERE name = 'nope' RETURN count(*)
+---- 1
+0
+-LOG AssertIsCheckedWhenALaterFilterFoldsToFalse
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'checked anyway' WITH a WHERE false RETURN count(*)
+---- error
+Assertion failed: checked anyway
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'checked anyway' WITH a WHERE 1 = 2 RETURN a
+---- error
+Assertion failed: checked anyway
+-LOG AssertIsCheckedWhenALaterFilterRemovesTheRow
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'checked anyway' WITH a WHERE a.age < 80 RETURN count(*)
+---- error
+Assertion failed: checked anyway
+-LOG LimitDoesNotCutTheCheckShort
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'checked anyway' RETURN a.fName LIMIT 1
+---- error
+Assertion failed: checked anyway
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'checked anyway' RETURN DISTINCT a.gender LIMIT 1
+---- error
+Assertion failed: checked anyway
+-STATEMENT MATCH (a:person) ASSERT a.age < 80 AS 'checked anyway' WITH a LIMIT 2 RETURN count(*)
+---- error
+Assertion failed: checked anyway
+-STATEMENT MATCH (a:person) ASSERT a.age < 100 RETURN a.fName ORDER BY a.ID LIMIT 2
+---- 2
+Alice
+Bob
+-STATEMENT MATCH (a:person) ASSERT a.age < 100 RETURN a.fName SKIP 6
+---- 2
+Greg
+Hubert Blaine Wolfeschlegelsteinhausenbergerdorff
+-LOG Union
+-STATEMENT MATCH (a:person) ASSERT a.age > 0 RETURN a.ID AS id UNION ALL MATCH (o:organisation) ASSERT o.ID > 0 RETURN o.ID AS id
+---- 11
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+-STATEMENT MATCH (a:person) ASSERT a.age > 0 RETURN a.ID AS id UNION ALL MATCH (o:organisation) ASSERT o.ID > 1 AS 'org one' RETURN o.ID AS id
+---- error
+Assertion failed: org one
+
+-CASE AssertAggregate
+-LOG PassesAllRowsThrough
+-STATEMENT MATCH (b:person) ASSERT count(b) > 0 AS 'Graph shall not be empty' RETURN b.fName ORDER BY b.fName LIMIT 3
+---- 3
+Alice
+Bob
+Carol
+-STATEMENT MATCH (b:person) ASSERT count(b) = 8 RETURN count(*)
+---- 1
+8
+-STATEMENT MATCH (b:person) ASSERT count(b) = 7
+---- error
+Assertion failed: count(b) = 7
+-LOG IssueExample
+-STATEMENT MATCH (a:person) MATCH (b:organisation) ASSERT count(a) = count(b) AS 'Count of a and b shall be equal' ASSERT count(b) > 0 AS 'Graph shall not be empty' RETURN count(*)
+---- 1
+24
+-STATEMENT MATCH (a:person) MATCH (b:organisation) ASSERT count(DISTINCT a) = count(DISTINCT b) AS 'Count of distinct a and b shall be equal' RETURN count(*)
+---- error
+Assertion failed: Count of distinct a and b shall be equal
+-STATEMENT MATCH (a:person) MATCH (b:organisation) ASSERT count(DISTINCT a) = 8 AND count(DISTINCT b) = 3 RETURN count(*)
+---- 1
+24
+-LOG EmptyInputStillAggregates
+-STATEMENT MATCH (b:person) WHERE b.age > 100 ASSERT count(b) > 0 AS 'Graph shall not be empty' RETURN b
+---- error
+Assertion failed: Graph shall not be empty
+-STATEMENT MATCH (b:person) WHERE b.age > 100 ASSERT count(b) = 0 RETURN count(*)
+---- 1
+0
+-STATEMENT MATCH (b:person) WHERE b.age > 100 ASSERT max(b.age) < 200 AS 'max of nothing is NULL'
+---- error
+Assertion failed: max of nothing is NULL
+-LOG OtherAggregates
+-STATEMENT MATCH (b:person) ASSERT sum(b.age) = 298 AND min(b.age) = 20 AND max(b.age) = 83 ASSERT size(collect(DISTINCT b.gender)) = 2 RETURN count(*)
+---- 1
+8
+-STATEMENT MATCH (b:person) ASSERT avg(b.age) < 30 AS 'young on average'
+---- error
+Assertion failed: young on average
+-STATEMENT MATCH (b:person) ASSERT all(x IN collect(b.age) WHERE x >= 20) RETURN count(*)
+---- 1
+8
+-LOG SameAggregateTwiceAndLater
+-STATEMENT MATCH (b:person) ASSERT count(b) > 0 ASSERT count(b) < 9 RETURN count(b)
+---- 1
+8
+-STATEMENT MATCH (b:person) WITH b, count(b) AS c ASSERT count(b) = 8 RETURN sum(c)
+---- 1
+8
+-LOG FollowedByMoreClauses
+-STATEMENT MATCH (a:person) ASSERT count(*) = 8 MATCH (a)-[:knows]->(b:person) RETURN count(*)
+---- 1
+14
+-STATEMENT MATCH (a:person) ASSERT count(*) = 8 WITH a WHERE a.age >= 40 ASSERT count(*) = 3 RETURN a.fName ORDER BY a.fName
+---- 3
+Carol
+Hubert Blaine Wolfeschlegelsteinhausenbergerdorff
+Greg
+-STATEMENT MATCH (a:person) ASSERT count(*) = 8 RETURN a.fName LIMIT 1
+---- 1
+Alice
+-LOG StatementLevelAggregate
+-STATEMENT ASSERT count(*) = 1 MATCH (a:person) RETURN count(*)
+---- 1
+8
+-STATEMENT ASSERT sum(1) = 1 ASSERT sum(1) = 1 RETURN 'ok'
+---- 1
+ok
+-LOG UncorrelatedSubqueryBesideAggregate
+-STATEMENT MATCH (a:person) ASSERT count(*) = COUNT { MATCH (:person) } RETURN count(*)
+---- 1
+8
+-LOG AggregateWithParameterFreeLiteral
+-STATEMENT MATCH (a:person) ASSERT count(*) > 1 + 1 RETURN count(*)
+---- 1
+8
+
+-CASE AssertBinderErrors
+-STATEMENT MATCH (a:person) ASSERT count(*) > 0 AND a.age > 0 RETURN a
+---- error
+Binder exception: ASSERT condition count(*) > 0 AND a.age > 0 mixes aggregates with a.age, which is not aggregated. Aggregate it as well, or compute the aggregates with WITH first.
+-STATEMENT MATCH (a:person) ASSERT count(*) > 0 AND a IS NOT NULL RETURN a
+---- error
+Binder exception: ASSERT condition count(*) > 0 AND a IS NOT NULL mixes aggregates with a, which is not aggregated. Aggregate it as well, or compute the aggregates with WITH first.
+-STATEMENT MATCH (a:person) ASSERT count(*) > 0 AND EXISTS { MATCH (a)-[:knows]->() } RETURN a
+---- error(regex)
+^Binder exception: ASSERT condition .* mixes aggregates with .*, which is not aggregated\..*
+-STATEMENT MATCH (a:person) ASSERT sum(count(*)) > 0
+---- error(regex)
+^Binder exception: .*contains nested aggregation.*
+-STATEMENT ASSERT 1
+---- error
+Binder exception: Expression 1 has data type INT64 but expected BOOL. Implicit cast is not supported.
+-STATEMENT ASSERT 'yes'
+---- error(regex)
+^Binder exception: .*
+-STATEMENT ASSERT x > 0
+---- error
+Binder exception: Variable x is not in scope.
+
+-CASE AssertParserErrors
+-STATEMENT MATCH (a:person)
+---- error(regex)
+^Parser exception: [\s\S]*
+-STATEMENT ASSERT true AS message
+---- error(regex)
+^Parser exception: [\s\S]*
+-STATEMENT ASSERT
+---- error(regex)
+^Parser exception: [\s\S]*
+-STATEMENT CREATE (:person {ID: 100}) ASSERT true
+---- error(regex)
+^Parser exception: [\s\S]*
+
+-CASE AssertKeywordIsNotReserved
+-STATEMENT UNWIND [1, 2] AS assert ASSERT assert > 0 RETURN sum(assert) AS Assert
+---- 1
+3
+-STATEMENT RETURN {assert: 1}.assert
+---- 1
+1
+
+-CASE AssertExplain
+-STATEMENT EXPLAIN MATCH (a:person) ASSERT a.age < 0 RETURN a
+---- ok
+-STATEMENT EXPLAIN LOGICAL MATCH (a:person) ASSERT count(*) < 0 RETURN a
+---- ok
+-STATEMENT PROFILE MATCH (a:person) ASSERT a.age > 0 RETURN count(*)
+---- ok
+-STATEMENT PROFILE MATCH (a:person) ASSERT a.age < 0 RETURN count(*)
+---- error
+Assertion failed: a.age < 0

@@ -3,6 +3,7 @@ add_library(riag_function_pattern
         cost_function.cpp
         id_function.cpp
         label_function.cpp
+        namespace_function.cpp
         rowid_function.cpp
         start_end_node_function.cpp)
 

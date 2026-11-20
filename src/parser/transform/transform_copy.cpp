@@ -27,6 +27,10 @@ std::unique_ptr<Statement> Transformer::transformCopyFrom(CypherParser::IC_CopyF
     auto source = transformScanSource(*ctx.iC_ScanSource());
     auto tableName = transformSchemaName(*ctx.oC_SchemaName());
     auto copyFrom = std::make_unique<CopyFrom>(std::move(source), std::move(tableName));
+    if (ctx.iC_NamespaceScope()) {
+        copyFrom->namespaceSelector =
+            transformNamespaceList(*ctx.iC_NamespaceScope()->iC_NamespaceList());
+    }
     CopyFromColumnInfo info;
     info.inputColumnOrder = ctx.iC_ColumnNames();
     if (ctx.iC_ColumnNames()) {

@@ -1,6 +1,7 @@
 #include "optimizer/correlated_subquery_unnest_solver.h"
 
 #include "common/exception/internal.h"
+#include "planner/operator/logical_cross_product.h"
 #include "planner/operator/logical_hash_join.h"
 #include "planner/operator/scan/logical_expressions_scan.h"
 
@@ -19,6 +20,10 @@ void CorrelatedSubqueryUnnestSolver::visitOperator(LogicalOperator* op) {
         solveAccHashJoin(op);
         return;
     }
+    if (isAccCrossProduct(*op)) {
+        solveAccCrossProduct(op);
+        return;
+    }
     for (auto i = 0u; i < op->getNumChildren(); ++i) {
         visitOperator(op->getChild(i).get());
     }
@@ -32,6 +37,24 @@ void CorrelatedSubqueryUnnestSolver::solveAccHashJoin(LogicalOperator* op) const
     auto acc = op->getChild(0).get();
     auto rightSolver = std::make_unique<CorrelatedSubqueryUnnestSolver>(acc);
     rightSolver->solve(hashJoin.getChild(1).get());
+    auto leftSolver = std::make_unique<CorrelatedSubqueryUnnestSolver>(accumulateOp);
+    leftSolver->solve(acc->getChild(0).get());
+}
+
+// A cross product whose build side scans the probe side's materialized rows back, e.g. the check
+// plan of an aggregating ASSERT (Planner::planAssertClause), which sets the dependency when
+// planning it.
+bool CorrelatedSubqueryUnnestSolver::isAccCrossProduct(const LogicalOperator& op) {
+    return op.getOperatorType() == LogicalOperatorType::CROSS_PRODUCT &&
+           op.getChild(0)->getOperatorType() == LogicalOperatorType::ACCUMULATE &&
+           op.constCast<LogicalCrossProduct>().getSIPInfo().dependency ==
+               SIPDependency::BUILD_DEPENDS_ON_PROBE;
+}
+
+void CorrelatedSubqueryUnnestSolver::solveAccCrossProduct(LogicalOperator* op) const {
+    auto acc = op->getChild(0).get();
+    auto rightSolver = std::make_unique<CorrelatedSubqueryUnnestSolver>(acc);
+    rightSolver->solve(op->getChild(1).get());
     auto leftSolver = std::make_unique<CorrelatedSubqueryUnnestSolver>(accumulateOp);
     leftSolver->solve(acc->getChild(0).get());
 }

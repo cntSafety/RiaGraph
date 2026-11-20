@@ -1,5 +1,10 @@
+#include <unordered_set>
+
+#include "binder/expression/node_rel_expression.h"
+#include "binder/expression/property_expression.h"
 #include "planner/operator/persistent/logical_merge.h"
 #include "processor/operator/persistent/merge.h"
+#include "processor/operator/persistent/namespace_mutation.h"
 #include "processor/plan_mapper.h"
 #include <processor/expression_mapper.h>
 
@@ -23,6 +28,83 @@ static FactorizedTableSchema getFactorizedTableSchema(const binder::expression_v
     }
     tableSchema.appendColumn(ColumnSchema(isUnFlat, groupID, sizeof(common::hash_t)));
     return tableSchema;
+}
+
+// The columns of an insert the MERGE pattern gives a value, e.g. v of (a:A {v: 5}).
+static std::vector<common::idx_t> getPatternColumns(const LogicalInsertInfo& info) {
+    const auto& pattern = info.pattern->constCast<binder::NodeOrRelExpression>();
+    std::vector<common::idx_t> columns;
+    for (auto i = 0u; i < info.columnExprs.size(); ++i) {
+        const auto& column = *info.columnExprs[i];
+        if (column.expressionType == common::ExpressionType::PROPERTY &&
+            pattern.hasPropertyDataExpr(
+                column.constCast<binder::PropertyExpression>().getPropertyName())) {
+            columns.push_back(i);
+        }
+    }
+    return columns;
+}
+
+// Whether a SET item writes a property the MERGE pattern gives a value to one of the inserted
+// nodes and rels.
+static bool changesPattern(const std::vector<binder::BoundSetPropertyInfo>& setInfos,
+    const std::vector<const LogicalInsertInfo*>& insertInfos) {
+    for (const auto& setInfo : setInfos) {
+        if (setInfo.column->expressionType != common::ExpressionType::PROPERTY) {
+            continue;
+        }
+        const auto propertyName =
+            setInfo.column->constCast<binder::PropertyExpression>().getPropertyName();
+        for (const auto* insertInfo : insertInfos) {
+            if (*setInfo.pattern == *insertInfo->pattern &&
+                insertInfo->pattern->constCast<binder::NodeOrRelExpression>().hasPropertyDataExpr(
+                    propertyName)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// See MergeInfo::onCreateChangesPattern.
+static void mapPatternChanges(const LogicalMerge& logicalMerge, const planner::Schema& inSchema,
+    MergeInfo& mergeInfo) {
+    std::vector<const LogicalInsertInfo*> insertInfos;
+    for (const auto& info : logicalMerge.getInsertNodeInfos()) {
+        insertInfos.push_back(&info);
+    }
+    for (const auto& info : logicalMerge.getInsertRelInfos()) {
+        insertInfos.push_back(&info);
+    }
+    mergeInfo.onCreateChangesPattern =
+        changesPattern(logicalMerge.getOnCreateSetNodeInfos(), insertInfos) ||
+        changesPattern(logicalMerge.getOnCreateSetRelInfos(), insertInfos);
+    mergeInfo.onMatchChangesPattern =
+        changesPattern(logicalMerge.getOnMatchSetNodeInfos(), insertInfos) ||
+        changesPattern(logicalMerge.getOnMatchSetRelInfos(), insertInfos);
+    if (!mergeInfo.onCreateChangesPattern && !mergeInfo.onMatchChangesPattern) {
+        return;
+    }
+    auto expressionMapper = ExpressionMapper(&inSchema);
+    std::unordered_set<std::string> patternValues;
+    for (const auto* info : insertInfos) {
+        auto columns = getPatternColumns(*info);
+        for (const auto column : columns) {
+            mergeInfo.patternValueEvaluators.push_back(
+                expressionMapper.getEvaluator(info->columnDataExprs[column]));
+        }
+        mergeInfo.patternColumns.push_back(std::move(columns));
+        for (const auto& [_, value] :
+            info->pattern->constCast<binder::NodeOrRelExpression>().getPropertyDataExprRef()) {
+            patternValues.insert(value->getUniqueName());
+        }
+    }
+    const auto& keys = logicalMerge.getKeys();
+    for (auto i = 0u; i < keys.size(); ++i) {
+        if (!patternValues.contains(keys[i]->getUniqueName())) {
+            mergeInfo.fixedKeys.push_back(i);
+        }
+    }
 }
 
 std::unique_ptr<PhysicalOperator> PlanMapper::mapMerge(const LogicalOperator* logicalOperator) {
@@ -102,21 +184,35 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapMerge(const LogicalOperator* lo
         keyEvaluators.push_back(expressionMapper.getEvaluator(key));
     }
 
-    auto storeInsertedPatternIDs = logicalMerge.getOnMatchSetNodeInfos().empty() &&
-                                   logicalMerge.getOnMatchSetRelInfos().empty();
     auto suppressDuplicateCreatedOutput = logicalMerge.suppressesDuplicateCreatedOutput();
-    auto numNodeIDFields = storeInsertedPatternIDs ? logicalMerge.getInsertNodeInfos().size() :
-                                                     logicalMerge.getOnMatchSetNodeInfos().size();
-    auto numRelIDFields = storeInsertedPatternIDs ? logicalMerge.getInsertRelInfos().size() :
-                                                    logicalMerge.getOnMatchSetRelInfos().size();
+    // One ID field per inserted node and rel: a later row with the same key reads the pattern's
+    // stored state back through these IDs (see Merge::executeOnCreatedPattern).
     MergeInfo mergeInfo{std::move(keyEvaluators),
-        getFactorizedTableSchema(logicalMerge.getKeys(), numNodeIDFields, numRelIDFields),
-        std::move(executorInfo), storeInsertedPatternIDs, suppressDuplicateCreatedOutput,
-        existenceMarkPos};
-    return std::make_unique<Merge>(std::move(nodeInsertExecutors), std::move(relInsertExecutors),
-        std::move(onCreateNodeSetExecutors), std::move(onCreateRelSetExecutors),
-        std::move(onMatchNodeSetExecutors), std::move(onMatchRelSetExecutors), std::move(mergeInfo),
-        std::move(prevOperator), getOperatorID(), std::move(printInfo));
+        getFactorizedTableSchema(logicalMerge.getKeys(), logicalMerge.getInsertNodeInfos().size(),
+            logicalMerge.getInsertRelInfos().size()),
+        std::move(executorInfo), suppressDuplicateCreatedOutput, existenceMarkPos};
+    // The existence check scanned the matched pattern before any row of this vector was merged,
+    // so an ON MATCH SET reading a property it writes reads it again (as SET does).
+    mergeInfo.onMatchNodeColumnsToRefresh =
+        getColumnsToRefresh(logicalMerge.getOnMatchSetNodeInfos(), *inSchema);
+    mergeInfo.onMatchRelColumnsToRefresh =
+        getColumnsToRefresh(logicalMerge.getOnMatchSetRelInfos(), *inSchema);
+    mapPatternChanges(logicalMerge, *inSchema, mergeInfo);
+    const auto mapMoves = [&](const auto& moves, auto& destination) {
+        for (const auto& move : moves) {
+            destination.push_back({getDataPos(*move.entity->getInternalID(), *outSchema),
+                move.target, move.entity->getEntry(0)->getOwningCatalog(),
+                move.entity->getDataType().getLogicalTypeID() == common::LogicalTypeID::REL});
+        }
+    };
+    mapMoves(logicalMerge.onMatchNamespaceMoves, mergeInfo.onMatchNamespaceMoves);
+    mapMoves(logicalMerge.onCreateNamespaceMoves, mergeInfo.onCreateNamespaceMoves);
+    std::unique_ptr<PhysicalOperator> result =
+        std::make_unique<Merge>(std::move(nodeInsertExecutors), std::move(relInsertExecutors),
+            std::move(onCreateNodeSetExecutors), std::move(onCreateRelSetExecutors),
+            std::move(onMatchNodeSetExecutors), std::move(onMatchRelSetExecutors),
+            std::move(mergeInfo), std::move(prevOperator), getOperatorID(), std::move(printInfo));
+    return result;
 }
 
 } // namespace processor

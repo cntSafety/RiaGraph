@@ -7,6 +7,7 @@
 #include "common/enums/alter_type.h"
 #include "common/enums/conflict_action.h"
 #include "parser/expression/parsed_expression.h"
+#include "parser/namespace_selector.h"
 
 namespace riag {
 namespace parser {
@@ -27,6 +28,11 @@ struct ExtraAlterInfo {
     TARGET* ptrCast() {
         return common::dynamic_cast_checked<TARGET*>(this);
     }
+};
+
+struct ExtraAlterNamespaces final : ExtraAlterInfo {
+    explicit ExtraAlterNamespaces(NamespaceSelector selector) : selector{std::move(selector)} {}
+    NamespaceSelector selector;
 };
 
 struct AlterInfo {

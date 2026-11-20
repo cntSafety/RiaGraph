@@ -10,6 +10,7 @@
 #include "function/table/bind_input.h"
 #include "graph/graph_entry_set.h"
 #include "graph/on_disk_graph.h"
+#include "main/client_context.h"
 #include "parser/parser.h"
 #include "planner/operator/logical_table_function_call.h"
 #include "planner/operator/sip/logical_semi_masker.h"
@@ -124,6 +125,10 @@ static NativeGraphEntryTableInfo bindRelEntry(ClientContext& context, const std:
 
 NativeGraphEntry GDSFunction::bindGraphEntry(ClientContext& context,
     const ParsedNativeGraphEntry& entry) {
+    if (!context.getNamespaceSelection().isUnrestricted()) {
+        throw BinderException("GDS functions require an unrestricted namespace selection in this "
+                              "version; use USE NAMESPACE ALL NAMESPACES.");
+    }
     auto catalog = Catalog::Get(context);
     auto transaction = transaction::Transaction::Get(context);
     auto result = NativeGraphEntry();

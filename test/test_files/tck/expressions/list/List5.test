@@ -29,7 +29,6 @@ True
 
 #  IN should work with list slices
 -CASE Scenario3
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -42,7 +41,6 @@ False
 
 #  IN should work with literal list slices
 -CASE Scenario4
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok

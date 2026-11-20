@@ -9,6 +9,7 @@
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/enums/extend_direction_util.h"
 #include "function/list/vector_list_functions.h"
+#include "function/schema/namespace_functions.h"
 #include "main/client_context.h"
 #include "main/database_manager.h"
 #include "planner/join_order/join_order_util.h"
@@ -150,7 +151,7 @@ uint64_t CardinalityEstimator::estimateScanNode(const LogicalOperator& op) const
     switch (scan.getScanType()) {
     case LogicalScanNodeTableType::PRIMARY_KEY_SCAN: {
         auto& primaryKeyScanInfo = scan.getExtraInfo()->constCast<PrimaryKeyScanInfo>();
-        return primaryKeyScanInfo.isRange ?
+        return primaryKeyScanInfo.isRange || primaryKeyScanInfo.nonUnique ?
                    atLeastOne(getNodeIDDom(scan.getNodeID()->getUniqueName())) :
                    1;
     }
@@ -493,6 +494,9 @@ std::optional<cardinality_t> CardinalityEstimator::getGroupKeyDomain(const Expre
 
 uint64_t CardinalityEstimator::estimateFilter(const LogicalOperator& childPlan,
     const Expression& predicate) const {
+    if (const auto selectivity = function::getNamespacePredicateSelectivity(predicate)) {
+        return atLeastOne(childPlan.getCardinality() * *selectivity);
+    }
     if (predicate.expressionType == ExpressionType::EQUALS) {
         if (isPrimaryKey(*predicate.getChild(0)) || isPrimaryKey(*predicate.getChild(1))) {
             return 1;

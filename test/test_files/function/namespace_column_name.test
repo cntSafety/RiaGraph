@@ -1,0 +1,188 @@
+-DATASET CSV empty
+
+--
+
+# namespace(x) of an element whose table has no member in a named namespace is the constant NULL.
+# Its result column is still named NAMESPACE(x._ID), as when the table has named members (#200).
+
+-CASE NamespaceColumnNameGlobalRelBetweenTwoNamedNamespaces
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id))
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N)
+---- ok
+-STATEMENT CREATE NAMESPACE ns_a
+---- ok
+-STATEMENT CREATE NAMESPACE ns_b
+---- ok
+-STATEMENT CREATE (:N {id: 1} IN ns_a)
+---- ok
+-STATEMENT CREATE (:N {id: 3} IN ns_b)
+---- ok
+-STATEMENT MATCH (a:N {id: 1}), (b:N {id: 3}) CREATE (a)-[:R]->(b)
+---- ok
+-LOG AllThree
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(a), namespace(r), namespace(b)
+---- 2
+NAMESPACE(a._ID)|NAMESPACE(r._ID)|NAMESPACE(b._ID)
+ns_a||ns_b
+-LOG RelOnly
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(r)
+---- 2
+NAMESPACE(r._ID)
+
+-LOG Aliased
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(r) AS rns
+---- 2
+rns
+
+-LOG WithOtherColumns
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN a.id, namespace(r), id(r)
+---- 2
+a.id|NAMESPACE(r._ID)|r._ID
+1||1:0
+-LOG InsideAnExpression
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(r) IS NULL, coalesce(namespace(r), 'GLOBAL')
+---- 2
+IS_NULL(NAMESPACE(r._ID))|COALESCE(NAMESPACE(r._ID),GLOBAL)
+True|GLOBAL
+-LOG AfterWith
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) WITH r RETURN namespace(r)
+---- 2
+NAMESPACE(r._ID)
+
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) WITH namespace(r) AS rns RETURN rns
+---- 2
+rns
+
+-LOG WithItemStillNeedsAnAlias
+-STATEMENT MATCH (a)-[r:R]->(b) WITH namespace(r) RETURN 1
+---- error
+Binder exception: Expression in WITH must be aliased (use AS).
+-LOG OrderByDistinctAggregate
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(r) ORDER BY namespace(r)
+---- 2
+NAMESPACE(r._ID)
+
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN DISTINCT namespace(r) ORDER BY namespace(r)
+---- 2
+NAMESPACE(r._ID)
+
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(r), count(*)
+---- 2
+NAMESPACE(r._ID)|COUNT_STAR()
+|1
+-LOG Path
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH p = (a)-[r:R]->(b) RETURN list_transform(rels(p), x -> namespace(x)), list_transform(nodes(p), x -> namespace(x)), namespace(r)
+---- 2
+LIST_TRANSFORM(RELS(p),x -> namespace(x))|LIST_TRANSFORM(NODES(p),x -> namespace(x))|NAMESPACE(r._ID)
+[]|[ns_a,ns_b]|
+
+-CASE NamespaceColumnNameRelInNamedNamespace
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id))
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N)
+---- ok
+-STATEMENT CREATE NAMESPACE ns_a
+---- ok
+-STATEMENT CREATE NAMESPACE ns_b
+---- ok
+-STATEMENT CREATE (:N {id: 1} IN ns_a)
+---- ok
+-STATEMENT CREATE (:N {id: 3} IN ns_b)
+---- ok
+-STATEMENT MATCH (a:N {id: 1}), (b:N {id: 3}) CREATE (a)-[:R IN ns_a]->(b)
+---- ok
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(a), namespace(r), namespace(b)
+---- 2
+NAMESPACE(a._ID)|NAMESPACE(r._ID)|NAMESPACE(b._ID)
+ns_a|ns_a|ns_b
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(r) AS rns
+---- 2
+rns
+ns_a
+
+-CASE NamespaceColumnNameGlobalRelOneNamedEndpoint
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id))
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N)
+---- ok
+-STATEMENT CREATE NAMESPACE `my model-1 ü`
+---- ok
+-STATEMENT CREATE (:N {id: 1} IN `my model-1 ü`)
+---- ok
+-STATEMENT CREATE (:N {id: 2})
+---- ok
+-STATEMENT MATCH (a:N {id: 1}), (b:N {id: 2}) CREATE (a)-[:R]->(b)
+---- ok
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(a), namespace(r), namespace(b)
+---- 2
+NAMESPACE(a._ID)|NAMESPACE(r._ID)|NAMESPACE(b._ID)
+my model-1 ü||
+
+-CASE NamespaceColumnNameImplicitlyGlobalNode
+-STATEMENT CREATE NODE TABLE T(id INT64, PRIMARY KEY(id))
+---- ok
+-STATEMENT CREATE NAMESPACE ns_a
+---- ok
+-STATEMENT CREATE (:T {id: 1})
+---- ok
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (t:T) RETURN t.id, namespace(t)
+---- 2
+t.id|NAMESPACE(t._ID)
+1|
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (t:T) RETURN namespace(t) AS tns
+---- 2
+tns
+
+
+-CASE NamespaceColumnNameWithoutNamespaces
+-STATEMENT CREATE NODE TABLE N(id INT64, PRIMARY KEY(id))
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N)
+---- ok
+-STATEMENT CREATE (:N {id: 1})-[:R]->(:N {id: 2})
+---- ok
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a)-[r:R]->(b) RETURN namespace(a), namespace(r)
+---- 2
+NAMESPACE(a._ID)|NAMESPACE(r._ID)
+|
+-CHECK_ORDER
+-CHECK_COLUMN_NAMES
+-STATEMENT MATCH (a:N {id: 1}) WITH [a] AS xs UNWIND xs AS x RETURN namespace(x)
+---- 2
+NAMESPACE(STRUCT_EXTRACT(x,_ID))
+

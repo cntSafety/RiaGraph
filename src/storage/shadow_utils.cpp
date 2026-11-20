@@ -39,6 +39,12 @@ ShadowPageAndFrame ShadowUtils::createShadowVersionIfNecessaryAndPinPage(page_id
         // It may have been flushed to disk to free memory and then read again
         shadowFile.getShadowingFH().setLockedPageDirty(shadowPage);
     } catch (Exception&) {
+        // Reading the original page can fail (for example when the buffer pool is full) after the
+        // shadow page was pinned. Release it, as the caller never gets the pin to release: the
+        // rollback that follows removes the shadow page from its frame and waits for the lock.
+        if (shadowFrame != nullptr) {
+            shadowFile.getShadowingFH().unpinPage(shadowPage);
+        }
         throw;
     }
     return {originalPage, shadowPage, shadowFrame};

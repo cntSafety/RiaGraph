@@ -1,0 +1,379 @@
+-DATASET CSV empty
+
+--
+
+# Intersect (the worst-case optimal join) over a multigraph: a list holds one entry per
+# relationship, so a neighbour reached over parallel edges appears in it several times and every
+# combination of those relationships is a match. Expected values are brute-force counts over each
+# case's edge list (w numbers the edges from 1); the hash-join plan of the same pattern is run
+# alongside and must agree.
+
+-CASE IntersectParallelClosingEdge
+# Two middle nodes reach c, and a reaches c over two parallel edges (#173).
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P, w INT64);
+---- ok
+-STATEMENT UNWIND range(0, 3) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT UNWIND [[0, 1, 1], [0, 3, 2], [1, 2, 3], [3, 2, 4], [0, 2, 5], [0, 2, 6]] AS e
+           MATCH (x:P {id: e[1]}), (y:P {id: e[2]}) CREATE (x)-[:K {w: e[3]}]->(y);
+---- ok
+-LOG Triangle, planner's choice
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+4|100
+-LOG Triangle, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+4|100
+-LOG Triangle, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT ((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+4|100
+-LOG Triangle with an undirected closing edge, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]-(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+4|100
+-LOG Every closing relationship is produced for every middle node
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN b.id, e1.w, e2.w, e3.w ORDER BY b.id, e3.w;
+---- 4
+1|1|3|5
+1|1|3|6
+3|2|4|5
+3|2|4|6
+
+-CASE IntersectParallelEdgesSingleMiddle
+# One middle node; boundary that was already right.
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P, w INT64);
+---- ok
+-STATEMENT UNWIND range(0, 2) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT UNWIND [[0, 1, 1], [1, 2, 2], [0, 2, 3], [0, 2, 4]] AS e
+           MATCH (x:P {id: e[1]}), (y:P {id: e[2]}) CREATE (x)-[:K {w: e[3]}]->(y);
+---- ok
+-LOG Triangle, planner's choice
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+2|31
+-LOG Triangle, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+2|31
+-LOG Triangle, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT ((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+2|31
+-LOG Triangle with an undirected closing edge, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]-(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+2|31
+
+-CASE IntersectParallelEdgesEveryLeg
+# Every leg doubled: 2 x 2 x 2.
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P, w INT64);
+---- ok
+-STATEMENT UNWIND range(0, 2) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT UNWIND [[0, 1, 1], [0, 1, 2], [1, 2, 3], [1, 2, 4], [0, 2, 5], [0, 2, 6]] AS e
+           MATCH (x:P {id: e[1]}), (y:P {id: e[2]}) CREATE (x)-[:K {w: e[3]}]->(y);
+---- ok
+-LOG Triangle, planner's choice
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+8|200
+-LOG Triangle, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+8|200
+-LOG Triangle, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT ((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+8|200
+-LOG Triangle with an undirected closing edge, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]-(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+8|200
+
+-CASE IntersectParallelEdgesMixedLegs
+# Parallel edges on each leg, different multiplicities.
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P, w INT64);
+---- ok
+-STATEMENT UNWIND range(0, 3) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT UNWIND [[0, 1, 1], [0, 1, 2], [0, 3, 3], [1, 2, 4], [3, 2, 5], [3, 2, 6], [3, 2, 7], [0, 2, 8], [0, 2, 9]] AS e
+           MATCH (x:P {id: e[1]}), (y:P {id: e[2]}) CREATE (x)-[:K {w: e[3]}]->(y);
+---- ok
+-LOG Triangle, planner's choice
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+10|383
+-LOG Triangle, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+10|383
+-LOG Triangle, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT ((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+10|383
+-LOG Triangle with an undirected closing edge, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]-(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+10|383
+
+-CASE IntersectParallelEdgesSelfLoops
+# Parallel self-loops; a node is its own neighbour.
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P, w INT64);
+---- ok
+-STATEMENT UNWIND range(0, 2) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT UNWIND [[0, 0, 1], [0, 0, 2], [0, 2, 3], [0, 2, 4], [2, 2, 5], [0, 1, 6], [1, 2, 7], [1, 1, 8]] AS e
+           MATCH (x:P {id: e[1]}), (y:P {id: e[2]}) CREATE (x)-[:K {w: e[3]}]->(y);
+---- ok
+-LOG Triangle, planner's choice
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+29|643
+-LOG Triangle, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+29|643
+-LOG Triangle, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT ((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+29|643
+-LOG Triangle with an undirected closing edge, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]-(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+39|793
+-LOG Four-clique, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c), (a)-[e4:K]->(d:P), (b)-[e5:K]->(d), (c)-[e6:K]->(d)
+           HINT (((((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c) MULTI_JOIN e4 MULTI_JOIN e5 MULTI_JOIN e6) JOIN d
+           RETURN COUNT(*);
+---- 1
+198
+-LOG Four-clique, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c), (a)-[e4:K]->(d:P), (b)-[e5:K]->(d), (c)-[e6:K]->(d)
+           HINT ((((((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3) JOIN e4) JOIN d) JOIN e5) JOIN e6
+           RETURN COUNT(*);
+---- 1
+198
+
+-CASE IntersectParallelEdgesFourClique
+# Three lists intersected for d.
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P, w INT64);
+---- ok
+-STATEMENT UNWIND range(0, 3) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT UNWIND [[0, 1, 1], [0, 2, 2], [0, 2, 3], [0, 3, 4], [0, 3, 5], [1, 2, 6], [1, 3, 7], [1, 3, 8], [1, 3, 9], [2, 3, 10], [2, 3, 11]] AS e
+           MATCH (x:P {id: e[1]}), (y:P {id: e[2]}) CREATE (x)-[:K {w: e[3]}]->(y);
+---- ok
+-LOG Triangle, planner's choice
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+22|826
+-LOG Triangle, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+22|826
+-LOG Triangle, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT ((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+22|826
+-LOG Triangle with an undirected closing edge, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]-(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+22|826
+-LOG Four-clique, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c), (a)-[e4:K]->(d:P), (b)-[e5:K]->(d), (c)-[e6:K]->(d)
+           HINT (((((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c) MULTI_JOIN e4 MULTI_JOIN e5 MULTI_JOIN e6) JOIN d
+           RETURN COUNT(*);
+---- 1
+24
+-LOG Four-clique, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c), (a)-[e4:K]->(d:P), (b)-[e5:K]->(d), (c)-[e6:K]->(d)
+           HINT ((((((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3) JOIN e4) JOIN d) JOIN e5) JOIN e6
+           RETURN COUNT(*);
+---- 1
+24
+
+-CASE IntersectParallelEdgesRandomMultigraph
+# 70 random edges on 8 nodes, no self-loops.
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P, w INT64);
+---- ok
+-STATEMENT UNWIND range(0, 7) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT UNWIND [[5, 2, 1], [6, 0, 2], [5, 0, 3], [3, 0, 4], [1, 6, 5], [6, 1, 6], [3, 1, 7], [6, 0, 8], [1, 3, 9], [0, 6, 10], [0, 3, 11], [0, 2, 12], [4, 6, 13], [2, 1, 14], [4, 2, 15], [1, 3, 16], [5, 1, 17], [1, 0, 18], [3, 7, 19], [6, 5, 20], [5, 4, 21], [3, 2, 22], [3, 1, 23], [4, 7, 24], [5, 7, 25], [4, 1, 26], [1, 6, 27], [2, 5, 28], [2, 7, 29], [6, 0, 30], [1, 5, 31], [4, 7, 32], [1, 0, 33], [4, 7, 34], [4, 6, 35], [5, 0, 36], [7, 5, 37], [2, 1, 38], [7, 0, 39], [3, 4, 40], [2, 3, 41], [7, 1, 42], [2, 7, 43], [6, 4, 44], [2, 6, 45], [4, 6, 46], [5, 6, 47], [3, 2, 48], [1, 2, 49], [2, 3, 50], [3, 0, 51], [7, 2, 52], [0, 2, 53], [6, 5, 54], [5, 2, 55], [0, 7, 56], [1, 7, 57], [6, 0, 58], [3, 1, 59], [3, 7, 60], [2, 1, 61], [5, 0, 62], [1, 0, 63], [2, 1, 64], [5, 0, 65], [1, 3, 66], [6, 2, 67], [4, 5, 68], [5, 7, 69], [4, 1, 70]] AS e
+           MATCH (x:P {id: e[1]}), (y:P {id: e[2]}) CREATE (x)-[:K {w: e[3]}]->(y);
+---- ok
+-LOG Triangle, planner's choice
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+625|136750
+-LOG Triangle, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+625|136750
+-LOG Triangle, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT ((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+625|136750
+-LOG Triangle with an undirected closing edge, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]-(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+1195|259672
+-LOG Four-clique, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c), (a)-[e4:K]->(d:P), (b)-[e5:K]->(d), (c)-[e6:K]->(d)
+           HINT (((((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c) MULTI_JOIN e4 MULTI_JOIN e5 MULTI_JOIN e6) JOIN d
+           RETURN COUNT(*);
+---- 1
+3804
+-LOG Four-clique, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c), (a)-[e4:K]->(d:P), (b)-[e5:K]->(d), (c)-[e6:K]->(d)
+           HINT ((((((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3) JOIN e4) JOIN d) JOIN e5) JOIN e6
+           RETURN COUNT(*);
+---- 1
+3804
+
+-CASE IntersectParallelEdgesRandomWithLoops
+# 50 random edges on 6 nodes, with self-loops.
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P, w INT64);
+---- ok
+-STATEMENT UNWIND range(0, 5) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT UNWIND [[3, 4, 1], [3, 3, 2], [4, 4, 3], [1, 1, 4], [4, 3, 5], [5, 4, 6], [1, 0, 7], [3, 2, 8], [1, 0, 9], [4, 5, 10], [5, 0, 11], [4, 3, 12], [3, 5, 13], [5, 4, 14], [5, 1, 15], [4, 0, 16], [4, 0, 17], [0, 0, 18], [1, 1, 19], [4, 0, 20], [3, 2, 21], [3, 4, 22], [1, 4, 23], [1, 5, 24], [2, 3, 25], [0, 5, 26], [0, 3, 27], [5, 2, 28], [3, 4, 29], [0, 5, 30], [2, 2, 31], [1, 4, 32], [2, 0, 33], [0, 4, 34], [0, 3, 35], [0, 2, 36], [3, 0, 37], [0, 5, 38], [0, 1, 39], [1, 0, 40], [3, 3, 41], [5, 3, 42], [3, 0, 43], [4, 5, 44], [1, 5, 45], [2, 2, 46], [0, 2, 47], [2, 0, 48], [3, 0, 49], [1, 1, 50]] AS e
+           MATCH (x:P {id: e[1]}), (y:P {id: e[2]}) CREATE (x)-[:K {w: e[3]}]->(y);
+---- ok
+-LOG Triangle, planner's choice
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+694|105451
+-LOG Triangle, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+694|105451
+-LOG Triangle, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT ((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+694|105451
+-LOG Triangle with an undirected closing edge, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]-(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN COUNT(*), SUM(e1.w + 2 * e2.w + 3 * e3.w);
+---- 1
+1327|201733
+-LOG Four-clique, forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c), (a)-[e4:K]->(d:P), (b)-[e5:K]->(d), (c)-[e6:K]->(d)
+           HINT (((((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c) MULTI_JOIN e4 MULTI_JOIN e5 MULTI_JOIN e6) JOIN d
+           RETURN COUNT(*);
+---- 1
+18258
+-LOG Four-clique, hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c), (a)-[e4:K]->(d:P), (b)-[e5:K]->(d), (c)-[e6:K]->(d)
+           HINT ((((((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3) JOIN e4) JOIN d) JOIN e5) JOIN e6
+           RETURN COUNT(*);
+---- 1
+18258
+
+-CASE IntersectParallelEdgesLargeLists
+# 0->2 3000 times and 2->4 2500 times: both lists span two 2048-entry build tuples, and one probe
+# (a=0, b=2, key c=4) yields 3000 x 2500 x 2 rows, far more than one output vector holds.
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE K(FROM P TO P, w INT64);
+---- ok
+-STATEMENT UNWIND range(0, 4) AS i CREATE (:P {id: i});
+---- ok
+-STATEMENT UNWIND range(1, 3000) AS i MATCH (x:P {id: 0}), (y:P {id: 2}) CREATE (x)-[:K {w: i}]->(y);
+---- ok
+-STATEMENT UNWIND [[0, 1, 0], [0, 3, 0], [1, 2, 1], [1, 2, 2], [1, 2, 3], [3, 2, 4], [3, 2, 5], [0, 4, 6], [0, 4, 7]] AS e
+           MATCH (x:P {id: e[1]}), (y:P {id: e[2]}) CREATE (x)-[:K {w: e[3]}]->(y);
+---- ok
+-STATEMENT UNWIND range(1, 2500) AS i MATCH (x:P {id: 2}), (y:P {id: 4}) CREATE (x)-[:K {w: i}]->(y);
+---- ok
+-LOG Forced Intersect
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT (((a JOIN e1) JOIN b) MULTI_JOIN e2 MULTI_JOIN e3) JOIN c
+           RETURN b.id, c.id, COUNT(*), SUM(e2.w), SUM(e3.w) ORDER BY b.id, c.id;
+---- 3
+1|2|9000|18000|13504500
+2|4|15000000|18757500000|97500000
+3|2|6000|27000|9003000
+-LOG Hash join
+-STATEMENT MATCH (a:P)-[e1:K]->(b:P)-[e2:K]->(c:P), (a)-[e3:K]->(c)
+           HINT ((((a JOIN e1) JOIN b) JOIN e2) JOIN c) JOIN e3
+           RETURN b.id, c.id, COUNT(*), SUM(e2.w), SUM(e3.w) ORDER BY b.id, c.id;
+---- 3
+1|2|9000|18000|13504500
+2|4|15000000|18757500000|97500000
+3|2|6000|27000|9003000

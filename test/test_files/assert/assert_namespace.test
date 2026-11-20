@@ -1,0 +1,45 @@
+-DATASET CSV empty
+
+--
+
+-CASE AssertSubqueriesReadWithTheStatementScope
+-STATEMENT CREATE NAMESPACE team_a
+---- ok
+-STATEMENT CREATE NAMESPACE team_b
+---- ok
+-STATEMENT CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING)
+---- ok
+-STATEMENT CREATE (:Person {id: 1, name: 'Alice'}) IN team_a
+---- ok
+-STATEMENT CREATE (:Person {id: 2, name: 'Bob'}) IN team_b
+---- ok
+-LOG UnrestrictedSessionSeesBoth
+-STATEMENT ASSERT COUNT { MATCH (p:Person) } = 2
+---- ok
+-LOG InlineSelector
+-STATEMENT ASSERT EXISTS { MATCH (p:Person IN team_b) } AND NOT EXISTS { MATCH (p:Person IN GLOBAL) }
+---- ok
+-LOG SessionScope
+-STATEMENT USE NAMESPACE team_a
+---- ok
+-STATEMENT ASSERT COUNT { MATCH (p:Person) } = 1 AS 'team_a only'
+---- ok
+-STATEMENT ASSERT NOT EXISTS { MATCH (p:Person {name: 'Bob'}) } AS 'Bob is outside team_a'
+---- ok
+-STATEMENT ASSERT EXISTS { MATCH (p:Person IN team_b) } AS 'inline selectors only narrow'
+---- error
+Assertion failed: inline selectors only narrow
+-LOG ClauseLevel
+-STATEMENT MATCH (p:Person) ASSERT namespace(p) = 'team_a' AS 'all rows in team_a' RETURN p.name
+---- 1
+Alice
+-STATEMENT MATCH (p:Person) ASSERT count(*) = 1 RETURN p.name
+---- 1
+Alice
+-STATEMENT MATCH (p:Person) IN ALL NAMESPACES ASSERT namespace(p) = 'team_a' AS 'all rows in team_a' RETURN p.name
+---- error
+Assertion failed: all rows in team_a
+-STATEMENT USE NAMESPACE ALL NAMESPACES
+---- ok
+-STATEMENT ASSERT COUNT { MATCH (p:Person) } = 2
+---- ok

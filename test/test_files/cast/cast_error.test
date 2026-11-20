@@ -767,10 +767,11 @@ Conversion exception: Map does not allow null as key.
 -LOG InvalidStructToStruct
 -STATEMENT RETURN cast(cast("{a: 12, b: 0}", "STRUCT(a STRING, b STRING, c STRING)"), "STRUCT(a INT128, b INT128)");
 ---- error
-Conversion exception: Unsupported casting function from STRUCT(a STRING, b STRING, c STRING) to STRUCT(a INT128, b INT128).
+Conversion exception: Unsupported casting function from STRUCT(a STRING, b STRING, c STRING) to STRUCT(a INT128, b INT128): field c does not exist in the target STRUCT. STRUCT fields are matched by name.
+# STRUCT fields are cast by name; a target field the source does not have is NULL (#193).
 -STATEMENT RETURN cast(cast("{a: 12, b: 0}", "STRUCT(a STRING, b STRING)"), "STRUCT(a INT128, b INT128, c STRING)");
----- error
-Conversion exception: Unsupported casting function from STRUCT(a STRING, b STRING) to STRUCT(a INT128, b INT128, c STRING).
+---- 1
+{a: 12, b: 0, c: }
 -STATEMENT RETURN cast(cast("{a: 12, b: 0}", "STRUCT(a STRING, b STRING)"), "STRUCT(a INT128, b STRUCT(a STRING, b STRING))");
 ---- error
 Conversion exception: Cast failed. 0 is not in STRUCT(a STRING, b STRING) range.
@@ -782,7 +783,7 @@ Conversion exception: Unsupported casting function from INT8 to STRUCT.
 Conversion exception: Unsupported casting function from STRUCT(a STRING, b STRING) to INT8.
 -STATEMENT RETURN cast(cast("{a: 12, b: 0}", "STRUCT(a STRING, b STRING)"), "STRUCT(c INT128, b INT128)");
 ---- error
-Conversion exception: Unsupported casting function from STRUCT(a STRING, b STRING) to STRUCT(c INT128, b INT128).
+Conversion exception: Unsupported casting function from STRUCT(a STRING, b STRING) to STRUCT(c INT128, b INT128): field a does not exist in the target STRUCT. STRUCT fields are matched by name.
 -STATEMENT RETURN cast(cast("{a: 12, b: 0}", "STRUCT(a STRING, b STRING)"), "MAP(STRING, STRING)");
 ---- error
 Conversion exception: Unsupported casting function from STRUCT to MAP.
@@ -864,10 +865,10 @@ Catalog exception:  is neither an internal type nor a user defined type.
 Catalog exception: STRING, INT is neither an internal type nor a user defined type.
 -STATEMENT RETURN cast({'a':12, 'b':24} as struct (c int64, d int64));
 ---- error
-Conversion exception: Unsupported casting function from STRUCT(a INT64, b INT64) to STRUCT(c INT64, d INT64).
+Conversion exception: Unsupported casting function from STRUCT(a INT64, b INT64) to STRUCT(c INT64, d INT64): field a does not exist in the target STRUCT. STRUCT fields are matched by name.
 -STATEMENT RETURN cast({'a':12, 'b':24} as struct (c int64, d int32));
 ---- error
-Conversion exception: Unsupported casting function from STRUCT(a INT64, b INT64) to STRUCT(c INT64, d INT32).
+Conversion exception: Unsupported casting function from STRUCT(a INT64, b INT64) to STRUCT(c INT64, d INT32): field a does not exist in the target STRUCT. STRUCT fields are matched by name.
 -STATEMENT RETURN cast({'a':12, 'b':24} as struct (a int16, b int16));
 ---- ok
 -STATEMENT RETURN {'a':12, 'b':24} = {'a':12, 'b':24};
@@ -1039,3 +1040,113 @@ Conversion exception: Invalid UUID:.*
 -STATEMENT RETURN cast("", "BOOLEAN");
 ---- error(regex)
 Conversion exception: Value .* is not a valid boolean
+
+-CASE CastToDecimalFromUnsupportedType
+-LOG NonNumericSourceIsRejectedNotAsserted
+# The bind of a cast to DECIMAL had an unreachable branch for every source that is neither numeric
+# nor DECIMAL, so a list or a struct failed an internal assertion instead of the unsupported-cast
+# error every other target gives.
+-STATEMENT RETURN CAST([1,2], 'DECIMAL(6,2)');
+---- error
+Conversion exception: Unsupported casting function from INT64[] to DECIMAL(6, 2).
+-STATEMENT RETURN CAST({a:1}, 'DECIMAL(6,2)');
+---- error(regex)
+Conversion exception: Unsupported casting function from STRUCT.* to DECIMAL\(6, 2\)\.
+-STATEMENT RETURN CAST(CAST([2.7,3.8,4.4], 'DECIMAL(5,2)[37'), 'DECIMAL(6,2)[3]');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(5,2)[37
+
+-LOG UnterminatedDecimalArraySuffix
+-STATEMENT RETURN CAST([2.7,3.8,4.4], 'DECIMAL(5,2)[3');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(5,2)[3
+-STATEMENT RETURN CAST(2.7, 'DECIMAL(5,2) x');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(5,2) x
+-STATEMENT RETURN CAST(2.7, 'DECIMAL(5,2');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(5,2
+
+-LOG WellFormedDecimalStillParses
+-STATEMENT RETURN CAST('1.5' AS DECIMAL(6,2));
+---- 1
+1.50
+-STATEMENT RETURN CAST(2.7, ' DECIMAL( 5 , 2 ) ');
+---- 1
+2.70
+-STATEMENT RETURN CAST(2.7, 'NUMERIC(5,2)');
+---- 1
+2.70
+-STATEMENT RETURN CAST([1,2], 'DECIMAL(6,2)[]');
+---- 1
+[1.00,2.00]
+-STATEMENT RETURN CAST([1,2], 'DECIMAL(6,2)[2]');
+---- 1
+[1.00,2.00]
+-STATEMENT RETURN typeof(CAST([1,2], 'DECIMAL(6,2)[2]'));
+---- 1
+DECIMAL(6, 2)[2]
+
+-CASE DecimalTypeRejectsJunkNumbers
+-LOG PrecisionAndScaleAreWholeNumericTokens
+# parseDecimalType read both numbers with strtoll and ignored what it could not parse, so a
+# junk precision such as 5x was read as 5 and the cast succeeded.
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(5x,2)');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(5x,2)
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(5,2x)');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(5,2x)
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(+5,2)');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(+5,2)
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(0x5,2)');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(0x5,2)
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(5 5,2)');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(5 5,2)
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(,2)');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(,2)
+-STATEMENT RETURN CAST('1.5', 'NUMERIC(5,)');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: NUMERIC(5,)
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(5,-1)');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(5,-1)
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(5x,2)[]');
+---- error
+Binder exception: Cannot parse NUMERIC/DECIMAL type: DECIMAL(5x,2)
+-LOG OutOfRangeNumbersStillGetTheRangeMessage
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(39,2)');
+---- error
+Binder exception: Precision of DECIMAL/NUMERIC must be a positive integer no greater than 38
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(99999999999999999999999,2)');
+---- error
+Binder exception: Precision of DECIMAL/NUMERIC must be a positive integer no greater than 38
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(0,0)');
+---- error
+Binder exception: Precision of DECIMAL/NUMERIC must be a positive integer no greater than 38
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(5,6)');
+---- error
+Binder exception: Scale of DECIMAL/NUMERIC must be a nonnegative integer no greater than the precision
+-LOG WellFormedNumbersStillParse
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(5,2)');
+---- 1
+1.50
+-STATEMENT RETURN CAST('1.5', 'DECIMAL( 5 , 2 )');
+---- 1
+1.50
+-STATEMENT RETURN CAST('1.5', 'NUMERIC(5,2)');
+---- 1
+1.50
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(38,0)');
+---- 1
+2
+-STATEMENT RETURN CAST('1.5', 'DECIMAL(05,02)');
+---- 1
+1.50
+-STATEMENT RETURN CAST([1,2], 'DECIMAL(6,2)[]');
+---- 1
+[1.00,2.00]

@@ -123,6 +123,7 @@ void ScanRelTable::initLocalStateInternal(ResultSet* resultSet, ExecutionContext
             boundNodeIDVector, outVectors, nbrNodeIDVector->state);
     }
     scanState->packedMultiParentScan = multiParentPackedScanEnabled;
+    boundNodeState.reset();
     tableInfo.initScanState(*scanState, outVectors, clientContext);
     // The native RelTable::initScanState reads from the bound-node
     // nodeIDVector to pick a node group, so it must run after a child tuple
@@ -303,51 +304,49 @@ bool ScanRelTable::getNextTuplesInternal(ExecutionContext* context) {
                 return true;
             }
         }
-        restoreBoundNodeState();
+        boundNodeState.restore(*scanState->nodeIDVector->state);
         if (!children[0]->getNextTuple(context)) {
             scanState->releaseScanPin();
             return false;
         }
-        saveBoundNodeState();
+        boundNodeState.save(*scanState->nodeIDVector->state);
         tableInfo.table->initScanState(transaction, *scanState);
     }
 }
 
-void ScanRelTable::saveBoundNodeState() {
-    const auto& state = *scanState->nodeIDVector->state;
+void BoundNodeStateKeeper::save(const DataChunkState& state) {
     const auto& selVector = state.getSelVector();
-    boundNodeStateWasFlat = state.isFlat();
-    boundNodeSelWasUnfiltered = selVector.isUnfiltered();
-    boundNodeSelPositions.resize(selVector.getSelSize());
-    if (!boundNodeSelWasUnfiltered) {
+    wasFlat = state.isFlat();
+    selWasUnfiltered = selVector.isUnfiltered();
+    selPositions.resize(selVector.getSelSize());
+    if (!selWasUnfiltered) {
         for (sel_t i = 0; i < selVector.getSelSize(); ++i) {
-            boundNodeSelPositions[i] = selVector[i];
+            selPositions[i] = selVector[i];
         }
     }
-    boundNodeStateSaved = true;
+    saved = true;
 }
 
-void ScanRelTable::restoreBoundNodeState() {
-    if (!boundNodeStateSaved) {
+void BoundNodeStateKeeper::restore(DataChunkState& state) {
+    if (!saved) {
         return;
     }
-    auto& state = *scanState->nodeIDVector->state;
     auto& selVector = state.getSelVectorUnsafe();
-    const auto selSize = static_cast<sel_t>(boundNodeSelPositions.size());
-    if (boundNodeSelWasUnfiltered) {
+    const auto selSize = static_cast<sel_t>(selPositions.size());
+    if (selWasUnfiltered) {
         selVector.setToUnfiltered(selSize);
     } else {
         selVector.setToFiltered(selSize);
         for (sel_t i = 0; i < selSize; ++i) {
-            selVector[i] = boundNodeSelPositions[i];
+            selVector[i] = selPositions[i];
         }
     }
-    if (boundNodeStateWasFlat) {
+    if (wasFlat) {
         state.setToFlat();
     } else {
         state.setToUnflat();
     }
-    boundNodeStateSaved = false;
+    saved = false;
 }
 
 } // namespace processor

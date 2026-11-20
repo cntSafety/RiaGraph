@@ -6,8 +6,10 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+#include "common/exception/overflow.h"
 #include "common/types/int128_t.h"
 #include "common/types/uint128_t.h"
+#include <format>
 
 namespace riag {
 namespace function {
@@ -117,7 +119,15 @@ struct Even {
 };
 
 struct Factorial {
+    // 20! is the largest factorial that fits in INT64. Rejecting larger inputs up front also
+    // bounds the loop below, whose trip count would otherwise be the user-supplied input.
+    static constexpr int64_t MAX_FACTORIAL_INPUT = 20;
+
     static inline void operation(int64_t& input, int64_t& result) {
+        if (input > MAX_FACTORIAL_INPUT) {
+            throw common::OverflowException{
+                std::format("Value {}! is not within INT64 range.", input)};
+        }
         result = 1;
         for (int64_t i = 2; i <= input; i++) {
             result *= i;

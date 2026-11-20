@@ -32,6 +32,8 @@ class ExportDB final : public SimpleSink {
     static constexpr PhysicalOperatorType type_ = PhysicalOperatorType::EXPORT_DATABASE;
 
 public:
+    bool namespaceAware = false;
+    std::string namespaceImport;
     ExportDB(common::FileScanInfo boundFileInfo, bool schemaOnly,
         std::shared_ptr<FactorizedTable> messageTable, physical_op_id id,
         std::unique_ptr<OPPrintInfo> printInfo,
@@ -43,8 +45,11 @@ public:
     void executeInternal(ExecutionContext* context) override;
 
     std::unique_ptr<PhysicalOperator> copy() override {
-        return std::make_unique<ExportDB>(boundFileInfo.copy(), schemaOnly, messageTable, id,
+        auto result = std::make_unique<ExportDB>(boundFileInfo.copy(), schemaOnly, messageTable, id,
             printInfo->copy(), sharedState);
+        result->namespaceAware = namespaceAware;
+        result->namespaceImport = namespaceImport;
+        return result;
     }
 
     void addToParallelReaderMap(const std::string& file, const std::atomic<bool>& parallelFlag) {

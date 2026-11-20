@@ -1,6 +1,8 @@
 #include "processor/operator/simple/import_db.h"
 
 #include "common/exception/runtime.h"
+#include "common/finally_wrapper.h"
+#include "common/utils.h"
 #include "main/client_context.h"
 #include "processor/execution_context.h"
 #include "storage/buffer_manager/memory_manager.h"
@@ -38,6 +40,11 @@ void ImportDB::executeInternal(ExecutionContext* context) {
     if (transactionContext->hasActiveTransaction()) {
         transactionContext->commit();
     }
+    const auto namespaceSelection = clientContext->getNamespaceSelection();
+    auto* namespaceOwner = clientContext->getNamespaceSelectionOwner();
+    FinallyWrapper restoreNamespaceSelection{
+        [&]() { clientContext->setNamespaceSelection(namespaceSelection, namespaceOwner); }};
+    clientContext->resetNamespaceSelection();
     auto res = clientContext->queryNoLock(query);
     validateQueryResult(res.get());
     if (!indexQuery.empty()) {

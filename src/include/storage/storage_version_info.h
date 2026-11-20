@@ -41,6 +41,9 @@ struct StorageVersionInfo {
     // key -> child map. Older files have no key bytes; replayed LIST children stay
     // unkeyed.
     static constexpr storage_version_t STORAGE_VERSION_49 = 49;
+    // Opt-in namespace catalog/membership metadata. Namespace-free writers keep
+    // using the release's existing base version and row/index representation.
+    static constexpr storage_version_t STORAGE_VERSION_50 = 50;
 
     static std::unordered_map<std::string, storage_version_t> getStorageVersionInfo() {
         return {{"0.12.0", STORAGE_VERSION_40}, {"0.12.2", STORAGE_VERSION_40},
@@ -65,7 +68,8 @@ struct StorageVersionInfo {
                storageVersion == STORAGE_VERSION_42 || storageVersion == STORAGE_VERSION_43 ||
                storageVersion == STORAGE_VERSION_44 || storageVersion == STORAGE_VERSION_45 ||
                storageVersion == STORAGE_VERSION_46 || storageVersion == STORAGE_VERSION_47 ||
-               storageVersion == STORAGE_VERSION_48 || storageVersion == getStorageVersion();
+               storageVersion == STORAGE_VERSION_48 || storageVersion == STORAGE_VERSION_49 ||
+               storageVersion == STORAGE_VERSION_50 || storageVersion == getStorageVersion();
     }
 
     // Written by every RiaGraph release.

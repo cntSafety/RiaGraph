@@ -88,7 +88,7 @@ AggKeyDependencyOptimizer::resolveKeysAndDependentKeys(const expression_vector& 
     for (auto& key : inputKeys) {
         if (key->expressionType == ExpressionType::PROPERTY) {
             auto property = (PropertyExpression*)key.get();
-            if (property->isPrimaryKey() || property->isInternalID()) {
+            if (property->isGloballyUniquePrimaryKey() || property->isInternalID()) {
                 primaryVarNames.insert(property->getVariableName());
             }
         }
@@ -124,7 +124,7 @@ AggKeyDependencyOptimizer::resolveKeysAndDependentKeys(const expression_vector& 
         }
         if (key->expressionType == ExpressionType::PROPERTY) {
             auto property = (PropertyExpression*)key.get();
-            if (property->isPrimaryKey() ||
+            if (property->isGloballyUniquePrimaryKey() ||
                 property->isInternalID()) { // NOLINT(bugprone-branch-clone): Collapsing
                                             // is a logical error.
                 // Primary properties are always keys.

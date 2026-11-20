@@ -32,6 +32,7 @@ private:
     virtual void visitUnwind(const ReadingClause* /*readingClause*/) {}
     virtual void visitInQueryCall(const ReadingClause* /*readingClause*/) {}
     virtual void visitLoadFrom(const ReadingClause* /*readingClause*/) {}
+    virtual void visitAssert(const ReadingClause* /*readingClause*/) {}
     virtual void visitUpdatingClause(const UpdatingClause* /*updatingClause*/);
     virtual void visitSet(const UpdatingClause* /*updatingClause*/) {}
     virtual void visitDelete(const UpdatingClause* /*updatingClause*/) {}
@@ -61,6 +62,7 @@ private:
     virtual void visitUseDatabase(const Statement& /*statement*/) {}
     virtual void visitCreateGraph(const Statement& /*statement*/) {}
     virtual void visitUseGraph(const Statement& /*statement*/) {}
+    virtual void visitNamespace(const Statement& /*statement*/) {}
     virtual void visitStandaloneCallFunction(const Statement& /*statement*/) {}
     virtual void visitExtensionClause(const Statement& /*statement*/) {}
     // LCOV_EXCL_STOP

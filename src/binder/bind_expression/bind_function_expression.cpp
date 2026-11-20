@@ -42,6 +42,18 @@ static bool containsExpressionNamed(const Expression& expression, const std::str
         [&](const auto& child) { return containsExpressionNamed(*child, uniqueName); });
 }
 
+// A lambda has no value of its own: it is bound against the list that precedes it by a function
+// flagged isListLambda, which then evaluates its body. Anywhere else it is left without a body, so
+// every other function rejects it where its arguments are bound.
+static void validateNoLambdaArguments(const expression_vector& children,
+    const std::string& functionName) {
+    for (auto& child : children) {
+        if (child->expressionType == ExpressionType::LAMBDA) {
+            throw BinderException(std::format("{} does not support lambda input.", functionName));
+        }
+    }
+}
+
 std::shared_ptr<Expression> ExpressionBinder::bindFunctionExpression(const ParsedExpression& expr) {
     auto funcExpr = expr.constPtrCast<ParsedFunctionExpression>();
     auto functionName = funcExpr->getNormalizedFunctionName();
@@ -99,11 +111,14 @@ std::shared_ptr<Expression> ExpressionBinder::bindScalarFunctionExpression(
         entry->ptrCast<FunctionCatalogEntry>())
                         ->ptrCast<ScalarFunction>()
                         ->copy();
-    if (children.size() == 2 && children[1]->expressionType == ExpressionType::LAMBDA) {
-        if (!function->isListLambda) {
-            throw BinderException(std::format("{} does not support lambda input.", functionName));
-        }
+    // Only the second argument of a list lambda function is a lambda: list_transform(l, x -> ...).
+    auto hasLambdaArgument = function->isListLambda && children.size() == 2 &&
+                             children[1]->expressionType == ExpressionType::LAMBDA;
+    if (hasLambdaArgument) {
+        validateNoLambdaArguments({children[0]}, functionName);
         bindLambdaExpression(*children[0], *children[1]);
+    } else {
+        validateNoLambdaArguments(children, functionName);
     }
     expression_vector childrenAfterCast;
     std::unique_ptr<FunctionBindData> bindData;
@@ -161,6 +176,7 @@ std::shared_ptr<Expression> ExpressionBinder::bindRewriteFunctionExpression(
     for (auto i = 0u; i < expr.getNumChildren(); ++i) {
         children.push_back(bindExpression(*expr.getChild(i)));
     }
+    validateNoLambdaArguments(children, funcExpr.getNormalizedFunctionName());
     auto childrenTypes = getTypes(children);
     auto functionName = funcExpr.getNormalizedFunctionName();
     auto transaction = transaction::Transaction::Get(*context);
@@ -175,14 +191,15 @@ std::shared_ptr<Expression> ExpressionBinder::bindRewriteFunctionExpression(
 
 // A primary key enforced by the table's primary-key index is unique, never null, and null exactly
 // when the node is unbound, so COUNT over it equals COUNT over the internal ID. Counting the
-// internal ID keeps the planner from scanning the node table only to read the key.
+// internal ID keeps the planner from scanning the node table only to read the key. A LOCAL
+// PRIMARY KEY is unique only within one namespace, so COUNT(DISTINCT) over it is not.
 static std::shared_ptr<Expression> rewritePrimaryKeyToInternalID(const Expression& expr,
     const BinderScope& scope, main::ClientContext* context) {
     if (expr.expressionType != ExpressionType::PROPERTY) {
         return nullptr;
     }
     auto& property = expr.constCast<PropertyExpression>();
-    if (!property.isSingleLabel() || !property.isPrimaryKey() ||
+    if (!property.isSingleLabel() || !property.isGloballyUniquePrimaryKey() ||
         !scope.contains(property.getRawVariableName())) {
         return nullptr;
     }
@@ -246,6 +263,7 @@ std::shared_ptr<Expression> ExpressionBinder::bindAggregateFunctionExpression(
         childrenTypes.push_back(child->dataType.copy());
         children.push_back(std::move(child));
     }
+    validateNoLambdaArguments(children, functionName);
     auto transaction = transaction::Transaction::Get(*context);
     auto entry = Catalog::Get(*context)->getFunctionEntry(transaction, functionName);
     auto function = BuiltInFunctionsUtils::matchAggregateFunction(functionName, childrenTypes,
@@ -312,7 +330,10 @@ std::shared_ptr<Expression> ExpressionBinder::bindMacroExpression(
         parameterVals[parameterName] = parsedFuncExpr.getChild(i);
     }
     auto replacer = MacroParameterReplacer(parameterVals);
-    return bindExpression(*replacer.replace(std::move(macroExpr)));
+    auto result = bindExpression(*replacer.replace(std::move(macroExpr)));
+    // A macro whose body is just the parameter hands the lambda argument back as its value.
+    validateNoLambdaArguments({result}, macroName);
+    return result;
 }
 
 } // namespace binder

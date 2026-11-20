@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bound_namespace_move.h"
 #include "bound_set_info.h"
 #include "bound_updating_clause.h"
 
@@ -12,6 +13,7 @@ public:
 
     void addInfo(BoundSetPropertyInfo info) { infos.push_back(std::move(info)); }
     const std::vector<BoundSetPropertyInfo>& getInfos() const { return infos; }
+    std::vector<BoundNamespaceMove> namespaceMoves;
 
     bool hasNodeInfo() const {
         return hasInfo([](const BoundSetPropertyInfo& info) {

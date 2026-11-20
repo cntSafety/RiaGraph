@@ -10,6 +10,7 @@
 #include "catalog/catalog_entry/scalar_macro_catalog_entry.h"
 #include "catalog/catalog_entry/sequence_catalog_entry.h"
 #include "catalog/catalog_entry/type_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/exception/catalog.h"
 #include "common/exception/runtime.h"
 #include "common/partition_routing_hook.h"
@@ -21,6 +22,7 @@
 #include "main/client_context.h"
 #include "main/database_manager.h"
 #include "transaction/transaction.h"
+#include "transaction/transaction_manager.h"
 #include <format>
 
 using namespace riag::binder;
@@ -30,6 +32,17 @@ using namespace riag::transaction;
 
 namespace riag {
 namespace catalog {
+
+Catalog::~Catalog() = default;
+
+NamespaceCatalog& Catalog::getOrCreateNamespaces() {
+    std::lock_guard lck{namespaceCatalogMutex};
+    if (!namespaceOwner) {
+        namespaceOwner = std::make_unique<NamespaceCatalog>(this);
+        namespaceCatalog.store(namespaceOwner.get(), std::memory_order_release);
+    }
+    return *namespaceOwner;
+}
 
 namespace {
 
@@ -215,6 +228,15 @@ void Catalog::dropTableEntry(Transaction* transaction, table_id_t tableID) {
 }
 
 void Catalog::dropTableEntry(Transaction* transaction, const TableCatalogEntry* entry) {
+    transaction->setDroppedTableStorage();
+    if (auto* namespaces = getNamespaces()) {
+        namespaces->dropTable(transaction, entry->getTableID());
+        if (entry->getType() == CatalogEntryType::REL_GROUP_ENTRY) {
+            for (const auto& item : entry->constCast<RelGroupCatalogEntry>().getRelEntryInfos()) {
+                namespaces->dropTable(transaction, item.oid);
+            }
+        }
+    }
     dropSerialSequence(transaction, entry);
     if (auto* nodeEntry = dynamic_cast<const NodeTableCatalogEntry*>(entry);
         nodeEntry != nullptr && nodeEntry->isPartitioned()) {
@@ -253,11 +275,40 @@ void Catalog::dropMacroEntry(Transaction* transaction, const ScalarMacroCatalogE
 }
 
 void Catalog::alterTableEntry(Transaction* transaction, const BoundAlterInfo& info) {
+    auto* namespaces = getNamespaces();
+    const bool connectionChange =
+        namespaces && (info.alterType == AlterType::ADD_FROM_TO_CONNECTION ||
+                          info.alterType == AlterType::DROP_FROM_TO_CONNECTION);
+    std::unordered_set<table_id_t> previousPhysicalTables;
+    if (connectionChange) {
+        for (const auto& rel : getTableCatalogEntry(transaction, info.tableName)
+                                   ->constCast<RelGroupCatalogEntry>()
+                                   .getRelEntryInfos()) {
+            previousPhysicalTables.insert(rel.oid);
+        }
+    }
     // Capture whether the renamed entry is a node table before the rename clears its name.
     const auto isNodeTable = tables->containsEntry(transaction, info.tableName) &&
                              tables->getEntry(transaction, info.tableName)->getType() ==
                                  CatalogEntryType::NODE_TABLE_ENTRY;
     tables->alterTableEntry(transaction, info);
+    if (info.alterType == AlterType::DROP_FROM_TO_CONNECTION) {
+        // The pair's rel table is reclaimed like a dropped table (see dropTableEntry).
+        transaction->setDroppedTableStorage();
+    }
+    if (connectionChange) {
+        const auto* group =
+            getTableCatalogEntry(transaction, info.tableName)->ptrCast<RelGroupCatalogEntry>();
+        const auto* policy = namespaces->getPolicy(transaction, group->getTableID());
+        for (const auto& rel : group->getRelEntryInfos()) {
+            if (previousPhysicalTables.erase(rel.oid) == 0 && policy) {
+                namespaces->setPolicy(transaction, rel.oid, true, policy->allowed, false, false);
+            }
+        }
+        for (auto id : previousPhysicalTables) {
+            namespaces->dropTable(transaction, id);
+        }
+    }
     if (isNodeTable && info.alterType == AlterType::RENAME) {
         // Keep the subgraph name in sync with the table name.
         const auto& renameInfo = info.extraInfo->constPtrCast<BoundExtraRenameTableInfo>();
@@ -654,16 +705,36 @@ void Catalog::registerBuiltInTypes() {
 
 CatalogEntry* Catalog::createTableEntry(Transaction* transaction,
     const BoundCreateTableInfo& info) {
+    if (!info.namespacePolicy.isUnrestricted() || info.localPrimaryKey) {
+        auto& context = *transaction->getClientContext();
+        TransactionManager::Get(context)->claimNamespaceDDL(context, *transaction);
+    }
+    CatalogEntry* result;
     switch (info.type) {
     case CatalogEntryType::NODE_TABLE_ENTRY: {
-        return createNodeTableEntry(transaction, info);
+        result = createNodeTableEntry(transaction, info);
+        break;
     }
     case CatalogEntryType::REL_GROUP_ENTRY: {
-        return createRelGroupEntry(transaction, info);
+        result = createRelGroupEntry(transaction, info);
+        break;
     }
     default:
         UNREACHABLE_CODE;
     }
+    if (!info.namespacePolicy.isUnrestricted() || info.localPrimaryKey) {
+        auto& namespaces = getOrCreateNamespaces();
+        const auto relationship = info.type == CatalogEntryType::REL_GROUP_ENTRY;
+        namespaces.setPolicy(transaction, result->getOID(), relationship, info.namespacePolicy,
+            info.localPrimaryKey, false);
+        if (relationship) {
+            for (const auto& entry : result->constCast<RelGroupCatalogEntry>().getRelEntryInfos()) {
+                namespaces.setPolicy(transaction, entry.oid, true, info.namespacePolicy, false,
+                    false);
+            }
+        }
+    }
+    return result;
 }
 
 void Catalog::createNodeTableSubgraph(Transaction* transaction, const std::string& tableName) {
@@ -816,6 +887,13 @@ void Catalog::serialize(Serializer& ser) const {
     internalSequences->serialize(ser);
     internalFunctions->serialize(ser);
     graphs->serialize(ser);
+    if (ser.getStorageVersion() >= StorageVersionInfo::STORAGE_VERSION_50) {
+        const auto* namespaces = getNamespaces();
+        ser.write(namespaces != nullptr);
+        if (namespaces) {
+            namespaces->serialize(ser);
+        }
+    }
 }
 
 void Catalog::serializeSnapshot(Serializer& ser, common::transaction_t snapshotTS) const {
@@ -831,6 +909,13 @@ void Catalog::serializeSnapshot(Serializer& ser, common::transaction_t snapshotT
     internalSequences->serializeSnapshot(ser, &snapshotTxn);
     internalFunctions->serializeSnapshot(ser, &snapshotTxn);
     graphs->serializeSnapshot(ser, &snapshotTxn);
+    if (ser.getStorageVersion() >= StorageVersionInfo::STORAGE_VERSION_50) {
+        const auto* namespaces = getNamespaces();
+        ser.write(namespaces != nullptr);
+        if (namespaces) {
+            namespaces->serializeSnapshot(ser, &snapshotTxn);
+        }
+    }
 }
 
 void Catalog::deserialize(Deserializer& deSer) {
@@ -845,6 +930,13 @@ void Catalog::deserialize(Deserializer& deSer) {
     internalSequences = CatalogSet::deserialize(this, deSer);
     internalFunctions = CatalogSet::deserialize(this, deSer);
     graphs = CatalogSet::deserialize(this, deSer);
+    if (deSer.getStorageVersion() >= StorageVersionInfo::STORAGE_VERSION_50) {
+        bool hasNamespaces = false;
+        deSer.deserializeValue(hasNamespaces);
+        if (hasNamespaces) {
+            getOrCreateNamespaces().deserialize(deSer);
+        }
+    }
 }
 
 } // namespace catalog

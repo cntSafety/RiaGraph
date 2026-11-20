@@ -2,6 +2,7 @@
 
 #include "binder/expression/expression_util.h"
 #include "catalog/catalog.h"
+#include "catalog/namespace_catalog.h"
 #include "processor/execution_context.h"
 #include "storage/storage_manager.h"
 #include "storage/table/node_table.h"
@@ -134,6 +135,13 @@ void Partitioner::executeInternal(ExecutionContext* context) {
         const auto numRels = relOffsetVector->state->getSelVector().getSelSize();
         evaluateExpressions(numRels);
         auto currentRelOffset = sharedState->relTable->reserveRelOffsets(numRels);
+        if (dataInfo.namespaceTarget != GLOBAL_NAMESPACE_ID && numRels != 0) {
+            auto* table = sharedState->relTable;
+            auto& namespaces = table->getOwningCatalog()->getOrCreateNamespaces();
+            catalog::NamespaceWriteState writer(&namespaces,
+                transaction::Transaction::Get(*context->clientContext), table->getTableID(), true);
+            writer.setRange(currentRelOffset, numRels, dataInfo.namespaceTarget);
+        }
         for (auto i = 0u; i < numRels; i++) {
             const auto pos = relOffsetVector->state->getSelVector()[i];
             relOffsetVector->setValue<offset_t>(pos, currentRelOffset++);

@@ -1,5 +1,7 @@
 #include "common/exception/binder.h"
 #include "common/type_utils.h"
+#include "function/arithmetic/add.h"
+#include "function/arithmetic/multiply.h"
 #include "function/comparison/comparison_functions.h"
 #include "function/list/vector_list_functions.h"
 #include "function/scalar_function.h"
@@ -71,7 +73,15 @@ struct ListSum {
             if (inputDataVector->isNull(input.offset + i)) {
                 continue;
             }
-            result += inputDataVector->getValue<T>(input.offset + i);
+            auto value = inputDataVector->getValue<T>(input.offset + i);
+            if constexpr (std::is_floating_point_v<T>) {
+                result += value;
+            } else {
+                // The checked Add throws on overflow, as the + operator does. It is handed
+                // copies: Multiply's unsigned 64-bit overload swaps its operands in place.
+                auto sum = result;
+                Add::operation(sum, value, result);
+            }
         }
     }
 };
@@ -95,7 +105,13 @@ struct ListProduct {
             if (inputDataVector->isNull(input.offset + i)) {
                 continue;
             }
-            result *= inputDataVector->getValue<T>(input.offset + i);
+            auto value = inputDataVector->getValue<T>(input.offset + i);
+            if constexpr (std::is_floating_point_v<T>) {
+                result *= value;
+            } else {
+                auto product = result;
+                Multiply::operation(product, value, result);
+            }
         }
     }
 };

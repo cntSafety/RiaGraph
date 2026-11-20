@@ -50,6 +50,7 @@ struct PrimaryKeyScanSharedState {
 
 class PrimaryKeyScanNodeTable : public ScanTable {
     static constexpr PhysicalOperatorType type_ = PhysicalOperatorType::PRIMARY_KEY_SCAN_NODE_TABLE;
+    enum class LookupKind : uint8_t { POINT, RANGE, NAMESPACE_POINT };
 
 public:
     PrimaryKeyScanNodeTable(ScanOpInfo opInfo, std::vector<ScanNodeTableInfo> tableInfos,
@@ -57,11 +58,14 @@ public:
         std::unique_ptr<evaluator::ExpressionEvaluator> upperBoundEvaluator, bool isRange,
         bool isIndexEquality, bool lowerInclusive, bool upperInclusive, std::string indexName,
         std::shared_ptr<PrimaryKeyScanSharedState> sharedState, physical_op_id id,
-        std::unique_ptr<OPPrintInfo> printInfo)
+        std::unique_ptr<OPPrintInfo> printInfo, bool namespacePoint = false)
         : ScanTable{type_, std::move(opInfo), id, std::move(printInfo)}, scanState{nullptr},
           tableInfos{std::move(tableInfos)}, indexEvaluator{std::move(indexEvaluator)},
           upperBoundEvaluator{std::move(upperBoundEvaluator)}, sharedState{std::move(sharedState)},
-          isRange{isRange}, isIndexEquality{isIndexEquality}, lowerInclusive{lowerInclusive},
+          lookupKind{namespacePoint ? LookupKind::NAMESPACE_POINT :
+                     isRange        ? LookupKind::RANGE :
+                                      LookupKind::POINT},
+          isIndexEquality{isIndexEquality}, lowerInclusive{lowerInclusive},
           upperInclusive{upperInclusive}, indexName{std::move(indexName)}, currentRangeTableIdx{0},
           rangeOffsetCursor{0} {}
 
@@ -78,12 +82,15 @@ public:
     std::unique_ptr<PhysicalOperator> copy() override {
         return std::make_unique<PrimaryKeyScanNodeTable>(opInfo.copy(), copyVector(tableInfos),
             indexEvaluator == nullptr ? nullptr : indexEvaluator->copy(),
-            upperBoundEvaluator == nullptr ? nullptr : upperBoundEvaluator->copy(), isRange,
-            isIndexEquality, lowerInclusive, upperInclusive, indexName, sharedState, id,
-            printInfo->copy());
+            upperBoundEvaluator == nullptr ? nullptr : upperBoundEvaluator->copy(),
+            lookupKind == LookupKind::RANGE, isIndexEquality, lowerInclusive, upperInclusive,
+            indexName, sharedState, id, printInfo->copy(),
+            lookupKind == LookupKind::NAMESPACE_POINT);
     }
 
 private:
+    template<bool NAMESPACE_POINT>
+    inline bool lookupPoint(ExecutionContext* context);
     bool lookupRange(ExecutionContext* context);
 
 private:
@@ -92,7 +99,7 @@ private:
     std::unique_ptr<evaluator::ExpressionEvaluator> indexEvaluator;
     std::unique_ptr<evaluator::ExpressionEvaluator> upperBoundEvaluator;
     std::shared_ptr<PrimaryKeyScanSharedState> sharedState;
-    bool isRange;
+    LookupKind lookupKind;
     bool isIndexEquality;
     bool lowerInclusive;
     bool upperInclusive;

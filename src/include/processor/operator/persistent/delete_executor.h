@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "common/enums/delete_type.h"
+#include "common/namespace_set.h"
 #include "common/vector/value_vector.h"
 #include "processor/result/result_set.h"
 #include "storage/table/node_table.h"
@@ -17,6 +18,7 @@ struct NodeDeleteInfo {
     DataPos nodeIDPos;
 
     common::ValueVector* nodeIDVector = nullptr;
+    common::NamespaceSet namespaceScope;
 
     NodeDeleteInfo(common::DeleteNodeType deleteType, const DataPos& nodeIDPos)
         : deleteType{deleteType}, nodeIDPos{nodeIDPos} {};
@@ -26,7 +28,8 @@ struct NodeDeleteInfo {
 
 private:
     NodeDeleteInfo(const NodeDeleteInfo& other)
-        : deleteType{other.deleteType}, nodeIDPos{other.nodeIDPos} {}
+        : deleteType{other.deleteType}, nodeIDPos{other.nodeIDPos},
+          namespaceScope{other.namespaceScope} {}
 };
 
 struct NodeTableDeleteInfo {
@@ -72,6 +75,7 @@ public:
     virtual void finalize(ExecutionContext* context) = 0;
 
 protected:
+    void validateNamespaceScope(ExecutionContext* context, const NodeTableDeleteInfo& tableInfo);
     void appendToBatch(common::internalID_t nodeID);
     void flushBatch(const std::vector<common::internalID_t>& nodeIDs,
         common::ValueVector& srcNodeIDVector,

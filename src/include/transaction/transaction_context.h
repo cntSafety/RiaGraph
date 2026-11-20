@@ -55,6 +55,7 @@ public:
     static TransactionContext* Get(const main::ClientContext& context);
 
 private:
+    void beginManualTransaction(TransactionType transactionType);
     void beginTransactionInternal(TransactionType transactionType);
 
 private:

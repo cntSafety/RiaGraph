@@ -1,0 +1,77 @@
+-DATASET CSV empty
+
+--
+
+# The string, list and null predicates (IN, STARTS WITH, ENDS WITH, CONTAINS, =~, IS [NOT] NULL)
+# bind looser than every arithmetic and bitwise operator and tighter than the comparisons, as in
+# openCypher 9 (oC_StringListNullPredicateExpression). They used to bind tighter than ^, so
+# `1+2 IN [3]` parsed as `1 + (2 IN [3])` and failed in the binder with +(INT64,BOOL).
+
+-CASE ArithmeticBindsTighterThanIn
+-STATEMENT RETURN 1+2 IN [3] AS a, (1+2) IN [3] AS b, typeof(1+2 IN [3]) AS t;
+---- 1
+True|True|BOOL
+-STATEMENT RETURN 2 * 3 IN [6] AS a, 7 % 4 IN [3] AS b, 1 - 1 IN [0] AS c, 2 ^ 3 IN [8.0] AS d;
+---- 1
+True|True|True|True
+-STATEMENT RETURN 1 | 2 IN [3] AS a, 1 << 1 IN [2] AS b, 6 & 3 IN [2] AS c;
+---- 1
+True|True|True
+-STATEMENT RETURN 3 IN [1] + [3] AS a, 1 + 2 IN [3] + [4] AS b, [1]+[2] IN [[1,2]] AS c;
+---- 1
+True|True|True
+-STATEMENT UNWIND [1,2,3] AS x WITH x WHERE x * 2 IN [2,4] RETURN x;
+---- 2
+1
+2
+-STATEMENT RETURN all(x IN [1,2] WHERE x + 1 IN [2,3]) AS a, CASE WHEN 1 + 1 IN [2] THEN 'y' ELSE 'n' END AS b;
+---- 1
+True|y
+
+-CASE ArithmeticBindsTighterThanStringPredicates
+-STATEMENT RETURN 'a' + 'b' STARTS WITH 'ab' AS a, 'abc' STARTS WITH 'a' + 'b' AS b, 'abc' ENDS WITH 'b' + 'c' AS c, 'abc' CONTAINS 'b' + 'c' AS d;
+---- 1
+True|True|True|True
+-STATEMENT RETURN 'abc' =~ 'a' + '.*' AS a, 'ab' + 'c' =~ 'abc' AS b;
+---- 1
+True|True
+
+-CASE ArithmeticBindsTighterThanNullPredicates
+-STATEMENT RETURN 1 + NULL IS NULL AS a, 1 + 1 IS NOT NULL AS b;
+---- 1
+True|True
+-STATEMENT UNWIND [1,2,NULL] AS x RETURN x, x + 1 IS NULL AS r;
+---- 3
+1|False
+2|False
+|True
+
+-CASE NonConstantOperands
+-STATEMENT CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE (:P {id: 1, name: 'ab'}), (:P {id: 2, name: 'xy'});
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.id + 1 IN [2] AND p.name + 'c' STARTS WITH 'abc' RETURN p.id;
+---- 1
+1
+-STATEMENT MATCH (p:P) RETURN p.id, p.id * 2 IN [4] AS a, p.id + NULL IS NULL AS b ORDER BY p.id;
+---- 2
+1|False|True
+2|True|True
+
+# Unchanged: the predicates still bind tighter than comparisons and the boolean operators.
+-CASE PredicatesBindTighterThanComparison
+-STATEMENT RETURN False = True IS NULL AS a, False = True IN [True, False] AS b, 1 IN [1] = true AS c, NOT True IN [True, False] AS d, 1 + 2 IN [3] AND true AS e;
+---- 1
+True|False|True|False|True
+
+-CASE PredicatesChainLeftToRight
+-STATEMENT RETURN 1 IN [1] IN [true] AS a, 1 IN [1] IS NULL AS b, NULL IS NULL IS NOT NULL AS c, 'abc' STARTS WITH 'a' IN [true] AS d, 'abc' STARTS WITH 'a' IS NULL AS e;
+---- 1
+True|False|True|True|False
+
+# Unchanged: unary minus and factorial still bind tighter than ^ and the predicates.
+-CASE UnaryOperatorsUnchanged
+-STATEMENT RETURN -1 IN [-1] AS a, -2 ^ 2 AS b, 3! IN [6] AS c, -[1,2][2] AS d;
+---- 1
+True|4.000000|True|-2

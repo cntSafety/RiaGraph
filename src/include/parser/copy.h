@@ -1,8 +1,10 @@
 #pragma once
 
+#include <optional>
 #include <vector>
 
 #include "parser/expression/parsed_expression.h"
+#include "parser/namespace_selector.h"
 #include "parser/scan_source.h"
 #include "parser/statement.h"
 
@@ -15,6 +17,7 @@ public:
 
     void setParsingOption(options_t options) { parsingOptions = std::move(options); }
     const options_t& getParsingOptions() const { return parsingOptions; }
+    std::optional<NamespaceSelector> namespaceSelector;
 
 protected:
     options_t parsingOptions;

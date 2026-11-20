@@ -102,5 +102,25 @@ void ListFunctionUtils::resolveTypes(const ScalarBindFuncInput& input,
     resolveNulls(types, bothNull, leftNull, rightNull, finalNullParamResolver);
 }
 
+void ListFunctionUtils::combineMapElementTypes(std::vector<LogicalType>& types,
+    bool rightIsElement) {
+    if (types[0].getLogicalTypeID() != LogicalTypeID::LIST ||
+        (!rightIsElement && types[1].getLogicalTypeID() != LogicalTypeID::LIST)) {
+        return;
+    }
+    const auto& leftChild = ListType::getChildType(types[0]);
+    const auto& rightChild = rightIsElement ? types[1] : ListType::getChildType(types[1]);
+    if (leftChild.getLogicalTypeID() != LogicalTypeID::STRUCT ||
+        rightChild.getLogicalTypeID() != LogicalTypeID::STRUCT || leftChild == rightChild) {
+        return;
+    }
+    LogicalType combinedType;
+    if (!LogicalTypeUtils::tryGetMaxLogicalType(leftChild, rightChild, combinedType)) {
+        return;
+    }
+    types[1] = rightIsElement ? combinedType.copy() : LogicalType::LIST(combinedType.copy());
+    types[0] = LogicalType::LIST(std::move(combinedType));
+}
+
 } // namespace function
 } // namespace riag

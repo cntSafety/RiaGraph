@@ -24,6 +24,9 @@ void Planner::planReadingClause(const BoundReadingClause& readingClause, Logical
     case ClauseType::LOAD_FROM: {
         planLoadFrom(readingClause, plan);
     } break;
+    case ClauseType::ASSERT: {
+        planAssertClause(readingClause, plan);
+    } break;
     default:
         UNREACHABLE_CODE;
     }
@@ -129,6 +132,14 @@ void Planner::planReadOp(std::shared_ptr<LogicalOperator> op, const expression_v
         tmpPlan.setLastOperator(std::move(op));
         if (!predicates.empty()) {
             appendFilters(predicates, tmpPlan);
+        }
+        // A cross product with an empty build side never pulls its probe side, so a write there
+        // would not run at all: MATCH (a) SET a.v = 1 WITH a LOAD FROM <empty file> RETURN a set
+        // nothing, and an ASSERT there would check nothing. A LIMIT above the cross product stops
+        // pulling it early, too. The write's clause completes before the next one reads, so
+        // materialize it. (ASSERT counts as an update, see LogicalOperatorUtils::isUpdate.)
+        if (plan.hasUpdateInPipeline()) {
+            appendAccumulate(plan);
         }
         appendCrossProduct(plan, tmpPlan, plan);
     } else {

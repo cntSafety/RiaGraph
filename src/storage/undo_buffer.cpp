@@ -229,6 +229,13 @@ void UndoBuffer::commitCatalogEntryRecord(ClientContext* context, const uint8_t*
     const transaction_t commitTS) {
     const auto& entryRecord = *reinterpret_cast<CatalogEntryRecord const*>(record);
     applyIfOwnerGraphAlive(context, entryRecord.ownerCatalog, [&]() {
+        // Namespace membership changes use catalog MVCC on the data-write path.
+        // Serialize publication with numeric-directory readers, including readers
+        // whose older snapshots walk past this transaction's uncommitted head.
+        std::unique_lock publicationLock{entryRecord.catalogSet->mtx, std::defer_lock};
+        if (entryRecord.catalogSet->namespaceLookup) {
+            publicationLock.lock();
+        }
         const auto newCatalogEntry = entryRecord.catalogEntry->getNext();
         DASSERT(newCatalogEntry);
         newCatalogEntry->setTimestamp(commitTS);
@@ -289,6 +296,7 @@ void UndoBuffer::rollbackRecord(ClientContext* context, const UndoRecordType rec
 void UndoBuffer::rollbackCatalogEntryRecord(ClientContext* context, const uint8_t* record) {
     const auto& entryRecord = *reinterpret_cast<CatalogEntryRecord const*>(record);
     applyIfOwnerGraphAlive(context, entryRecord.ownerCatalog, [&]() {
+        std::unique_lock lock{entryRecord.catalogSet->mtx};
         const auto entryToRollback = entryRecord.catalogEntry->getNext();
         DASSERT(entryToRollback);
         if (entryToRollback->getNext()) {

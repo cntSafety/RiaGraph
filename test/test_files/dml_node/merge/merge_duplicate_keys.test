@@ -1,0 +1,249 @@
+-DATASET CSV empty
+
+--
+
+# A MERGE key repeated within one statement: the first row creates the node, every later row
+# matches it and must see what the earlier rows stored (ON CREATE SET, earlier ON MATCH SET).
+
+-CASE MergeDuplicateKeyOnMatchReadsCreatedNode
+-STATEMENT CREATE NODE TABLE A(id STRING, v INT64, w INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {id: 'a'}) ON CREATE SET a.v = k ON MATCH SET a.v = a.v + 10 RETURN k, a.v;
+---- 3
+1|1
+2|11
+3|21
+-STATEMENT MATCH (a:A {id: 'a'}) RETURN a.v, a.w;
+---- 1
+21|
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {id: 'b'}) ON CREATE SET a.v = k ON MATCH SET a.w = 5 RETURN k, a.v, a.w;
+---- 3
+1|1|
+2|1|5
+3|1|5
+-STATEMENT UNWIND ['x', 'yy', 'x', 'yy'] AS s MERGE (a:A {id: s}) ON CREATE SET a.v = size(s) ON MATCH SET a.v = a.v + 10 RETURN s, a.v;
+---- 4
+x|1
+x|11
+yy|12
+yy|2
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {id: 'c'}) ON MATCH SET a.w = coalesce(a.w, 0) + k RETURN k, a.w;
+---- 3
+1|
+2|2
+3|5
+# Duplicates spanning more than one vector.
+-STATEMENT UNWIND range(1, 3000) AS k MERGE (a:A {id: 'd'}) ON CREATE SET a.v = k ON MATCH SET a.v = a.v + 10 RETURN count(*);
+---- 1
+3000
+-STATEMENT MATCH (a:A {id: 'd'}) RETURN a.v;
+---- 1
+29991
+# Unchanged: ON CREATE SET only, and ON MATCH SET on a node that existed before the statement.
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {id: 'e'}) ON CREATE SET a.v = k RETURN k, a.v;
+---- 3
+1|1
+2|1
+3|1
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {id: 'e'}) ON MATCH SET a.v = a.v + 10 RETURN k, a.v;
+---- 3
+1|11
+2|21
+3|31
+
+-CASE MergeDuplicateKeyOnMatchReadsCreatedString
+-STATEMENT CREATE NODE TABLE S(id INT64, t STRING, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND ['a', 'b', 'c'] AS x MERGE (s:S {id: 1}) ON CREATE SET s.t = x ON MATCH SET s.t = s.t + x RETURN x, s.t;
+---- 3
+a|a
+b|ab
+c|abc
+-STATEMENT MATCH (s:S) RETURN s.t;
+---- 1
+abc
+
+# ON MATCH SET on a variable bound outside the merged pattern writes that variable, not the
+# created node's ID slot.
+-CASE MergeDuplicateKeyOnMatchSetsBoundNode
+-STATEMENT CREATE NODE TABLE A(id STRING, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE B(id INT64, c INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE (:B {id: 1, c: 0}), (:B {id: 2, c: 0});
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (b:B {id: 2}) MERGE (a:A {id: 'a'}) ON MATCH SET b.c = k RETURN k, b.c;
+---- 3
+1|0
+2|2
+3|3
+-STATEMENT MATCH (b:B) RETURN b.id, b.c;
+---- 2
+1|0
+2|3
+
+# An ON CREATE SET or ON MATCH SET that changes a property of the MERGE pattern (#166). MERGE runs
+# row by row: a later row matches what an earlier row created only as it is stored now, so a
+# created node can stop matching the key it was created for, or start matching another row's.
+-CASE MergeSetChangesPatternProperty
+-STATEMENT CREATE NODE TABLE A(id SERIAL, v INT64, w INT64, PRIMARY KEY(id));
+---- ok
+# After row 1 the node has v = 1, so {v: 5} matches nothing in row 2 and it creates again.
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {v: 5}) ON CREATE SET a.v = k RETURN k, a.v;
+---- 3
+1|1
+2|2
+3|3
+-STATEMENT MATCH (a:A) RETURN a.v;
+---- 3
+1
+2
+3
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# Row 1 creates v = 1 and sets it to 2, which row 2's {v: 2} matches.
+-STATEMENT UNWIND [1, 2] AS k MERGE (a:A {v: k}) ON CREATE SET a.v = 2 RETURN k, a.v;
+---- 2
+1|2
+2|2
+-STATEMENT MATCH (a:A) RETURN count(*);
+---- 1
+1
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# Row 2 matches the node row 1 created and moves it to v = 11, so row 3 creates v = 1 again.
+-STATEMENT UNWIND [1, 1, 1] AS k MERGE (a:A {v: k}) ON MATCH SET a.v = a.v + 10 RETURN k, a.v;
+---- 3
+1|1
+1|11
+1|1
+-STATEMENT MATCH (a:A) RETURN a.v;
+---- 2
+1
+11
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# Rows 1 and 2 both end up with v = 3, so row 3 matches both of them.
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {v: k}) ON CREATE SET a.v = 3 ON MATCH SET a.w = k RETURN k, a.v, a.w;
+---- 4
+1|3|
+2|3|
+3|3|3
+3|3|3
+-STATEMENT MATCH (a:A) RETURN a.v, a.w;
+---- 2
+3|3
+3|3
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# One of two pattern properties changed.
+-STATEMENT UNWIND [1, 1, 1] AS k MERGE (a:A {v: k, w: 1}) ON CREATE SET a.w = 2 RETURN k, a.v, a.w;
+---- 3
+1|1|2
+1|1|2
+1|1|2
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# A NULL never matches: both rows create.
+-STATEMENT UNWIND [1, 1] AS k MERGE (a:A {v: k}) ON CREATE SET a.v = NULL RETURN k, a.v;
+---- 2
+1|
+1|
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# Rows 2 to 4 create v = 2, 3, 4; row 5 creates v = 5, which every later row matches.
+-STATEMENT UNWIND range(1, 3000) AS k MERGE (a:A {v: 5}) ON CREATE SET a.v = k RETURN count(*);
+---- 1
+3000
+-STATEMENT MATCH (a:A) RETURN a.v;
+---- 5
+1
+2
+3
+4
+5
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# More than one vector of input: every created node moves away from its key.
+-STATEMENT UNWIND range(1, 3000) AS k MERGE (a:A {v: k % 3}) ON CREATE SET a.v = k % 3 + 10 RETURN count(*);
+---- 1
+3000
+-STATEMENT MATCH (a:A) RETURN count(*);
+---- 1
+3000
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# The SET writes the value the node already has: duplicates still merge into one node.
+-STATEMENT UNWIND range(1, 3000) AS k MERGE (a:A {v: k % 3}) ON CREATE SET a.v = k % 3 ON MATCH SET a.w = coalesce(a.w, 0) + 1 RETURN count(*);
+---- 1
+3000
+-STATEMENT MATCH (a:A) RETURN a.v, a.w;
+---- 3
+0|999
+1|999
+2|999
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# A node that existed before the statement, and created nodes moved away from their key.
+-STATEMENT CREATE (:A {v: 9});
+---- ok
+-STATEMENT UNWIND [9, 1, 1, 9] AS k MERGE (a:A {v: k}) ON CREATE SET a.v = k + 100 ON MATCH SET a.w = 1 RETURN k, a.v, a.w;
+---- 4
+9|9|1
+9|9|1
+1|101|
+1|101|
+-STATEMENT MATCH (a:A) RETURN a.v, a.w;
+---- 3
+9|1
+101|
+101|
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+# Unchanged: an ON CREATE SET of a property the pattern does not give still merges duplicates.
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {v: 7}) ON CREATE SET a.w = k RETURN k, a.v, a.w;
+---- 3
+1|7|1
+2|7|1
+3|7|1
+-STATEMENT MATCH (a:A) RETURN a.v, a.w;
+---- 1
+7|1
+-STATEMENT MATCH (a:A) DELETE a;
+---- ok
+-STATEMENT BEGIN TRANSACTION
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {v: 5}) ON CREATE SET a.v = k RETURN k, a.v;
+---- 3
+1|1
+2|2
+3|3
+-STATEMENT COMMIT
+---- ok
+-STATEMENT MATCH (a:A) RETURN a.v;
+---- 3
+1
+2
+3
+
+# The value the pattern gives is cast to the column type; the stored value compares equal to it.
+-CASE MergeSetChangesPatternPropertyCast
+-STATEMENT CREATE NODE TABLE T(id SERIAL, v INT32, s STRING, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND [5, 5] AS k MERGE (a:T {v: k}) ON CREATE SET a.v = k RETURN k, a.v;
+---- 2
+5|5
+5|5
+-STATEMENT MATCH (a:T) RETURN count(*);
+---- 1
+1
+-STATEMENT UNWIND ['a', 'a', 'b'] AS x MERGE (a:T {s: x}) ON CREATE SET a.s = x + '!' RETURN x, a.s;
+---- 3
+a|a!
+a|a!
+b|b!
+-STATEMENT MATCH (a:T) WHERE a.s IS NOT NULL RETURN a.s;
+---- 3
+a!
+a!
+b!

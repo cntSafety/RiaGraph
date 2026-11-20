@@ -30,10 +30,25 @@ public:
         return onCreateSetItems;
     }
 
+    void addOnMatchNamespaceMove(NamespaceMove move) {
+        onMatchNamespaceMoves.push_back(std::move(move));
+    }
+    void addOnCreateNamespaceMove(NamespaceMove move) {
+        onCreateNamespaceMoves.push_back(std::move(move));
+    }
+    const std::vector<NamespaceMove>& getOnMatchNamespaceMoves() const {
+        return onMatchNamespaceMoves;
+    }
+    const std::vector<NamespaceMove>& getOnCreateNamespaceMoves() const {
+        return onCreateNamespaceMoves;
+    }
+
 private:
     std::vector<PatternElement> patternElements;
     std::vector<parsed_expr_pair> onMatchSetItems;
     std::vector<parsed_expr_pair> onCreateSetItems;
+    std::vector<NamespaceMove> onMatchNamespaceMoves;
+    std::vector<NamespaceMove> onCreateNamespaceMoves;
 };
 
 } // namespace parser

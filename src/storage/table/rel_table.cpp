@@ -5,6 +5,7 @@
 #include <queue>
 #include <type_traits>
 
+#include "catalog/catalog.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
 #include "common/exception/message.h"
 #include "common/exception/runtime.h"
@@ -203,7 +204,8 @@ void RelTableScanState::setNodeIDVectorToFlat(sel_t selPos) const {
 RelTable::RelTable(RelGroupCatalogEntry* relGroupEntry, table_id_t fromTableID,
     table_id_t toTableID, const StorageManager* storageManager, MemoryManager* memoryManager)
     : Table{relGroupEntry, storageManager, memoryManager}, fromNodeTableID{fromTableID},
-      toNodeTableID{toTableID}, nextRelOffset{0} {
+      toNodeTableID{toTableID}, nextRelOffset{0},
+      namespaceOwner{relGroupEntry->getOwningCatalog()} {
     auto relEntryInfo = relGroupEntry->getRelEntryInfo(fromNodeTableID, toNodeTableID);
     tableID = relEntryInfo->oid;
     relGroupID = relGroupEntry->getTableID();
@@ -439,6 +441,10 @@ bool RelTable::delete_(Transaction* transaction, TableDeleteState& deleteState) 
         }
     }
     if (isDeleted) {
+        if (namespaceOwner && namespaceOwner->getNamespaces()) {
+            clearNamespaceMembership(transaction,
+                relDeleteState.relIDVector.readNodeOffset(relIDPos), deleteState);
+        }
         setHasChanges();
         if (deleteState.logToWAL && transaction->shouldLogToWAL()) {
             DASSERT(transaction->isWriteTransaction());
@@ -483,6 +489,7 @@ void RelTable::detachDelete(Transaction* transaction, RelTableDeleteState* delet
 
 void RelTable::detachDeleteBatch(Transaction* transaction, ValueVector& srcNodeIDVector,
     ValueVector& dstNodeIDVector, ValueVector& relIDVector, RelDataDirection direction) {
+    TableDeleteState membershipState;
     if (std::ranges::count(getStorageDirections(), direction) == 0) {
         return;
     }
@@ -538,6 +545,9 @@ void RelTable::detachDeleteBatch(Transaction* transaction, ValueVector& srcNodeI
 
                 const auto relIDPos = relIDVector.state->getSelVector()[0];
                 const auto relOffset = relIDVector.readNodeOffset(relIDPos);
+                if (namespaceOwner && namespaceOwner->getNamespaces()) {
+                    clearNamespaceMembership(transaction, relOffset, membershipState);
+                }
                 if (relOffset >= StorageConstants::MAX_NUM_ROWS_IN_TABLE) {
                     DASSERT(localTable);
                     RelTableDeleteState localDeleteState{tempSrcNodeID, dstNodeIDVector,
@@ -616,6 +626,9 @@ void RelTable::detachDeleteForCSRRels(Transaction* transaction, RelTableData* ta
 
             const auto relIDPos = deleteState->relIDVector.state->getSelVector()[0];
             const auto relOffset = deleteState->relIDVector.readNodeOffset(relIDPos);
+            if (namespaceOwner && namespaceOwner->getNamespaces()) {
+                clearNamespaceMembership(transaction, relOffset, *deleteState);
+            }
             if (relOffset >= StorageConstants::MAX_NUM_ROWS_IN_TABLE) {
                 DASSERT(localTable);
                 localTable->delete_(transaction, *deleteState);

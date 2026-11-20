@@ -10,6 +10,7 @@
 #include "gmock/gmock-matchers.h"
 #include "gtest/gtest.h"
 #include "storage/compression/bitpacking_int128.h"
+#include "storage/compression/bitpacking_utils.h"
 #include "storage/compression/compression.h"
 #include "storage/storage_utils.h"
 #include "storage/table/column_chunk_metadata.h"
@@ -300,6 +301,27 @@ TEST(CompressionTests, IntegerPackingTest64SetValuesFromUncompressed) {
 
         EXPECT_THAT(decompressed, ::testing::ContainerEq(src));
     }
+}
+
+// A value of bit width 0 occupies no storage (a column of one constant value has no data
+// bytes), so packing and unpacking it must not touch the buffer. The null buffer makes any
+// access fail.
+template<typename T>
+static void checkSingleValueOfWidthZeroTouchesNoMemory() {
+    for (size_t offset : {0u, 1u, 7u, 31u}) {
+        BitpackingUtils<T>::packSingle(T{5}, nullptr, 0 /* bitWidth */, offset);
+        T unpacked = T{123};
+        BitpackingUtils<T>::unpackSingle(nullptr, &unpacked, 0 /* bitWidth */, offset);
+        EXPECT_EQ(unpacked, T{0});
+    }
+}
+
+TEST(CompressionTests, BitpackingSingleValueOfWidthZeroTouchesNoMemory) {
+    checkSingleValueOfWidthZeroTouchesNoMemory<uint8_t>();
+    checkSingleValueOfWidthZeroTouchesNoMemory<uint16_t>();
+    checkSingleValueOfWidthZeroTouchesNoMemory<uint32_t>();
+    checkSingleValueOfWidthZeroTouchesNoMemory<uint64_t>();
+    checkSingleValueOfWidthZeroTouchesNoMemory<int128_t>();
 }
 
 TEST(CompressionTests, IntegerPackingTest128WorksOnNonZeroBuffer) {

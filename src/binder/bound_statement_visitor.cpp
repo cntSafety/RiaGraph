@@ -79,6 +79,9 @@ void BoundStatementVisitor::visit(const BoundStatement& statement) {
     case StatementType::USE_GRAPH: {
         visitUseGraph(statement);
     } break;
+    case StatementType::NAMESPACE: {
+        visitNamespace(statement);
+    } break;
     case StatementType::STANDALONE_CALL_FUNCTION: {
         visitStandaloneCallFunction(statement);
     } break;
@@ -188,6 +191,9 @@ void BoundStatementVisitor::visitReadingClause(const BoundReadingClause& reading
     case ClauseType::LOAD_FROM: {
         visitLoadFrom(readingClause);
     } break;
+    case ClauseType::ASSERT: {
+        visitAssert(readingClause);
+    } break;
     default:
         UNREACHABLE_CODE;
     }
@@ -206,6 +212,9 @@ void BoundStatementVisitor::visitReadingClauseUnsafe(BoundReadingClause& reading
     } break;
     case ClauseType::LOAD_FROM: {
         visitLoadFrom(readingClause);
+    } break;
+    case ClauseType::ASSERT: {
+        visitAssert(readingClause);
     } break;
     default:
         UNREACHABLE_CODE;

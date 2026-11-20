@@ -3,6 +3,9 @@
 #include "binder/expression/expression_util.h"
 #include "binder/expression/literal_expression.h"
 #include "catalog/catalog.h"
+#include "catalog/namespace_catalog.h"
+#include "common/exception/binder.h"
+#include "common/string_utils.h"
 #include "function/built_in_function_utils.h"
 #include "main/client_context.h"
 #include "transaction/transaction.h"
@@ -70,6 +73,33 @@ BoundTableScanInfo Binder::bindTableFunc(const std::string& tableFuncName,
     bindInput.optionalParamsLegacy = std::move(optionalParamsLegacy);
     bindInput.binder = this;
     bindInput.yieldVariables = std::move(yieldVariables);
+    const auto name = StringUtils::getUpper(tableFuncName);
+    const bool namespaceBlindIndex =
+        name == "ANN_SEARCH" || ((name.find("FTS_INDEX") != std::string::npos ||
+                                     name.find("VECTOR_INDEX") != std::string::npos ||
+                                     name.find("HNSW_INDEX") != std::string::npos) &&
+                                    !name.starts_with("DROP_") && !name.starts_with("_DROP_"));
+    if (namespaceBlindIndex) {
+        const auto& selection = clientContext->getNamespaceSelection();
+        if (!selection.isUnrestricted() && !selection.contains(GLOBAL_NAMESPACE_ID)) {
+            throw BinderException(
+                "FTS/vector index operations do not support namespace scopes in this version.");
+        }
+        if (const auto* namespaces = catalog->getNamespaces();
+            namespaces && !bindInput.params.empty()) {
+            const auto value = bindInput.getValue(0);
+            if (value.getDataType().getLogicalTypeID() == LogicalTypeID::STRING &&
+                catalog->containsTable(transaction, value.getValue<std::string>())) {
+                const auto* table =
+                    catalog->getTableCatalogEntry(transaction, value.getValue<std::string>());
+                const auto* policy = namespaces->getPolicy(transaction, table->getTableID());
+                if (policy && (policy->hasMembership || policy->localPrimaryKey)) {
+                    throw BinderException("FTS/vector indexes require a global-only table with a "
+                                          "GLOBAL primary key in this version.");
+                }
+            }
+        }
+    }
     return BoundTableScanInfo{*tableFunc, tableFunc->bindFunc(clientContext, &bindInput)};
 }
 

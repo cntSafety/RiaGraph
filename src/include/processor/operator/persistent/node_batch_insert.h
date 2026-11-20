@@ -51,6 +51,7 @@ private:
 };
 
 struct NodeBatchInsertInfo final : BatchInsertInfo {
+    common::namespace_id_t namespaceTarget = common::GLOBAL_NAMESPACE_ID;
     evaluator::evaluator_vector_t columnEvaluators;
     std::vector<common::ColumnEvaluateType> evaluateTypes;
     bool skipDuplicatePK;
@@ -67,9 +68,9 @@ struct NodeBatchInsertInfo final : BatchInsertInfo {
           skipDuplicatePK{skipDuplicatePK}, partitionInfo{std::move(partitionInfo)} {}
 
     NodeBatchInsertInfo(const NodeBatchInsertInfo& other)
-        : BatchInsertInfo{other}, columnEvaluators{copyVector(other.columnEvaluators)},
-          evaluateTypes{other.evaluateTypes}, skipDuplicatePK{other.skipDuplicatePK},
-          partitionInfo{other.partitionInfo} {}
+        : BatchInsertInfo{other}, namespaceTarget{other.namespaceTarget},
+          columnEvaluators{copyVector(other.columnEvaluators)}, evaluateTypes{other.evaluateTypes},
+          skipDuplicatePK{other.skipDuplicatePK}, partitionInfo{other.partitionInfo} {}
 
     std::unique_ptr<BatchInsertInfo> copy() const override {
         return std::make_unique<NodeBatchInsertInfo>(*this);

@@ -61,6 +61,29 @@ private:
           direction{other.direction}, alias{other.alias} {}
 };
 
+// The CSR scan flattens the bound node's chunk state in place, one bound node at a time
+// (RelTableScanState::setNodeIDVectorToFlat). That state belongs to the operators below, and
+// it must be handed back exactly as received -- unflat or flat, same selection -- before the
+// rel scan pulls its next input, the same contract Flatten keeps. Two readers depend on it:
+// a filter between two extends reads the flatness to decide how to evaluate, and an extend
+// below whose bound chunk is not the one this scan flattens returns its next batch without
+// rewriting that chunk, so the rel scan would otherwise re-read its own leftover (the last
+// bound node only) as the next input. ScanRelTable and ScanMultiRelTable both keep it.
+class BoundNodeStateKeeper {
+public:
+    // After pulling an input: remember the bound node's chunk state as the child left it.
+    void save(const common::DataChunkState& state);
+    // Before pulling the next input: hand the remembered state back.
+    void restore(common::DataChunkState& state);
+    void reset() { saved = false; }
+
+private:
+    bool saved = false;
+    bool wasFlat = false;
+    bool selWasUnfiltered = false;
+    std::vector<common::sel_t> selPositions;
+};
+
 class ScanRelTable final : public ScanTable {
     static constexpr PhysicalOperatorType type_ = PhysicalOperatorType::SCAN_REL_TABLE;
 
@@ -123,17 +146,7 @@ protected:
     void initGlobalStateInternal(ExecutionContext* context) override;
     bool fetchNextBoundNodeBatch(transaction::Transaction* transaction);
     void updatePackedChildSlices(common::sel_t outputSize) const;
-    // The CSR scan flattens the bound node's chunk state in place, one bound node at a time
-    // (RelTableScanState::setNodeIDVectorToFlat). That state belongs to the operators below:
-    // when a filter sits between two extends it reads the flatness to decide how to evaluate,
-    // so the state is handed back exactly as received -- unflat or flat, same selection --
-    // before the next input is pulled, the same contract Flatten keeps.
-    void saveBoundNodeState();
-    void restoreBoundNodeState();
-    bool boundNodeStateSaved = false;
-    bool boundNodeStateWasFlat = false;
-    bool boundNodeSelWasUnfiltered = false;
-    std::vector<common::sel_t> boundNodeSelPositions;
+    BoundNodeStateKeeper boundNodeState;
 
     // Multi-parent packed batches (see docs/multi_parent_lifetime.md). Disabled by default:
     // standard consumers of the packed extend output rely on the one-parent-per-batch

@@ -26,6 +26,8 @@ private:
     // are recomputed (and reset) at the start of every rewrite().
     std::shared_ptr<binder::Expression> probeLimit;
     planner::LogicalOperator* probeLimitTarget = nullptr;
+    // Whether the plan contains an ASSERT, so that plans without one skip the per-join check.
+    bool planHasAssert = false;
 };
 
 } // namespace optimizer

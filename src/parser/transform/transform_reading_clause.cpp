@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "parser/query/reading_clause/assert_clause.h"
 #include "parser/query/reading_clause/in_query_call_clause.h"
 #include "parser/query/reading_clause/load_from.h"
 #include "parser/query/reading_clause/match_clause.h"
@@ -20,6 +21,8 @@ std::unique_ptr<ReadingClause> Transformer::transformReadingClause(
         return transformInQueryCall(*ctx.iC_InQueryCall());
     } else if (ctx.iC_LoadFrom()) {
         return transformLoadFrom(*ctx.iC_LoadFrom());
+    } else if (ctx.iC_Assert()) {
+        return transformAssert(*ctx.iC_Assert());
     }
     UNREACHABLE_CODE;
 }
@@ -29,6 +32,10 @@ std::unique_ptr<ReadingClause> Transformer::transformMatch(CypherParser::OC_Matc
         ctx.OPTIONAL() ? MatchClauseType::OPTIONAL_MATCH : MatchClauseType::MATCH;
     auto matchClause =
         std::make_unique<MatchClause>(transformPattern(*ctx.oC_Pattern()), matchClauseType);
+    if (ctx.iC_NamespaceScope()) {
+        matchClause->setNamespaceSelector(
+            transformNamespaceList(*ctx.iC_NamespaceScope()->iC_NamespaceList()));
+    }
     if (ctx.oC_Where()) {
         matchClause->setWherePredicate(transformWhere(*ctx.oC_Where()));
     }
@@ -112,6 +119,18 @@ std::unique_ptr<ReadingClause> Transformer::transformLoadFrom(
         loadFrom->setWherePredicate(transformWhere(*ctx.oC_Where()));
     }
     return loadFrom;
+}
+
+std::unique_ptr<ReadingClause> Transformer::transformAssert(CypherParser::IC_AssertContext& ctx) {
+    auto condition = transformExpression(*ctx.oC_Expression());
+    // The source text, whitespace included, is the failure message when AS is absent.
+    auto conditionText = ctx.oC_Expression()->getText();
+    std::optional<std::string> message;
+    if (ctx.StringLiteral()) {
+        message = transformStringLiteral(*ctx.StringLiteral());
+    }
+    return std::make_unique<AssertClause>(std::move(condition), std::move(conditionText),
+        std::move(message));
 }
 
 } // namespace parser

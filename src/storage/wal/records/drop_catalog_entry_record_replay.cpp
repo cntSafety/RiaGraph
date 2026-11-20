@@ -1,6 +1,7 @@
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/catalog_entry.h"
 #include "catalog/catalog_entry/index_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "main/client_context.h"
 #include "main/database.h"
 #include "main/database_manager.h"
@@ -21,6 +22,11 @@ void WALReplayer::replayDropCatalogEntryRecord(const WALRecord& walRecord) const
     auto transaction = transaction::Transaction::Get(clientContext);
     const auto entryID = getReplayedEntryID(dropEntryRecord.entryType, dropEntryRecord.entryID);
     switch (dropEntryRecord.entryType) {
+    case CatalogEntryType::NAMESPACE_ENTRY:
+    case CatalogEntryType::NAMESPACE_POLICY_ENTRY:
+    case CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY: {
+        catalog->getOrCreateNamespaces().dropEntry(transaction, dropEntryRecord.entryID);
+    } break;
     case CatalogEntryType::NODE_TABLE_ENTRY:
     case CatalogEntryType::REL_GROUP_ENTRY: {
         DASSERT(Catalog::Get(clientContext));

@@ -1,13 +1,23 @@
 #include "storage/table/table.h"
 
+#include "catalog/catalog.h"
+#include "catalog/namespace_catalog.h"
 #include "storage/storage_manager.h"
 #include "storage/table/node_table.h"
 #include "storage/table/rel_table.h"
+#include "transaction/transaction.h"
 
 using namespace riag::common;
 
 namespace riag {
 namespace storage {
+
+struct NamespaceDeleteState {
+    transaction_t transactionID = INVALID_TRANSACTION;
+    const Table* currentTable = nullptr;
+    catalog::NamespaceWriteState* currentWriter = nullptr;
+    std::unordered_map<const Table*, std::unique_ptr<catalog::NamespaceWriteState>> writers;
+};
 
 TableScanState::~TableScanState() = default;
 
@@ -48,6 +58,36 @@ Table::Table(const catalog::TableCatalogEntry* tableEntry, const StorageManager*
       shadowFile{&storageManager->getShadowFile()}, changeEpoch{0} {}
 
 Table::~Table() = default;
+
+catalog::Catalog* Table::getOwningCatalog() const {
+    return tableType == TableType::NODE ? cast<NodeTable>().getOwningCatalog() :
+                                          cast<RelTable>().getOwningCatalog();
+}
+
+void Table::clearNamespaceMembership(transaction::Transaction* transaction, offset_t offset,
+    TableDeleteState& state) {
+    if (!state.namespaces) {
+        state.namespaces = std::make_unique<NamespaceDeleteState>();
+    }
+    auto& cache = *state.namespaces;
+    if (cache.transactionID != transaction->getID()) {
+        cache.writers.clear();
+        cache.currentTable = nullptr;
+        cache.currentWriter = nullptr;
+        cache.transactionID = transaction->getID();
+    }
+    if (cache.currentTable != this) {
+        auto& writer = cache.writers[this];
+        if (!writer) {
+            writer =
+                std::make_unique<catalog::NamespaceWriteState>(getOwningCatalog()->getNamespaces(),
+                    transaction, tableID, tableType == TableType::REL);
+        }
+        cache.currentTable = this;
+        cache.currentWriter = writer.get();
+    }
+    cache.currentWriter->set(offset, GLOBAL_NAMESPACE_ID);
+}
 
 bool Table::scan(transaction::Transaction* transaction, TableScanState& scanState) {
     return scanInternal(transaction, scanState);

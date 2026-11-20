@@ -81,6 +81,10 @@ protected:
     // Runs only when WAL retirement actually executes; skipped alongside retirement while
     // the horizon pins the WAL.
     virtual void onWALRetired(bool walRotated);
+    // Run around the removal of the shadow files at the end of a checkpoint, after the shadow
+    // pages were applied and before the checkpoint is finished. Crash-injection points.
+    virtual void beforeShadowCleanup();
+    virtual void afterShadowCleanup();
     virtual void beforeGraphShadowApply(StorageManager& storageManager);
     void applyShadowPagesForPartitionChildren();
     void flushGraphShadowFiles();
@@ -90,6 +94,7 @@ private:
     struct CheckpointTarget {
         catalog::Catalog* catalog;
         StorageManager* storageManager;
+        storage_version_t storageVersion;
     };
 
     std::vector<CheckpointTarget> collectCheckpointTargets() const;

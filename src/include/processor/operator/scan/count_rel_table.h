@@ -32,11 +32,9 @@ class CountRelTable final : public PhysicalOperator {
 public:
     CountRelTable(std::vector<storage::NodeTable*> nodeTables,
         std::vector<storage::RelTable*> relTables, common::RelDataDirection direction,
-        DataPos countOutputPos, bool returnNullOnZero, physical_op_id id,
-        std::unique_ptr<OPPrintInfo> printInfo)
+        DataPos countOutputPos, physical_op_id id, std::unique_ptr<OPPrintInfo> printInfo)
         : PhysicalOperator{type_, id, std::move(printInfo)}, nodeTables{std::move(nodeTables)},
-          relTables{std::move(relTables)}, direction{direction}, countOutputPos{countOutputPos},
-          returnNullOnZero{returnNullOnZero} {}
+          relTables{std::move(relTables)}, direction{direction}, countOutputPos{countOutputPos} {}
 
     bool isSource() const override { return true; }
     bool isParallel() const override { return false; }
@@ -46,8 +44,8 @@ public:
     bool getNextTuplesInternal(ExecutionContext* context) override;
 
     std::unique_ptr<PhysicalOperator> copy() override {
-        return std::make_unique<CountRelTable>(nodeTables, relTables, direction, countOutputPos,
-            returnNullOnZero, id, printInfo->copy());
+        return std::make_unique<CountRelTable>(nodeTables, relTables, direction, countOutputPos, id,
+            printInfo->copy());
     }
 
 private:
@@ -55,7 +53,6 @@ private:
     std::vector<storage::RelTable*> relTables;
     common::RelDataDirection direction;
     DataPos countOutputPos;
-    bool returnNullOnZero;
     common::ValueVector* countVector;
     bool hasExecuted;
     common::row_idx_t totalCount;

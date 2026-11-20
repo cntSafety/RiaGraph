@@ -302,6 +302,62 @@ TEST(VFSTests, VirtualFileSystemDeleteFilesPatternValidation) {
     std::filesystem::remove_all("/tmp/foo.db");
 }
 
+// The graph and partition-child files of a database without an extension are <stem>.<name>, with
+// no extension of the database's to share. They must be removable; nothing else may become so.
+TEST(VFSTests, VirtualFileSystemDeleteFilesExtensionlessDatabase) {
+    const auto dir = std::filesystem::temp_directory_path() / "riag_vfs_extensionless";
+    const auto otherDir = std::filesystem::temp_directory_path() / "riag_vfs_extensionless_other";
+    std::filesystem::create_directories(dir);
+    std::filesystem::create_directories(otherDir);
+    const auto dbPath = (dir / "db").string();
+    VirtualFileSystem vfs(dbPath);
+    auto inDir = [&](const std::string& name) { return (dir / name).string(); };
+
+    for (const auto& name : {"db.g", "db.T_p1", "db.graph.with.dots", "db.g.wal", "db.g.shadow",
+             "db.g.tmp", "db.T_p0.wal", "db.wal", "db.shadow", "db.tmp", "db.lock"}) {
+        std::ofstream(inDir(name)).close();
+        ASSERT_TRUE(std::filesystem::exists(inDir(name))) << name;
+        EXPECT_NO_THROW(vfs.removeFileIfExists(inDir(name))) << name;
+        EXPECT_FALSE(std::filesystem::exists(inDir(name))) << name;
+    }
+
+    // The database file itself, a sibling that merely shares the prefix, an unrelated file, and a
+    // child-shaped name in another directory stay protected.
+    for (const auto& name : {"db", "db.", "other", "other.g", "dbx.g", "db_p1"}) {
+        std::ofstream(inDir(name)).close();
+        EXPECT_THROW(vfs.removeFileIfExists(inDir(name)), IOException) << name;
+        EXPECT_TRUE(std::filesystem::exists(inDir(name))) << name;
+    }
+    const auto foreign = (otherDir / "db.g").string();
+    std::ofstream(foreign).close();
+    EXPECT_THROW(vfs.removeFileIfExists(foreign), IOException);
+    EXPECT_TRUE(std::filesystem::exists(foreign));
+
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(otherDir);
+}
+
+// The same rule for a database with an extension is unchanged: the child shares the extension.
+TEST(VFSTests, VirtualFileSystemDeleteFilesExtensionDatabaseChildren) {
+    const auto dir = std::filesystem::temp_directory_path() / "riag_vfs_extension_children";
+    std::filesystem::create_directories(dir);
+    VirtualFileSystem vfs((dir / "db.riag").string());
+    auto inDir = [&](const std::string& name) { return (dir / name).string(); };
+
+    for (const auto& name : {"db.g.riag", "db.T_p1.riag"}) {
+        std::ofstream(inDir(name)).close();
+        EXPECT_NO_THROW(vfs.removeFileIfExists(inDir(name))) << name;
+        EXPECT_FALSE(std::filesystem::exists(inDir(name))) << name;
+    }
+    for (const auto& name : {"db.riag", "db.g", "db.g.other", "other.g.riag"}) {
+        std::ofstream(inDir(name)).close();
+        EXPECT_THROW(vfs.removeFileIfExists(inDir(name)), IOException) << name;
+        EXPECT_TRUE(std::filesystem::exists(inDir(name))) << name;
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
 class CrossFileSystemRenameProbe final : public FileSystem {
 public:
     explicit CrossFileSystemRenameProbe(std::string knownPath) : knownPath{std::move(knownPath)} {}

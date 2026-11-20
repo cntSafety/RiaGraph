@@ -39,6 +39,8 @@ public:
 
     bool isProfile() const;
     bool hasUpdate() const;
+    // See LogicalOperator::hasUpdateInPipeline.
+    bool hasUpdateInPipeline() const;
 
 private:
     std::shared_ptr<LogicalOperator> lastOperator;

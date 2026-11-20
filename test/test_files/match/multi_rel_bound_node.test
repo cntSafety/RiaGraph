@@ -1,0 +1,77 @@
+-DATASET CSV EMPTY
+
+--
+
+# The bound node of an extend over several rel tables (a multi-label bound node, or a rel
+# pattern spread over several rel tables) reaches the scan as a chunk that may be unflat.
+# ScanMultiRelTable picks the rel tables to scan from the first selected position and hands the
+# whole selection to the rel table scan, so every selected position has to be non-NULL and from
+# that same node table. These queries produce bound nodes of several node tables and NULL bound
+# nodes upstream of such an extend; the results guard that no input row is lost or scanned
+# against the wrong table. (#151)
+
+-CASE MultiRelBoundNode
+-STATEMENT CREATE NODE TABLE A(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE NODE TABLE B(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE NODE TABLE C(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM A TO B, FROM B TO C, FROM A TO C, FROM C TO A);
+---- ok
+-STATEMENT UNWIND range(1,5) AS i CREATE (:A {id:i});
+---- ok
+-STATEMENT UNWIND range(101,105) AS i CREATE (:B {id:i});
+---- ok
+-STATEMENT UNWIND range(201,205) AS i CREATE (:C {id:i});
+---- ok
+-STATEMENT MATCH (a:A),(b:B) WHERE b.id = a.id+100 CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (b:B),(c:C) WHERE c.id = b.id+100 CREATE (b)-[:R]->(c);
+---- ok
+-STATEMENT MATCH (a:A),(c:C) WHERE c.id = a.id+200 CREATE (a)-[:R]->(c);
+---- ok
+-STATEMENT MATCH (a:A),(c:C) WHERE a.id = c.id-200 CREATE (c)-[:R]->(a);
+---- ok
+
+-LOG BoundNodesFromSeveralTables
+-STATEMENT MATCH (a:A)-[:R]->(b) WITH a, b MATCH (b)-[e:R]->(c) RETURN count(*), sum(a.id), sum(c.id);
+---- 1
+10|30|1030
+-STATEMENT MATCH (a:A)-[:R]->(b) WITH DISTINCT b MATCH (b)-[e:R]->(c) RETURN count(*), sum(c.id);
+---- 1
+10|1030
+-STATEMENT MATCH (a:A)-[:R]->(b) WITH collect(b) AS bs UNWIND bs AS b MATCH (b)-[e:R]->(c) RETURN count(*), sum(c.id);
+---- 1
+10|1030
+-STATEMENT MATCH (a:A)-[:R]->(b) WITH a, b ORDER BY a.id, b.id LIMIT 3 MATCH (b)-[e:R]->(c) RETURN a.id, b.id, c.id ORDER BY 1,2,3;
+---- 3
+1|101|201
+1|201|1
+2|102|202
+-STATEMENT MATCH (a:A)-[:R]->(b) WITH a, b ORDER BY a.id, b.id LIMIT 3 MATCH (b)-[e:R]-(c) RETURN count(*), sum(c.id);
+---- 1
+7|509
+
+-LOG NullBoundNodes
+-STATEMENT MATCH (a:A) OPTIONAL MATCH (a)-[:R]->(b) WHERE a.id <> 3 WITH a, b MATCH (b)-[e:R]->(c) RETURN count(*), sum(a.id), sum(c.id);
+---- 1
+8|24|824
+-STATEMENT MATCH (a:A) OPTIONAL MATCH (a)-[:R]->(b) WHERE a.id <> 2 WITH a, b ORDER BY a.id LIMIT 5 OPTIONAL MATCH (b)-[e:R]->(c) RETURN a.id, b.id, c.id ORDER BY 1,2,3;
+---- 5
+1|101|201
+1|201|1
+2||
+3|103|203
+3|203|3
+-STATEMENT MATCH (a:A) OPTIONAL MATCH (a)-[:R]->(b) WHERE a.id <> 3 WITH a, b OPTIONAL MATCH (b)-[e:R]->(c) RETURN a.id, b.id, c.id ORDER BY 1,2,3;
+---- 9
+1|101|201
+1|201|1
+2|102|202
+2|202|2
+3||
+4|104|204
+4|204|4
+5|105|205
+5|205|5

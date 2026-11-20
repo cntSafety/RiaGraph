@@ -7,12 +7,18 @@
 #include "main/db_config.h"
 #include "parser/expression/parsed_expression_visitor.h"
 #include "parser/expression/parsed_function_expression.h"
+#include "parser/namespace_statement.h"
+#include "parser/query/reading_clause/assert_clause.h"
 #include "parser/query/reading_clause/reading_clause.h"
 #include "parser/query/return_with_clause/with_clause.h"
 #include "parser/standalone_call_function.h"
 
 namespace riag {
 namespace parser {
+
+void StatementReadWriteAnalyzer::visitNamespace(const Statement& statement) {
+    readOnly = statement.constCast<NamespaceStatement>().action == NamespaceAction::USE;
+}
 
 void StatementReadWriteAnalyzer::visitStandaloneCallFunction(const Statement& statement) {
     // Standalone CALL functions are write-classified by default: extensions can register
@@ -43,6 +49,12 @@ void StatementReadWriteAnalyzer::visitExtension(const Statement& /*statement*/) 
 void StatementReadWriteAnalyzer::visitReadingClause(const ReadingClause* readingClause) {
     if (readingClause->hasWherePredicate()) {
         if (!isExprReadOnly(readingClause->getWherePredicate())) {
+            readOnly = false;
+        }
+    }
+    // An ASSERT condition is evaluated like a predicate, e.g. ASSERT nextval('s') > 0 writes.
+    if (readingClause->getClauseType() == common::ClauseType::ASSERT) {
+        if (!isExprReadOnly(readingClause->constCast<AssertClause>().getCondition())) {
             readOnly = false;
         }
     }

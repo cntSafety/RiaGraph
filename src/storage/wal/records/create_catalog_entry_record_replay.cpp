@@ -7,6 +7,7 @@
 #include "catalog/catalog_entry/sequence_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "catalog/catalog_entry/type_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/partition_routing.h"
 #include "storage/index/art_index.h"
 #include "storage/partition_storage_registry.h"
@@ -54,6 +55,24 @@ void WALReplayer::replayCreateCatalogEntryRecord(WALRecord& walRecord) const {
     auto storageManager = StorageManager::Get(clientContext);
     auto& record = walRecord.cast<CreateCatalogEntryRecord>();
     switch (record.ownedCatalogEntry->getType()) {
+    case CatalogEntryType::NAMESPACE_ENTRY:
+    case CatalogEntryType::NAMESPACE_POLICY_ENTRY:
+    case CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY: {
+        auto entry = record.ownedCatalogEntry->constCast<NamespaceCatalogEntry>().copy();
+        if (entry->getType() != CatalogEntryType::NAMESPACE_ENTRY) {
+            entry->tableID =
+                getReplayedEntryID(entry->relationship ? CatalogEntryType::REL_GROUP_ENTRY :
+                                                         CatalogEntryType::NODE_TABLE_ENTRY,
+                    entry->tableID);
+        }
+        const auto tableID = entry->tableID;
+        const bool localPK =
+            entry->getType() == CatalogEntryType::NAMESPACE_POLICY_ENTRY && entry->localPrimaryKey;
+        catalog->getOrCreateNamespaces().replayEntry(transaction, std::move(entry));
+        if (localPK && storageManager->containsTable(tableID)) {
+            storageManager->getTable(tableID)->cast<NodeTable>().enableLocalPrimaryKey();
+        }
+    } break;
     case CatalogEntryType::NODE_TABLE_ENTRY:
     case CatalogEntryType::REL_GROUP_ENTRY: {
         auto& entry = record.ownedCatalogEntry->constCast<TableCatalogEntry>();

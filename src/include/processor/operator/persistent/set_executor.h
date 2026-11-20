@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/data_chunk/data_chunk.h"
 #include "expression_evaluator/expression_evaluator.h"
 #include "processor/execution_context.h"
 #include "processor/result/result_set.h"
@@ -45,6 +46,15 @@ private:
         : table{other.table}, columnID{other.columnID} {}
 };
 
+// What NodeSetExecutor::refreshColumn keeps across rows, so a row costs a lookup and no allocation.
+struct NodeSetRefreshState {
+    std::unique_ptr<common::ValueVector> idVector;
+    std::unique_ptr<common::ValueVector> dataVector;
+    std::unique_ptr<storage::NodeTableScanState> scanState;
+    // The table scanState is set to.
+    const NodeTableSetInfo* tableInfo = nullptr;
+};
+
 class NodeSetExecutor {
 public:
     explicit NodeSetExecutor(NodeSetInfo info) : info{std::move(info)} {}
@@ -55,12 +65,23 @@ public:
 
     void setNodeID(common::nodeID_t nodeID) const;
 
+    // Reads the stored value of the target property into its projected vector. The vector was
+    // filled when the node was scanned, before the SET ran, so a right-hand side reading it would
+    // miss what earlier rows of the statement wrote to the same node.
+    void refreshColumn(ExecutionContext* context);
+
     virtual void set(ExecutionContext* context) = 0;
 
     virtual std::unique_ptr<NodeSetExecutor> copy() const = 0;
 
 protected:
+    // The table and column the property of a node of this table is written to, or nullptr.
+    virtual const NodeTableSetInfo* getTableInfo(common::table_id_t tableID) const = 0;
+
     NodeSetInfo info;
+
+private:
+    std::unique_ptr<NodeSetRefreshState> refreshState;
 };
 
 class SingleLabelNodeSetExecutor final : public NodeSetExecutor {
@@ -74,6 +95,11 @@ public:
 
     std::unique_ptr<NodeSetExecutor> copy() const override {
         return std::make_unique<SingleLabelNodeSetExecutor>(*this);
+    }
+
+protected:
+    const NodeTableSetInfo* getTableInfo(common::table_id_t) const override {
+        return tableInfo.columnID == common::INVALID_COLUMN_ID ? nullptr : &tableInfo;
     }
 
 private:
@@ -91,6 +117,12 @@ public:
 
     std::unique_ptr<NodeSetExecutor> copy() const override {
         return std::make_unique<MultiLabelNodeSetExecutor>(*this);
+    }
+
+protected:
+    const NodeTableSetInfo* getTableInfo(common::table_id_t tableID) const override {
+        const auto it = tableInfos.find(tableID);
+        return it == tableInfos.end() ? nullptr : &it->second;
     }
 
 private:
@@ -137,6 +169,17 @@ private:
     RelTableSetInfo(const RelTableSetInfo& other) : table{other.table}, columnID{other.columnID} {}
 };
 
+// What RelSetExecutor::refreshColumn keeps across rows.
+struct RelSetRefreshState {
+    std::unique_ptr<common::ValueVector> boundNodeIDVector;
+    std::unique_ptr<common::DataChunk> scanChunk;
+    std::vector<common::ValueVector*> outputVectors;
+    std::unique_ptr<storage::RelTableScanState> scanState;
+    // The table scanState is set to, and the direction it scans.
+    const RelTableSetInfo* tableInfo = nullptr;
+    common::RelDataDirection direction = common::RelDataDirection::FWD;
+};
+
 class RelSetExecutor {
 public:
     explicit RelSetExecutor(RelSetInfo info) : info{std::move(info)} {}
@@ -147,12 +190,21 @@ public:
 
     void setRelID(common::nodeID_t relID) const;
 
+    // As NodeSetExecutor::refreshColumn, for a rel.
+    void refreshColumn(ExecutionContext* context);
+
     virtual void set(ExecutionContext* context) = 0;
 
     virtual std::unique_ptr<RelSetExecutor> copy() const = 0;
 
 protected:
+    // The table and column the property of a rel of this table is written to, or nullptr.
+    virtual const RelTableSetInfo* getTableInfo(common::table_id_t tableID) const = 0;
+
     RelSetInfo info;
+
+private:
+    std::unique_ptr<RelSetRefreshState> refreshState;
 };
 
 class SingleLabelRelSetExecutor final : public RelSetExecutor {
@@ -166,6 +218,11 @@ public:
 
     std::unique_ptr<RelSetExecutor> copy() const override {
         return std::make_unique<SingleLabelRelSetExecutor>(*this);
+    }
+
+protected:
+    const RelTableSetInfo* getTableInfo(common::table_id_t) const override {
+        return tableInfo.columnID == common::INVALID_COLUMN_ID ? nullptr : &tableInfo;
     }
 
 private:
@@ -183,6 +240,12 @@ public:
 
     std::unique_ptr<RelSetExecutor> copy() const override {
         return std::make_unique<MultiLabelRelSetExecutor>(*this);
+    }
+
+protected:
+    const RelTableSetInfo* getTableInfo(common::table_id_t tableID) const override {
+        const auto it = tableInfos.find(tableID);
+        return it == tableInfos.end() ? nullptr : &it->second;
     }
 
 private:

@@ -20,6 +20,7 @@ private:
     void visitCreateIndex(const Statement& /*statement*/) override { readOnly = false; }
     void visitCreateType(const Statement& /*statement*/) override { readOnly = false; }
     void visitAlter(const Statement& /*statement*/) override { readOnly = false; }
+    void visitNamespace(const Statement& statement) override;
     void visitCopyFrom(const Statement& /*statement*/) override { readOnly = false; }
     void visitStandaloneCall(const Statement& /*statement*/) override { readOnly = true; }
     void visitStandaloneCallFunction(const Statement& statement) override;

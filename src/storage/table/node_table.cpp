@@ -12,6 +12,8 @@
 #include "common/types/types.h"
 #include "main/client_context.h"
 #include "main/database.h"
+#include "main/database_manager.h"
+#include "storage/index/namespace_primary_key_index.h"
 #include "storage/local_storage/local_node_table.h"
 #include "storage/local_storage/local_storage.h"
 #include "storage/local_storage/local_table.h"
@@ -38,6 +40,17 @@ namespace {
 bool updatesAfterTableWrite(const Index& index) {
     return index.getIndexInfo().indexType == "HNSW";
 }
+
+// Whether an index is a built-in ART secondary index. Unlike the primary-key indexes, which keep
+// a deleted row's entry and leave it to visibility, these are changed in place: COPY, and COMMIT
+// for the rows of local storage, add entries as they append rows, DELETE erases them and SET
+// re-keys them. A rollback must therefore undo those changes itself: an undone append would
+// leave entries behind that point at offsets the next insert reuses, an undone DELETE or SET
+// would leave the row unreachable by its value or reachable by a value it no longer has. Keyed
+// on the type name for the same reason as above.
+bool isArtSecondaryIndex(const Index& index) {
+    return !index.isPrimary() && index.getIndexInfo().indexType == "ART";
+}
 } // namespace
 
 NodeTableVersionRecordHandler::NodeTableVersionRecordHandler(NodeTable* table,
@@ -53,7 +66,7 @@ void NodeTableVersionRecordHandler::applyFuncToChunkedGroups(version_record_hand
 
 void NodeTableVersionRecordHandler::rollbackInsert(main::ClientContext* context,
     node_group_idx_t nodeGroupIdx, row_idx_t startRow, row_idx_t numRows) const {
-    table->rollbackPKIndexInsert(context, startRow, numRows, nodeGroupIdx);
+    table->rollbackIndexInsert(context, startRow, numRows, nodeGroupIdx);
 
     // the only case where a node group would be empty (and potentially removed before) is if an
     // exception occurred while adding its first chunk
@@ -122,11 +135,13 @@ struct UncommittedIndexInserter final : IndexScanHelper {
     std::unique_ptr<Index::InsertState> insertState;
 };
 
-struct RollbackPKDeleter final : IndexScanHelper {
-    RollbackPKDeleter(row_idx_t startNodeOffset, row_idx_t numRows, NodeTable* table,
-        Index* pkIndex)
-        : IndexScanHelper(table, pkIndex),
-          semiMask(SemiMaskUtil::createMask(startNodeOffset + numRows)) {
+// Removes the index entries of rolled-back rows: those of the primary-key index, or those of an
+// ART secondary index (`namespacePK` selects the LOCAL PRIMARY KEY directory's own path).
+struct RollbackIndexDeleter final : IndexScanHelper {
+    RollbackIndexDeleter(row_idx_t startNodeOffset, row_idx_t numRows, NodeTable* table,
+        Index* index, bool namespacePK)
+        : IndexScanHelper(table, index),
+          semiMask(SemiMaskUtil::createMask(startNodeOffset + numRows)), namespacePK{namespacePK} {
         semiMask->maskRange(startNodeOffset, startNodeOffset + numRows);
         semiMask->enable();
     }
@@ -138,12 +153,16 @@ struct RollbackPKDeleter final : IndexScanHelper {
         const std::vector<ValueVector*>& scannedVectors) override;
 
     std::unique_ptr<SemiMask> semiMask;
+    bool namespacePK;
 };
 
 struct CommittedIndexInserter final : IndexScanHelper {
-    CommittedIndexInserter(NodeTable* table, Index* index, visible_func isVisible)
+    // A `semiMask` restricts the insert to the masked rows; without one every visible row is
+    // inserted.
+    CommittedIndexInserter(NodeTable* table, Index* index, visible_func isVisible,
+        SemiMask* semiMask = nullptr)
         : IndexScanHelper(table, index), nodeIDVector(LogicalType::INTERNAL_ID()),
-          isVisible(std::move(isVisible)) {}
+          isVisible(std::move(isVisible)), semiMask{semiMask} {}
 
     std::unique_ptr<NodeTableScanState> initScanState(const Transaction* transaction,
         DataChunk& dataChunk) override;
@@ -154,6 +173,7 @@ struct CommittedIndexInserter final : IndexScanHelper {
     ValueVector nodeIDVector;
     visible_func isVisible;
     std::unique_ptr<Index::InsertState> insertState;
+    SemiMask* semiMask;
 };
 
 std::unique_ptr<NodeTableScanState> UncommittedIndexInserter::initScanState(
@@ -186,6 +206,9 @@ std::unique_ptr<NodeTableScanState> CommittedIndexInserter::initScanState(
     auto scanState = IndexScanHelper::initScanState(transaction, dataChunk);
     nodeIDVector.setState(dataChunk.state);
     scanState->source = TableScanSource::COMMITTED;
+    if (semiMask != nullptr) {
+        scanState->semiMask = semiMask;
+    }
     return scanState;
 }
 
@@ -207,15 +230,15 @@ bool CommittedIndexInserter::processScanOutput(main::ClientContext* context,
     return true;
 }
 
-std::unique_ptr<NodeTableScanState> RollbackPKDeleter::initScanState(const Transaction* transaction,
-    DataChunk& dataChunk) {
+std::unique_ptr<NodeTableScanState> RollbackIndexDeleter::initScanState(
+    const Transaction* transaction, DataChunk& dataChunk) {
     auto scanState = IndexScanHelper::initScanState(transaction, dataChunk);
     scanState->source = TableScanSource::COMMITTED;
     scanState->semiMask = semiMask.get();
     return scanState;
 }
 
-bool RollbackPKDeleter::processScanOutput(main::ClientContext* context,
+bool RollbackIndexDeleter::processScanOutput(main::ClientContext* context,
     NodeGroupScanResult scanResult, const std::vector<ValueVector*>& scannedVectors) {
     (void)context;
     if (scanResult == NODE_GROUP_SCAN_EMPTY_RESULT) {
@@ -223,7 +246,26 @@ bool RollbackPKDeleter::processScanOutput(main::ClientContext* context,
     }
     DASSERT(scannedVectors.size() == 1);
     auto& scannedVector = *scannedVectors[0];
-    index->discardPrimaryKey(&scannedVector);
+    if (namespacePK) {
+        auto* localIndex = static_cast<NamespacePrimaryKeyIndex*>(index);
+        ValueVector key(scannedVector.dataType.copy(), MemoryManager::Get(*context),
+            std::make_shared<DataChunkState>());
+        key.state->setToFlat();
+        key.state->getSelVectorUnsafe().setToUnfiltered(1);
+        for (sel_t i = 0; i < scannedVector.state->getSelSize(); ++i) {
+            const auto pos = scannedVector.state->getSelVector()[i];
+            key.copyFromVectorData(0, &scannedVector, pos);
+            const auto offset = StorageUtils::getStartOffsetOfNodeGroup(currentNodeGroupIdx) +
+                                scanResult.startRow + pos;
+            localIndex->discardAtOffset(Transaction::Get(*context), &key, offset);
+        }
+        return true;
+    }
+    // Discard by (key, offset): a row that failed on a key the table already holds inserted no
+    // entry, and discarding by key alone would remove the existing row's entry instead. For a
+    // secondary index, other rows with an equal key keep their entries for the same reason.
+    index->discardPrimaryKey(&scannedVector,
+        StorageUtils::getStartOffsetOfNodeGroup(currentNodeGroupIdx) + scanResult.startRow);
     return true;
 }
 } // namespace
@@ -271,7 +313,8 @@ NodeTable::NodeTable(const StorageManager* storageManager,
       pkColumnID{nodeTableEntry->getColumnID(nodeTableEntry->getPrimaryKeyName())},
       versionRecordHandler(this, nodeTableEntry->getOwningCatalogName().empty() ?
                                      nullptr :
-                                     nodeTableEntry->getOwningCatalog()) {
+                                     nodeTableEntry->getOwningCatalog()),
+      namespaceOwner{nodeTableEntry->getOwningCatalog()} {
     auto* dataFH = storageManager->getDataFH();
     auto& pageAllocator = *dataFH->getPageManager();
     const auto maxColumnID = nodeTableEntry->getMaxColumnID();
@@ -424,10 +467,16 @@ template bool NodeTable::lookupMultiple<false>(Transaction* transaction,
     TableScanState& scanState) const;
 
 offset_t NodeTable::validateUniquenessConstraint(const Transaction* transaction,
-    const std::vector<ValueVector*>& propertyVectors) const {
+    const std::vector<ValueVector*>& propertyVectors, namespace_id_t namespaceID) const {
     const auto pkVector = propertyVectors[pkColumnID];
     DASSERT(pkVector->state->getSelVector().getSelSize() == 1);
     const auto pkVectorPos = pkVector->state->getSelVector()[0];
+    if (hasLocalPrimaryKey()) {
+        offset_t offset;
+        return lookupPKInNamespace(transaction, pkVector, pkVectorPos, namespaceID, offset) ?
+                   offset :
+                   INVALID_OFFSET;
+    }
     if (offset_t offset = INVALID_OFFSET;
         lookupPK(transaction, propertyVectors[pkColumnID], pkVectorPos, offset)) {
         return offset;
@@ -481,7 +530,20 @@ void NodeTable::insert(Transaction* transaction, TableInsertState& insertState) 
         return;
     }
     const auto localTable = transaction->getLocalStorage()->getOrCreateLocalTable(*this);
-    validatePkNotExists(transaction, const_cast<ValueVector*>(&nodeInsertState.pkVector));
+    if (hasLocalPrimaryKey()) {
+        auto* key = const_cast<ValueVector*>(&nodeInsertState.pkVector);
+        const auto pos = key->state->getSelVector()[0];
+        offset_t existing;
+        if (key->isNull(pos)) {
+            throw RuntimeException(ExceptionMessage::nullPKException());
+        }
+        if (!transaction->isRecovery() &&
+            lookupPKInNamespace(transaction, key, pos, nodeInsertState.namespaceID, existing)) {
+            throw RuntimeException("Duplicate LOCAL primary key in the destination namespace.");
+        }
+    } else {
+        validatePkNotExists(transaction, const_cast<ValueVector*>(&nodeInsertState.pkVector));
+    }
     localTable->insert(transaction, insertState);
     for (auto i = 0u; i < indexes.size(); i++) {
         // Skip unloaded (orphaned) index holders; getIndex() would return a null pointer
@@ -556,6 +618,9 @@ void NodeTable::update(Transaction* transaction, TableUpdateState& updateState) 
         if (!nodeUpdateState.needToUpdateIndex(i) || updatesAfterTableWrite(*index)) {
             continue;
         }
+        if (isArtSecondaryIndex(*index)) {
+            trackSecondaryIndexChange(transaction, nodeOffset);
+        }
         index->update(transaction, nodeUpdateState.nodeIDVector, nodeUpdateState.propertyVector,
             *nodeUpdateState.indexUpdateState[i]);
     }
@@ -609,6 +674,9 @@ bool NodeTable::delete_(Transaction* transaction, TableDeleteState& deleteState)
         if (!index.isLoaded()) {
             continue;
         }
+        if (isArtSecondaryIndex(*index.getIndex())) {
+            trackSecondaryIndexChange(transaction, nodeOffset);
+        }
         auto indexDeleteState = index.getIndex()->initDeleteState(transaction, memoryManager,
             getVisibleFunc(transaction));
         index.getIndex()->delete_(transaction, nodeDeleteState.nodeIDVector, *indexDeleteState);
@@ -627,6 +695,9 @@ bool NodeTable::delete_(Transaction* transaction, TableDeleteState& deleteState)
         }
     }
     if (isDeleted) {
+        if (namespaceOwner && namespaceOwner->getNamespaces()) {
+            clearNamespaceMembership(transaction, nodeOffset, deleteState);
+        }
         setHasChanges();
         if (deleteState.logToWAL && transaction->shouldLogToWAL()) {
             DASSERT(transaction->isWriteTransaction());
@@ -822,17 +893,113 @@ bool NodeTable::checkpoint(main::ClientContext* context, TableCatalogEntry* tabl
     return true;
 }
 
-void NodeTable::rollbackPKIndexInsert(main::ClientContext* context, row_idx_t startRow,
+void NodeTable::rollbackIndexInsert(main::ClientContext* context, row_idx_t startRow,
     row_idx_t numRows_, node_group_idx_t nodeGroupIdx_) {
-    auto* pkIndex = tryGetPrimaryKeyIndex();
-    if (!pkIndex) {
-        return;
-    }
     const row_idx_t startNodeOffset =
         startRow + StorageUtils::getStartOffsetOfNodeGroup(nodeGroupIdx_);
+    if (auto* pkIndex = tryGetPrimaryKeyIndex()) {
+        RollbackIndexDeleter pkDeleter{startNodeOffset, numRows_, this, pkIndex,
+            hasLocalPrimaryKey()};
+        scanIndexColumns(context, pkDeleter, *nodeGroups);
+    }
+    for (auto& indexHolder : indexes) {
+        if (!indexHolder.isLoaded() || !isArtSecondaryIndex(*indexHolder.getIndex())) {
+            continue;
+        }
+        RollbackIndexDeleter deleter{startNodeOffset, numRows_, this, indexHolder.getIndex(),
+            false /*namespacePK*/};
+        scanIndexColumns(context, deleter, *nodeGroups);
+    }
+}
 
-    RollbackPKDeleter pkDeleter{startNodeOffset, numRows_, this, pkIndex};
-    scanIndexColumns(context, pkDeleter, *nodeGroups);
+// DELETE and SET change the ART secondary indexes in place, and the undo buffer only restores the
+// table. The first change of a write transaction registers a rollback callback, which runs after
+// the undo buffer, and later changes add their rows to the same list.
+void NodeTable::trackSecondaryIndexChange(Transaction* transaction, offset_t nodeOffset) {
+    if (!transaction->shouldAppendToUndoBuffer()) {
+        return;
+    }
+    const auto transactionID = transaction->getID();
+    std::shared_ptr<std::vector<offset_t>> offsets;
+    {
+        std::lock_guard lck{secondaryIndexChangesMtx};
+        auto& entry = secondaryIndexChanges[transactionID];
+        if (entry) {
+            entry->push_back(nodeOffset);
+            return;
+        }
+        entry = std::make_shared<std::vector<offset_t>>(1, nodeOffset);
+        offsets = entry;
+    }
+    // A table of a graph catalog is only touched while that graph is alive, as the undo buffer
+    // does for its records (applyIfOwnerGraphAlive).
+    auto* ownerCatalog = versionRecordHandler.getOwnerCatalog();
+    transaction->pushRollbackCallback([this, offsets, transactionID, ownerCatalog](
+                                          Transaction& rolledBack) {
+        const auto restore = [&]() {
+            restoreSecondaryIndexEntries(rolledBack, *offsets);
+            std::lock_guard lck{secondaryIndexChangesMtx};
+            secondaryIndexChanges.erase(transactionID);
+        };
+        if (ownerCatalog == nullptr) {
+            restore();
+        } else if (auto* dbManager = main::DatabaseManager::Get(*rolledBack.getClientContext())) {
+            dbManager->withGraphCatalogIfAlive(ownerCatalog, restore);
+        }
+    });
+    transaction->pushCommitCallback([this, transactionID, ownerCatalog](Transaction& committed) {
+        const auto forget = [&]() {
+            std::lock_guard lck{secondaryIndexChangesMtx};
+            secondaryIndexChanges.erase(transactionID);
+        };
+        if (ownerCatalog == nullptr) {
+            forget();
+        } else if (auto* dbManager = main::DatabaseManager::Get(*committed.getClientContext())) {
+            dbManager->withGraphCatalogIfAlive(ownerCatalog, forget);
+        }
+    });
+}
+
+// Rebuilds the ART secondary-index entries of the given rows after their transaction was rolled
+// back. By then the undo buffer has restored the rows' values, revived the deleted rows and
+// truncated the appended ones, so the entries are re-derived from the rows instead of replaying
+// the changes backwards: every entry of each row is dropped, and the rows that still exist are
+// inserted again with the values they now hold.
+void NodeTable::restoreSecondaryIndexEntries(Transaction& transaction,
+    const std::vector<offset_t>& changedOffsets) {
+    auto offsets = changedOffsets;
+    std::sort(offsets.begin(), offsets.end());
+    offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+    if (offsets.empty()) {
+        return;
+    }
+    auto* context = transaction.getClientContext();
+    const auto rows = SemiMaskUtil::createMask(offsets.back() + 1);
+    for (const auto offset : offsets) {
+        rows->mask(offset);
+    }
+    rows->enable();
+    const auto state = std::make_shared<DataChunkState>();
+    ValueVector nodeIDVector{LogicalType::INTERNAL_ID()};
+    nodeIDVector.setState(state);
+    for (auto& indexHolder : indexes) {
+        if (!indexHolder.isLoaded() || !isArtSecondaryIndex(*indexHolder.getIndex())) {
+            continue;
+        }
+        auto* index = indexHolder.getIndex();
+        const auto deleteState =
+            index->initDeleteState(&transaction, memoryManager, getVisibleFunc(&transaction));
+        for (auto start = 0u; start < offsets.size(); start += DEFAULT_VECTOR_CAPACITY) {
+            const auto size = std::min<uint64_t>(DEFAULT_VECTOR_CAPACITY, offsets.size() - start);
+            state->getSelVectorUnsafe().setToUnfiltered(size);
+            for (auto i = 0u; i < size; ++i) {
+                nodeIDVector.setValue<nodeID_t>(i, nodeID_t{offsets[start + i], tableID});
+            }
+            index->delete_(&transaction, nodeIDVector, *deleteState);
+        }
+        CommittedIndexInserter inserter{this, index, getVisibleFunc(&transaction), rows.get()};
+        scanIndexColumns(context, inserter, *nodeGroups);
+    }
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const): Semantically non-const.
@@ -853,6 +1020,9 @@ void NodeTable::finalizeCheckpoint(main::ClientContext& context) {
     // never calls it from the checkpoint path.
     if (auto* pkIndex = tryGetPKIndex()) {
         pkIndex->finalize(&context);
+    }
+    if (namespacePKIndex) {
+        namespacePKIndex->finalize(&context);
     }
 }
 
@@ -1017,6 +1187,102 @@ bool NodeTable::lookupPK(const Transaction* transaction, ValueVector* keyVector,
     std::vector<ColumnPredicateSet> predicateSets;
     predicateSets.push_back(std::move(predicateSet));
     return scanPKColumn(transaction, *keyToLookup, std::move(predicateSets), result);
+}
+
+void NodeTable::enableLocalPrimaryKey() {
+    if (namespacePKIndex) {
+        return;
+    }
+    if (nodeGroups->getNumTotalRows() != 0) {
+        throw RuntimeException("LOCAL primary-key mode cannot be changed on an existing table.");
+    }
+    for (auto it = indexes.begin(); it != indexes.end();) {
+        if (it->getIndexInfo().isPrimary) {
+            droppedIndexes.push_back(std::move(*it));
+            it = indexes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    IndexInfo info{PrimaryKeyIndex::DEFAULT_NAME, NamespacePrimaryKeyIndex::getIndexType().typeName,
+        tableID, {pkColumnID}, {getColumn(pkColumnID).getDataType().getPhysicalType()}, true, true};
+    auto index =
+        std::make_unique<NamespacePrimaryKeyIndex>(std::move(info), storageManager, memoryManager);
+    namespacePKIndex = index.get();
+    indexes.emplace_back(std::move(index));
+}
+
+bool NodeTable::lookupPKInNamespace(const Transaction* transaction, ValueVector* key,
+    uint64_t position, namespace_id_t namespaceID, offset_t& result) const {
+    if (!hasLocalPrimaryKey()) {
+        return lookupPK(transaction, key, position, result);
+    }
+    if (transaction->getLocalStorage()) {
+        if (auto* local = transaction->getLocalStorage()->getLocalTable(*this);
+            local && local->cast<LocalNodeTable>().lookupPKInNamespace(transaction, key, position,
+                         namespaceID, result)) {
+            return true;
+        }
+    }
+    return namespacePKIndex->lookupNamespace(transaction, key, position, namespaceID, result,
+        [&](offset_t offset) { return isVisibleNoLock(transaction, offset); });
+}
+
+bool NodeTable::lookupPKInNamespaces(const Transaction* transaction, ValueVector* key,
+    uint64_t position, const NamespaceSet& scope, std::vector<offset_t>& results) const {
+    if (!hasLocalPrimaryKey()) {
+        offset_t offset;
+        if (lookupPK(transaction, key, position, offset)) {
+            results.push_back(offset);
+        }
+        return !results.empty();
+    }
+    if (transaction->getLocalStorage()) {
+        if (auto* local = transaction->getLocalStorage()->getLocalTable(*this)) {
+            local->cast<LocalNodeTable>().lookupPKInNamespaces(transaction, key, position, scope,
+                results);
+        }
+    }
+    return namespacePKIndex->lookupNamespaces(transaction, key, position, scope, results,
+        [&](offset_t offset) { return isVisibleNoLock(transaction, offset); });
+}
+
+void NodeTable::moveNamespace(Transaction* transaction, offset_t offset,
+    namespace_id_t destination) {
+    if (!hasLocalPrimaryKey()) {
+        return;
+    }
+    catalog::NamespaceReadState memberships(namespaceOwner->getNamespaces(), transaction, tableID);
+    if (memberships.get(offset) == destination) {
+        return;
+    }
+    ValueVector id(LogicalType::INTERNAL_ID());
+    auto data = constructDataChunkForColumns({pkColumnID});
+    id.setState(data.state);
+    data.state->setToFlat();
+    data.state->getSelVectorUnsafe().setToUnfiltered(1);
+    id.setValue<nodeID_t>(0, {offset, tableID});
+    NodeTableScanState scan(&id, {&data.getValueVectorMutable(0)}, data.state);
+    scan.setToTable(transaction, this, {pkColumnID}, {});
+    initScanState(transaction, scan, tableID, offset);
+    if (!lookup(transaction, scan)) {
+        return;
+    }
+    auto& key = data.getValueVectorMutable(0);
+    offset_t existing;
+    if (lookupPKInNamespace(transaction, &key, 0, destination, existing) && existing != offset) {
+        throw RuntimeException("Duplicate LOCAL primary key in the destination namespace.");
+    }
+    if (transaction->isUnCommitted(*this, offset)) {
+        transaction->getLocalStorage()
+            ->getLocalTable(*this)
+            ->cast<LocalNodeTable>()
+            .insertNamespaceKey(transaction, key, offset, destination);
+    } else {
+        namespacePKIndex->insertNamespace(transaction, &key, 0, offset, destination,
+            [&](offset_t existingOffset) { return isVisibleNoLock(transaction, existingOffset); });
+    }
+    setHasChanges();
 }
 
 bool NodeTable::lookupPKRange(const Transaction* transaction, ValueVector* lowerBoundVector,
@@ -1248,6 +1514,9 @@ void NodeTable::deserialize(main::ClientContext* context, StorageManager* storag
             storageInfoBufferSizes[i]));
         if (indexInfos[i].isBuiltin) {
             indexes[i].load(context, storageManager);
+            if (indexInfos[i].indexType == NamespacePrimaryKeyIndex::getIndexType().typeName) {
+                namespacePKIndex = static_cast<NamespacePrimaryKeyIndex*>(indexes[i].getIndex());
+            }
         }
     }
 }
@@ -1257,8 +1526,10 @@ void NodeTable::applySemiMaskFilter(const TableScanState& state, row_idx_t start
     if (!state.semiMask || !state.semiMask->isEnabled()) {
         return;
     }
-    applySemiMaskFilter(state.semiMask->range(startOffset, startOffset + numRowsToScan),
-        startOffset, selVector);
+    auto range = state.semiMask->getRange(startOffset, startOffset + numRowsToScan);
+    if (!range.allSelected) {
+        applySemiMaskFilter(range.offsets, startOffset, selVector);
+    }
 }
 
 void NodeTable::applySemiMaskFilter(const offset_vec_t& arr, row_idx_t startOffset,

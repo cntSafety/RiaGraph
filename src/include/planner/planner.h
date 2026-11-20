@@ -137,6 +137,7 @@ public:
     LogicalPlan planUseDatabase(const binder::BoundStatement& statement);
     LogicalPlan planCreateGraph(const binder::BoundStatement& statement);
     LogicalPlan planUseGraph(const binder::BoundStatement& statement);
+    LogicalPlan planNamespace(const binder::BoundStatement& statement);
     LogicalPlan planExtensionClause(const binder::BoundStatement& statement);
 
     // Plan copy.
@@ -165,6 +166,7 @@ public:
     void planReadOp(std::shared_ptr<LogicalOperator> op,
         const binder::expression_vector& predicates, LogicalPlan& plan);
     void planLoadFrom(const binder::BoundReadingClause& readingClause, LogicalPlan& plan);
+    void planAssertClause(const binder::BoundReadingClause& readingClause, LogicalPlan& plan);
 
     // Plan updating
     void planUpdatingClause(const binder::BoundUpdatingClause& updatingClause, LogicalPlan& plan);
@@ -415,6 +417,8 @@ public:
 
     void appendFilters(const binder::expression_vector& predicates, LogicalPlan& plan);
     void appendFilter(const std::shared_ptr<binder::Expression>& predicate, LogicalPlan& plan);
+    void appendAssert(const std::shared_ptr<binder::Expression>& condition, std::string message,
+        LogicalPlan& plan);
 
     void appendTableFunctionCall(const binder::BoundTableScanInfo& info, LogicalPlan& plan);
 

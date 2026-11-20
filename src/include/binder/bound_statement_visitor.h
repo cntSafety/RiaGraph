@@ -48,6 +48,7 @@ protected:
     virtual void visitUnwind(const BoundReadingClause& /*readingClause*/) {}
     virtual void visitTableFunctionCall(const BoundReadingClause&) {}
     virtual void visitLoadFrom(const BoundReadingClause& /*statement*/) {}
+    virtual void visitAssert(const BoundReadingClause& /*readingClause*/) {}
     void visitUpdatingClause(const BoundUpdatingClause& updatingClause);
     virtual void visitSet(const BoundUpdatingClause& /*updatingClause*/) {}
     virtual void visitDelete(const BoundUpdatingClause& /* updatingClause*/) {}
@@ -61,6 +62,7 @@ protected:
     virtual void visitUseDatabase(const BoundStatement&) {}
     virtual void visitCreateGraph(const BoundStatement&) {}
     virtual void visitUseGraph(const BoundStatement&) {}
+    virtual void visitNamespace(const BoundStatement&) {}
     virtual void visitStandaloneCallFunction(const BoundStatement&) {}
     virtual void visitExtensionClause(const BoundStatement&) {}
 };

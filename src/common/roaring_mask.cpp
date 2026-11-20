@@ -1,5 +1,7 @@
 #include "common/roaring_mask.h"
 
+#include <limits>
+
 namespace riag {
 namespace common {
 
@@ -17,7 +19,10 @@ offset_vec_t Roaring32BitmapSemiMask::collectMaskedNodes(uint64_t size) const {
     return result;
 }
 
-offset_vec_t Roaring32BitmapSemiMask::range(uint32_t start, uint32_t end) {
+offset_vec_t Roaring32BitmapSemiMask::range(offset_t start, offset_t end) {
+    if (start > std::numeric_limits<uint32_t>::max()) {
+        return {};
+    }
     auto it = roaring->begin();
     it.move_equalorlarger(start);
     offset_vec_t ans;
@@ -45,7 +50,7 @@ offset_vec_t Roaring64BitmapSemiMask::collectMaskedNodes(uint64_t size) const {
     return result;
 }
 
-offset_vec_t Roaring64BitmapSemiMask::range(uint32_t start, uint32_t end) {
+offset_vec_t Roaring64BitmapSemiMask::range(offset_t start, offset_t end) {
     auto it = roaring->begin();
     it.move_equalorlarger(start);
     offset_vec_t ans;

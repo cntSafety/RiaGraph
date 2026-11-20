@@ -171,7 +171,12 @@ public:
         std::vector<common::offset_t>& /*results*/, visible_func /*isVisible*/) {
         return false;
     }
-    virtual void discardPrimaryKey(common::ValueVector* /*keyVector*/) {
+    // Rollback of a bulk insert: removes the entry that the row `firstOffset + pos` inserted for
+    // the key at each selected position `pos`. An entry that another row holds for an equal key
+    // stays, since a row whose key collided with an existing one inserted nothing. Also called
+    // for ART secondary indexes, whose keys need not be unique (NodeTable::rollbackIndexInsert).
+    virtual void discardPrimaryKey(common::ValueVector* /*keyVector*/,
+        common::offset_t /*firstOffset*/) {
         // DO NOTHING.
     }
     virtual bool needCommitInsert() const { return false; }

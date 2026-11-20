@@ -60,6 +60,8 @@ LogicalPlan Planner::planExportDatabase(const BoundStatement& statement) {
     auto exportDatabase =
         std::make_shared<LogicalExportDatabase>(boundExportDatabase.getBoundFileInfo()->copy(),
             std::move(logicalOperators), boundExportDatabase.exportSchemaOnly());
+    exportDatabase->namespaceAware = boundExportDatabase.namespaceAware;
+    exportDatabase->namespaceImport = boundExportDatabase.getNamespaceImport();
     plan.setLastOperator(std::move(exportDatabase));
     return plan;
 }

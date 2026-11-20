@@ -1,6 +1,9 @@
 # Upstream integration plan — ladybug 0.20.2 → 0.21.2 (October 2026)
 
 **Status:** Waves 1-5 applied and verified on `upstream/integration-2026-10` (2026-10-04), reviewed and finalized 2026-10-05; see §11 for the outcome. **Date:** 2026-10-03.
+**Last round:** upstream integration ended on 2026-11-18 (decision D1 in
+[riagraph-fork-plan.md](riagraph-fork-plan.md), as revised). Nothing listed here as deferred or
+not selected will be picked; a defect behind one of those commits is fixed in RiaGraph directly.
 **Range reviewed:** `191b90ca3` (fork point, ladybug 0.20.2) .. `c473940c7` (ladybug `main`, 0.21.2) —
 151 core commits, plus the binding and extension submodule commits those bumps carry.
 **Scope decisions:** bug fixes, hardening and generic performance first. The LDBC/LSQB planner

@@ -137,6 +137,11 @@ public:
         const common::LogicalType& targetType);
     std::shared_ptr<Expression> forceCast(const std::shared_ptr<Expression>& expression,
         const common::LogicalType& targetType);
+    // Casts a map literal (a STRUCT_PACK call) to a STRUCT type by re-packing its arguments under
+    // the target's field names, each cast on its own. Returns nullptr when the expression is not
+    // a map literal or has a key the target does not have.
+    std::shared_ptr<Expression> tryRepackStructLiteral(
+        const std::shared_ptr<Expression>& expression, const common::LogicalType& targetType);
 
     // Parameter
     void addParameter(const std::string& name, std::shared_ptr<common::Value> value);

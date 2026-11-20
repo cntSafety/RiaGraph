@@ -16,6 +16,8 @@ namespace common {
 class RIAG_API Serializer {
 public:
     explicit Serializer(std::shared_ptr<Writer> writer) : writer(std::move(writer)) {}
+    void setStorageVersion(uint64_t version) { storageVersion = version; }
+    uint64_t getStorageVersion() const { return storageVersion; }
 
     template<typename T>
         requires std::is_trivially_destructible_v<T> || std::is_same_v<std::string, T>
@@ -117,6 +119,7 @@ public:
 
 private:
     std::shared_ptr<Writer> writer;
+    uint64_t storageVersion = 0;
 };
 
 template<>

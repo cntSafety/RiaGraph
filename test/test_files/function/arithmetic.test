@@ -551,3 +551,19 @@
 ---- 1
 18446744065119617025
 
+
+-LOG factorialLargestInt64
+-STATEMENT RETURN 20!, factorial(20), 0!, 1!
+---- 1
+2432902008176640000|2432902008176640000|1|1
+-LOG factorialOverflowInt64
+-STATEMENT RETURN 21!
+---- error
+Overflow exception: Value 21! is not within INT64 range.
+-STATEMENT RETURN factorial(25)
+---- error
+Overflow exception: Value 25! is not within INT64 range.
+-LOG factorialUnboundedLoop
+-STATEMENT RETURN 9223372036854775807!
+---- error
+Overflow exception: Value 9223372036854775807! is not within INT64 range.

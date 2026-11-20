@@ -147,8 +147,12 @@ static std::vector<ParsedNativeGraphTableInfo> extractGraphEntryTableInfos(const
     return infos;
 }
 
-static std::unique_ptr<TableFuncBindData> bindFunc(const main::ClientContext*,
+static std::unique_ptr<TableFuncBindData> bindFunc(const main::ClientContext* context,
     const TableFuncBindInput* input) {
+    if (!context->getNamespaceSelection().isUnrestricted()) {
+        throw BinderException("Native graph projection requires an unrestricted namespace "
+                              "selection in this version.");
+    }
     auto graphName = input->getLiteralVal<std::string>(0);
     auto nodeInfos = extractGraphEntryTableInfos(input->getValue(1));
     auto relInfos = extractGraphEntryTableInfos(input->getValue(2));

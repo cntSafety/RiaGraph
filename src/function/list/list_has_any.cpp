@@ -1,6 +1,7 @@
 #include "common/exception/binder.h"
 #include "common/exception/message.h"
 #include "common/type_utils.h"
+#include "function/list/functions/list_function_utils.h"
 #include "function/list/functions/list_position_function.h"
 #include "function/list/vector_list_functions.h"
 #include "function/scalar_function.h"
@@ -44,6 +45,7 @@ static std::unique_ptr<FunctionBindData> bindFunc(const ScalarBindFuncInput& inp
             types.push_back(arg->dataType.copy());
         }
     }
+    ListFunctionUtils::combineMapElementTypes(types, false /* rightIsElement */);
     if (types[0] != types[1]) {
         throw common::BinderException(ExceptionMessage::listFunctionIncompatibleChildrenType(
             ListHasAnyFunction::name, input.arguments[0]->getDataType().toString(),

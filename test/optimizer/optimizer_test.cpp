@@ -3,6 +3,8 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -16,6 +18,7 @@
 #include "graph_test/private_graph_test.h"
 #include "optimizer/remove_unnecessary_distinct_optimizer.h"
 #include "planner/join_order/cost_model.h"
+#include "planner/operator/logical_distinct.h"
 #include "planner/operator/logical_filter.h"
 #include "planner/operator/logical_intersect.h"
 #include "planner/operator/logical_plan_util.h"
@@ -417,6 +420,76 @@ TEST_F(OptimizerTest, IntersectBuildSideMasksProbeScan) {
     EXPECT_EQ(getCount(*conn->query(taggedQuery)), 16);
 }
 
+// The scans and extends that a semi mask narrows and that have an update (SET, CREATE, MERGE,
+// DELETE) above them: the update would apply to only the rows the mask keeps.
+static void collectMaskedUnderUpdate(planner::LogicalOperator* op, bool underUpdate,
+    std::unordered_set<const planner::LogicalOperator*>& underUpdateOps) {
+    if (underUpdate) {
+        underUpdateOps.insert(op);
+    }
+    underUpdate = underUpdate || planner::LogicalOperatorUtils::isUpdate(op->getOperatorType());
+    for (auto i = 0u; i < op->getNumChildren(); ++i) {
+        collectMaskedUnderUpdate(op->getChild(i).get(), underUpdate, underUpdateOps);
+    }
+}
+
+static size_t countMaskTargetsUnderUpdate(planner::LogicalOperator* root) {
+    using planner::LogicalOperatorType;
+    std::unordered_set<const planner::LogicalOperator*> underUpdateOps;
+    collectMaskedUnderUpdate(root, false, underUpdateOps);
+    std::vector<planner::LogicalOperator*> maskers;
+    collectOperators(root, LogicalOperatorType::SEMI_MASKER, maskers);
+    size_t result = 0;
+    for (auto masker : maskers) {
+        for (auto target : masker->constCast<planner::LogicalSemiMasker>().getTargetOperators()) {
+            result += underUpdateOps.contains(target);
+        }
+    }
+    return result;
+}
+
+static bool planHasSemiMasker(const std::string& query, main::Connection& conn) {
+    return conn.query("EXPLAIN " + query)->toString().find("SEMI_MASKER") != std::string::npos;
+}
+
+// A write below a join must see every row it is given, so no semi mask may narrow a scan under it
+// (cntSafety/RiaGraph#122). Masks that do not sit under the write stay: a point write followed
+// by a traversal is seeded by the write's keys (build-to-probe) instead of scanning the rel table.
+TEST_F(OptimizerTest, WriteBelowJoinIsNotMasked) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE SipT(id INT64, v INT64, PRIMARY KEY(id));"
+                            "CREATE REL TABLE SipR(FROM SipT TO SipT);"
+                            "COPY SipT FROM (UNWIND range(0, 19999) AS i RETURN i, 0);"
+                            "COPY SipR FROM (UNWIND range(0, 199999) AS i "
+                            "RETURN i % 20000, (i * 7919 + 13) % 20000);")
+                    ->isSuccess());
+    const std::string tail = " WITH a MATCH (a)-[:SipR]->(b:SipT) RETURN b.v";
+    // Without a write the join is masked.
+    EXPECT_TRUE(planHasSemiMasker("MATCH (a:SipT) WHERE a.id < 10" + tail, *conn));
+
+    for (const std::string write : {"SET a.v = 1", "CREATE (:SipT {id: 100 + a.id})",
+             "MERGE (:SipT {id: 100 + a.id})", "SET a.v = 1 WITH a SET a.v = 2"}) {
+        const auto query = "MATCH (a:SipT) " + write + tail;
+        auto plan = TestRunner::getLogicalPlan(query, *conn);
+        EXPECT_EQ(countMaskTargetsUnderUpdate(plan->getLastOperator().get()), 0u) << query;
+    }
+    // A selective write is the cheap build side of the join: its keys mask the probe side's scan
+    // of the written node, which is not under the write.
+    for (const std::string match : {"MATCH (a:SipT {id: 1}) ", "MATCH (a:SipT) WHERE a.id < 10 "}) {
+        for (const std::string write : {"SET a.v = 1", "SET a.v = 1 WITH a SET a.v = 2"}) {
+            const auto query = match + write + tail;
+            auto plan = TestRunner::getLogicalPlan(query, *conn);
+            EXPECT_EQ(countMaskTargetsUnderUpdate(plan->getLastOperator().get()), 0u) << query;
+            EXPECT_TRUE(planHasSemiMasker(query, *conn)) << query;
+        }
+    }
+    const auto traverse =
+        "MATCH (a:SipT {id: 1}) SET a.v = 1 WITH a MATCH (a)-[:SipR*1..2]->(b:SipT) RETURN b.v";
+    EXPECT_TRUE(planHasSemiMasker(traverse, *conn));
+    EXPECT_EQ(countMaskTargetsUnderUpdate(
+                  TestRunner::getLogicalPlan(traverse, *conn)->getLastOperator().get()),
+        0u);
+}
+
 TEST_F(OptimizerTest, IndexScanTest) {
     auto q1 = "MATCH (a:person) "
               "WHERE a.ID = 0 AND a.fName='Alice' "
@@ -446,6 +519,25 @@ TEST_F(OptimizerTest, RemoveUnnecessaryJoinTest) {
               "HINT (a JOIN e) JOIN b "
               "RETURN e.date;";
     ASSERT_STREQ(getEncodedPlan(q1).c_str(), "E(b)S(a)");
+}
+
+// The join with the scan of an already bound node is redundant only if the bound node cannot be
+// NULL: the join would drop such rows and the bare scan cannot produce them. An OPTIONAL MATCH
+// leaves the node NULL where it found nothing, so the join must stay above it.
+TEST_F(OptimizerTest, RemoveUnnecessaryJoinKeepsJoinOnNullableKey) {
+    // The key comes from an EXTEND: never NULL, the join goes.
+    auto q1 = "MATCH (a:person)-[e:knows]->(b:person) RETURN e.date;";
+    ASSERT_STREQ(getEncodedPlan(q1).c_str(), "E(b)S(a)");
+    // The same join inside the OPTIONAL MATCH is removed as well.
+    auto q2 = "MATCH (a:person) OPTIONAL MATCH (a)-[e:knows]->(b:person) RETURN e.date;";
+    ASSERT_STREQ(getEncodedPlan(q2).c_str(), "HJ(a._ID){S(a)}{HJ(a._ID){E(b)S(a)}{}}");
+    // b is NULL for the persons without a friend, so the join with the scan of b stays.
+    auto q3 = "MATCH (a:person) OPTIONAL MATCH (a)-[e:knows]->(b) MATCH (b:person) RETURN a.ID;";
+    ASSERT_STREQ(getEncodedPlan(q3).c_str(),
+        "HJ(b._ID){HJ(a._ID){S(a)}{HJ(a._ID){E(b)S(a)}{}}}{S(b)}");
+    auto q4 = "MATCH (a:person) OPTIONAL MATCH (a)-[e:knows]->(b) WITH a, b MATCH (b) RETURN a.ID;";
+    ASSERT_STREQ(getEncodedPlan(q4).c_str(),
+        "HJ(b._ID){HJ(a._ID){S(a)}{HJ(a._ID){E(b)S(a)}{}}}{S(b)}");
 }
 
 TEST_F(OptimizerTest, RemoveUnnecessaryJoinNullableKeyTest) {
@@ -754,7 +846,7 @@ TEST_F(OptimizerTest, CountRelTableOptimizer) {
 
     // A CSR-declared bound node with a primary-key equality filter must not route constant SUM
     // into the RelDegreeTable rewrite: that path writes the raw degree as INT64 and can neither
-    // apply the constant multiplier nor preserve SUM's NULL-on-empty semantics. Data must be
+    // apply the constant multiplier nor produce SUM's result type. Data must be
     // inserted before the CSR declaration; mutations afterwards invalidate the rewrite gate.
     ASSERT_TRUE(
         conn->query("CREATE NODE TABLE opt_csr_user(id INT64, PRIMARY KEY(id));")->isSuccess());
@@ -779,9 +871,8 @@ TEST_F(OptimizerTest, CountRelTableOptimizer) {
     ASSERT_EQ(resultSumPkFilter->getNext()->getValue(0)->getValue<common::int128_t>(),
         common::int128_t{int64_t{2}});
 
-    // SUM over an empty input is NULL, unlike COUNT(*) * c.
-
-    // SUM over an empty input is NULL, unlike COUNT(*) * c. Verify both rewrite shapes preserve it.
+    // SUM over an empty input is its zero, not NULL (openCypher, #192). Verify both rewrite
+    // shapes give the zero of SUM's result type.
     ASSERT_TRUE(
         conn->query("CREATE REL TABLE opt_empty_follows(FROM opt_user TO opt_user);")->isSuccess());
     for (auto expression : {"SUM(1)", "SUM(10)", "SUM(2.5)"}) {
@@ -792,7 +883,15 @@ TEST_F(OptimizerTest, CountRelTableOptimizer) {
             planner::LogicalOperatorType::COUNT_REL_TABLE));
         auto result = conn->query(query);
         ASSERT_TRUE(result->isSuccess());
-        ASSERT_TRUE(result->getNext()->getValue(0)->isNull());
+        auto value = result->getNext()->getValue(0);
+        ASSERT_FALSE(value->isNull());
+        if (std::string_view{expression} == "SUM(2.5)") {
+            ASSERT_EQ(value->getDataType().getLogicalTypeID(), common::LogicalTypeID::DOUBLE);
+            ASSERT_DOUBLE_EQ(value->getValue<double>(), 0.0);
+        } else {
+            ASSERT_EQ(value->getDataType().getLogicalTypeID(), common::LogicalTypeID::INT128);
+            ASSERT_EQ(value->getValue<common::int128_t>(), common::int128_t{int64_t{0}});
+        }
     }
 
     // Test active-write degree queries over native rel tables.
@@ -1970,6 +2069,80 @@ TEST_F(OptimizerTest, BoolFoldingFlattensAnAndItProduces) {
     auto* filter = findFilter(plan->getLastOperator().get());
     ASSERT_NE(filter, nullptr);
     ASSERT_EQ(filter->getPredicate()->toString(), "EQUALS(a.age,5)");
+}
+
+// A LIMIT, a DISTINCT the limit push-down caps, and a cross product with an empty build side stop
+// pulling from their input early. A write in that pipeline applied to only some of its rows
+// (cntSafety/RiaGraph#120, #121), so the planner materializes the write's output first. Plans
+// without a write keep streaming into these operators.
+TEST_F(OptimizerTest, ReadOnlyEarlyStopIsNotMaterialized) {
+    using planner::LogicalOperatorType;
+    for (auto query :
+        {"MATCH (a:person) RETURN a.ID LIMIT 1", "MATCH (a:person) RETURN a.ID SKIP 1 LIMIT 2",
+            "MATCH (a:person) WITH a LIMIT 1 RETURN a.ID",
+            "MATCH (a:person) WITH a CALL show_tables() RETURN a.ID"}) {
+        auto plan = getRoot(query);
+        EXPECT_FALSE(
+            hasOperatorType(plan->getLastOperator().get(), LogicalOperatorType::ACCUMULATE))
+            << query << "\n"
+            << plan->toString();
+    }
+    // The limit push-down still caps a read-only DISTINCT.
+    auto plan = getRoot("MATCH (a:person) RETURN DISTINCT a.age LIMIT 1");
+    std::vector<planner::LogicalOperator*> distincts;
+    collectOperators(plan->getLastOperator().get(), LogicalOperatorType::DISTINCT, distincts);
+    ASSERT_EQ(distincts.size(), 1u);
+    EXPECT_EQ(distincts[0]->constCast<planner::LogicalDistinct>().getLimitNum(), 1u);
+}
+
+TEST_F(OptimizerTest, WriteBeforeEarlyStopIsMaterialized) {
+    using planner::LogicalOperatorType;
+    for (auto query : {"MATCH (a:person) SET a.age = 1 RETURN a.ID LIMIT 1",
+             "MATCH (a:person) SET a.age = 1 WITH a LIMIT 1 RETURN a.ID",
+             "MATCH (a:person) SET a.age = 1 RETURN a.ID SKIP 1 LIMIT 1",
+             "MATCH (a:person) SET a.age = 1 RETURN a.ID LIMIT $n",
+             "UNWIND [1, 2] AS i CREATE (n:person {ID: 100 + i}) RETURN n.ID LIMIT 0",
+             "MATCH (a:person) DETACH DELETE a RETURN 1 LIMIT 1"}) {
+        auto plan = getRoot(query);
+        std::vector<planner::LogicalOperator*> limits;
+        collectOperators(plan->getLastOperator().get(), LogicalOperatorType::LIMIT, limits);
+        ASSERT_EQ(limits.size(), 1u) << query << "\n" << plan->toString();
+        EXPECT_TRUE(plan->hasUpdate()) << query;
+        EXPECT_TRUE(hasOperatorType(limits[0], LogicalOperatorType::ACCUMULATE)) << query;
+        EXPECT_FALSE(limits[0]->getChild(0)->hasUpdateInPipeline()) << query << "\n"
+                                                                    << plan->toString();
+    }
+    for (auto query : {"MATCH (a:person) SET a.age = 1 RETURN DISTINCT a.age LIMIT 1",
+             "MATCH (a:person) SET a.age = 1 WITH DISTINCT a.age AS v RETURN v LIMIT 1"}) {
+        auto plan = getRoot(query);
+        std::vector<planner::LogicalOperator*> distincts;
+        collectOperators(plan->getLastOperator().get(), LogicalOperatorType::DISTINCT, distincts);
+        ASSERT_EQ(distincts.size(), 1u) << query << "\n" << plan->toString();
+        EXPECT_FALSE(distincts[0]->constCast<planner::LogicalDistinct>().hasLimitNum()) << query;
+    }
+    auto plan = getRoot("MATCH (a:person) SET a.age = 1 WITH a CALL show_tables() RETURN a.ID");
+    std::vector<planner::LogicalOperator*> crossProducts;
+    collectOperators(plan->getLastOperator().get(), LogicalOperatorType::CROSS_PRODUCT,
+        crossProducts);
+    ASSERT_EQ(crossProducts.size(), 1u) << plan->toString();
+    EXPECT_EQ(crossProducts[0]->getChild(0)->getOperatorType(), LogicalOperatorType::ACCUMULATE)
+        << plan->toString();
+}
+
+// LIMIT $n has no value at planning time; the write still applies to every row.
+TEST_F(OptimizerTest, WriteBeforeParameterLimitAppliesToEveryRow) {
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE wl_t(id INT64, v INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(1, 5) AS i CREATE (:wl_t {id: i, v: 0});")->isSuccess());
+    auto prepared = conn->prepare("MATCH (a:wl_t) SET a.v = a.v + 1 RETURN a.v LIMIT $n");
+    ASSERT_TRUE(prepared->isSuccess()) << prepared->getErrorMessage();
+    for (int64_t n : {int64_t{1}, int64_t{0}}) {
+        auto result = conn->execute(prepared.get(), std::make_pair(std::string("n"), n));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        EXPECT_EQ(result->getNumTuples(), static_cast<uint64_t>(n));
+    }
+    // Both executions incremented all five rows.
+    EXPECT_EQ(getCount(*conn->query("MATCH (a:wl_t) WHERE a.v = 2 RETURN count(*);")), 5);
 }
 
 } // namespace testing

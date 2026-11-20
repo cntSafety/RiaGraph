@@ -98,6 +98,9 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapScanNodeTable(
     std::vector<std::shared_ptr<ScanNodeTableSharedState>> sharedStates;
     auto binder = Binder(clientContext);
     auto expressionBinder = ExpressionBinder(&binder, clientContext);
+    const auto namespaceScope = scan.namespaceScope.isUnrestricted() ?
+                                    nullptr :
+                                    std::make_shared<const NamespaceSet>(scan.namespaceScope);
     for (size_t i = 0; i < tableIDs.size(); ++i) {
         auto& r = resolved[i];
         auto table = r.sm->getTable(tableIDs[i])->ptrCast<storage::NodeTable>();
@@ -128,6 +131,7 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapScanNodeTable(
                 tableInfo.addColumnInfo(INVALID_COLUMN_ID, ColumnCaster(LogicalType::ANY()));
             }
         }
+        tableInfo.namespaceScope = namespaceScope;
         tableInfos.push_back(std::move(tableInfo));
         // Build sharedState
         auto semiMask = SemiMaskUtil::createMask(table->getNumTotalRows(transaction));
@@ -137,6 +141,13 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapScanNodeTable(
     std::unique_ptr<PhysicalOperator> result;
     switch (scan.getScanType()) {
     case LogicalScanNodeTableType::SCAN: {
+        if (!scan.namespaceScope.isUnrestricted() &&
+            !scan.namespaceScope.contains(GLOBAL_NAMESPACE_ID)) {
+            alias += ", namespace IDs:";
+            for (auto id : scan.namespaceScope.getIDs()) {
+                alias += " " + std::to_string(id);
+            }
+        }
         auto printInfo =
             std::make_unique<ScanNodeTablePrintInfo>(tableNames, alias, scan.getProperties());
         auto progressSharedState = std::make_shared<ScanNodeTableProgressSharedState>();
@@ -168,11 +179,17 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapScanNodeTable(
         }
         auto printInfo = std::make_unique<PrimaryKeyScanPrintInfo>(scan.getProperties(), keyString,
             alias, indexType);
+        const auto namespacePoint =
+            !primaryKeyScanInfo.isRange && scan.namespaceScope.getSingleton() &&
+            std::any_of(tableInfos.begin(), tableInfos.end(), [](const auto& info) {
+                return info.table->template cast<storage::NodeTable>().hasLocalPrimaryKey();
+            });
         return std::make_unique<PrimaryKeyScanNodeTable>(std::move(scanInfo), std::move(tableInfos),
-            std::move(evaluator), std::move(upperBoundEvaluator), primaryKeyScanInfo.isRange,
-            false /* isIndexEquality */, primaryKeyScanInfo.lowerInclusive,
-            primaryKeyScanInfo.upperInclusive, "", std::move(sharedState), getOperatorID(),
-            std::move(printInfo));
+            std::move(evaluator), std::move(upperBoundEvaluator),
+            primaryKeyScanInfo.isRange || primaryKeyScanInfo.nonUnique,
+            primaryKeyScanInfo.nonUnique, primaryKeyScanInfo.lowerInclusive,
+            primaryKeyScanInfo.upperInclusive, primaryKeyScanInfo.nonUnique ? "_PK" : "",
+            std::move(sharedState), getOperatorID(), std::move(printInfo), namespacePoint);
     }
     case LogicalScanNodeTableType::SECONDARY_INDEX_SCAN: {
         auto& secondaryIndexScanInfo = scan.getExtraInfo()->constCast<SecondaryIndexScanInfo>();

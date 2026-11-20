@@ -13,6 +13,9 @@ void LogicalOperatorVisitor::visitOperatorSwitch(LogicalOperator* op) {
     case LogicalOperatorType::AGGREGATE: {
         visitAggregate(op);
     } break;
+    case LogicalOperatorType::ASSERT: {
+        visitAssert(op);
+    } break;
     case LogicalOperatorType::COPY_FROM: {
         visitCopyFrom(op);
     } break;
@@ -94,6 +97,9 @@ void LogicalOperatorVisitor::visitOperatorSwitch(LogicalOperator* op) {
     case LogicalOperatorType::SET_PROPERTY: {
         visitSetProperty(op);
     } break;
+    case LogicalOperatorType::NAMESPACE_MUTATION: {
+        visitNamespaceMutation(op);
+    } break;
     case LogicalOperatorType::TABLE_FUNCTION_CALL: {
         visitTableFunctionCall(op);
     } break;
@@ -122,6 +128,9 @@ std::shared_ptr<LogicalOperator> LogicalOperatorVisitor::visitOperatorReplaceSwi
     }
     case LogicalOperatorType::AGGREGATE: {
         return visitAggregateReplace(op);
+    }
+    case LogicalOperatorType::ASSERT: {
+        return visitAssertReplace(op);
     }
     case LogicalOperatorType::COPY_FROM: {
         return visitCopyFromReplace(op);

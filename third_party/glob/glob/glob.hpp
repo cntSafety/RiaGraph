@@ -55,6 +55,25 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// RiaGraph: paths are UTF-8 std::strings. On Windows, fs::path's narrow-string constructor and
+// string() use the process ANSI code page, so convert through char8_t there instead.
+static inline fs::path path_from_utf8(const std::string &s) {
+#if defined(_WIN32) && !defined(GLOB_USE_GHC_FILESYSTEM)
+  return fs::path(std::u8string(s.begin(), s.end()));
+#else
+  return fs::path(s);
+#endif
+}
+
+static inline std::string path_to_utf8(const fs::path &p) {
+#if defined(_WIN32) && !defined(GLOB_USE_GHC_FILESYSTEM)
+  const auto s = p.u8string();
+  return std::string(s.begin(), s.end());
+#else
+  return p.string();
+#endif
+}
+
 static inline 
 bool string_replace(std::string &str, const std::string &from, const std::string &to) {
   std::size_t start_pos = str.find(from);
@@ -172,7 +191,7 @@ std::string translate(const std::string &pattern) {
 
 static inline 
 bool fnmatch(const fs::path &name, const std::string &pattern) {
-  return RE2::FullMatch(name.string(), translate(pattern));
+  return RE2::FullMatch(path_to_utf8(name), translate(pattern));
 }
 
 static inline 
@@ -264,7 +283,7 @@ std::vector<fs::path> rlistdir(const fs::path &dirname, bool dironly) {
   std::vector<fs::path> result;
   auto names = iter_directory(dirname, dironly);
   for (auto &x : names) {
-    if (!is_hidden(x.string())) {
+    if (!is_hidden(path_to_utf8(x))) {
       result.push_back(x);
       for (auto &y : rlistdir(x, dironly)) {
         result.push_back(y);
@@ -298,7 +317,7 @@ std::vector<fs::path> glob1(const fs::path &dirname, const std::string &pattern,
   auto names = iter_directory(dirname, dironly);
   std::vector<fs::path> filtered_names;
   for (auto &n : names) {
-    if (!is_hidden(n.string())) {
+    if (!is_hidden(path_to_utf8(n))) {
       filtered_names.push_back(n.filename());
       // if (n.is_relative()) {
       //   // std::cout << "Filtered (Relative): " << n << "\n";
@@ -335,7 +354,7 @@ std::vector<fs::path> glob(const std::string &pathname, bool recursive = false,
                            bool dironly = false) {
   std::vector<fs::path> result;
 
-  auto path = fs::path(pathname);
+  auto path = path_from_utf8(pathname);
 
   if (pathname[0] == '~') {
     // expand tilde
@@ -361,24 +380,24 @@ std::vector<fs::path> glob(const std::string &pathname, bool recursive = false,
   }
 
   if (dirname.empty()) {
-    if (recursive && is_recursive(basename.string())) {
-      return glob2(dirname, basename.string(), dironly);
+    if (recursive && is_recursive(path_to_utf8(basename))) {
+      return glob2(dirname, path_to_utf8(basename), dironly);
     } else {
-      return glob1(dirname, basename.string(), dironly);
+      return glob1(dirname, path_to_utf8(basename), dironly);
     }
   }
 
   std::vector<fs::path> dirs;
-  if (dirname != fs::path(pathname) && has_magic(dirname.string())) {
-    dirs = glob(dirname.string(), recursive, true);
+  if (dirname != path_from_utf8(pathname) && has_magic(path_to_utf8(dirname))) {
+    dirs = glob(path_to_utf8(dirname), recursive, true);
   } else {
     dirs = {dirname};
   }
 
   std::function<std::vector<fs::path>(const fs::path &, const std::string &, bool)>
       glob_in_dir;
-  if (has_magic(basename.string())) {
-    if (recursive && is_recursive(basename.string())) {
+  if (has_magic(path_to_utf8(basename))) {
+    if (recursive && is_recursive(path_to_utf8(basename))) {
       glob_in_dir = glob2;
     } else {
       glob_in_dir = glob1;
@@ -388,7 +407,7 @@ std::vector<fs::path> glob(const std::string &pathname, bool recursive = false,
   }
 
   for (auto &d : dirs) {
-    for (auto &name : glob_in_dir(d, basename.string(), dironly)) {
+    for (auto &name : glob_in_dir(d, path_to_utf8(basename), dironly)) {
       fs::path subresult = name;
       if (name.parent_path().empty()) {
         subresult = d / name;

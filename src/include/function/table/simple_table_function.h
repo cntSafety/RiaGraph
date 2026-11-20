@@ -108,6 +108,16 @@ struct TableInfoFunction final {
     static function_set getFunctionSet();
 };
 
+struct ShowNamespacesFunction final {
+    static constexpr const char* name = "SHOW_NAMESPACES";
+    static function_set getFunctionSet();
+};
+
+struct NamespaceInfoFunction final {
+    static constexpr const char* name = "NAMESPACE_INFO";
+    static function_set getFunctionSet();
+};
+
 struct ShowSequencesFunction final {
     static constexpr const char* name = "SHOW_SEQUENCES";
 

@@ -26,6 +26,9 @@ static std::string getQueryFromFile(VirtualFileSystem* vfs, const std::string& b
         if (fileName == PortDBConstants::INDEX_FILE_NAME) {
             return "";
         }
+        if (fileName == "namespace-copy.cypher") {
+            return "";
+        }
         throw BinderException(std::format("File {} does not exist.", filePath));
     }
     auto fileInfo = vfs->openFile(filePath, FileOpenFlags(FileFlags::READ_ONLY
@@ -137,6 +140,20 @@ std::unique_ptr<BoundStatement> Binder::bindImportDatabaseClause(const Statement
             }
             finalQueryStatements += query;
         }
+    }
+    auto namespaceCopy =
+        getQueryFromFile(fs, boundFilePath, "namespace-copy.cypher", clientContext);
+    if (!namespaceCopy.empty()) {
+        const auto prefix = getCopyFilePath(boundFilePath, "namespace-copy.cypher");
+        const auto directory =
+            prefix.substr(0, prefix.size() - std::string("namespace-copy.cypher").size());
+        size_t position = 0;
+        const auto marker = std::string("${RIA_NAMESPACE_EXPORT}/");
+        while ((position = namespaceCopy.find(marker, position)) != std::string::npos) {
+            namespaceCopy.replace(position, marker.size(), directory);
+            position += directory.size();
+        }
+        finalQueryStatements += namespaceCopy;
     }
     return std::make_unique<BoundImportDatabase>(boundFilePath, finalQueryStatements,
         getQueryFromFile(fs, boundFilePath, PortDBConstants::INDEX_FILE_NAME, clientContext));

@@ -1,6 +1,7 @@
 #include <optional>
 
 #include "binder/binder.h"
+#include "binder/bound_namespace_statement.h"
 #include "binder/ddl/bound_alter.h"
 #include "binder/ddl/bound_create_index.h"
 #include "binder/ddl/bound_create_sequence.h"
@@ -13,6 +14,7 @@
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
 #include "catalog/catalog_entry/sequence_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/constants.h"
 #include "common/enums/extend_direction_util.h"
 #include "common/enums/storage_format.h"
@@ -154,17 +156,40 @@ static void validatePrimaryKey(const std::string& pkColName,
 }
 
 BoundCreateTableInfo Binder::bindCreateTableInfo(const CreateTableInfo* info) {
-    switch (info->type) {
-    case TableType::NODE: {
-        return bindCreateNodeTableInfo(info);
+    auto result = [&]() -> BoundCreateTableInfo {
+        switch (info->type) {
+        case TableType::NODE: {
+            return bindCreateNodeTableInfo(info);
+        }
+        case TableType::REL: {
+            return bindCreateRelTableGroupInfo(info);
+        }
+        default: {
+            UNREACHABLE_CODE;
+        }
+        }
+    }();
+    if (info->namespaceSelector) {
+        result.namespacePolicy = bindNamespaceSelector(*info->namespaceSelector);
     }
-    case TableType::REL: {
-        return bindCreateRelTableGroupInfo(info);
+    if (info->type == TableType::NODE) {
+        result.localPrimaryKey =
+            info->extraInfo->constCast<ExtraCreateNodeTableInfo>().localPrimaryKey;
+        const auto* extra = result.extraInfo->constPtrCast<BoundExtraCreateNodeTableInfo>();
+        if ((result.localPrimaryKey || !result.namespacePolicy.isUnrestricted()) &&
+            (extra->partitionInfo || !extra->storage.empty() ||
+                extra->storageFormat != StorageFormat::NONE)) {
+            throw BinderException(
+                "Namespace policies and LOCAL PRIMARY KEY require an unpartitioned native table.");
+        }
+    } else if (!result.namespacePolicy.isUnrestricted()) {
+        const auto* extra = result.extraInfo->constPtrCast<BoundExtraCreateRelTableGroupInfo>();
+        if (!extra->storage.empty() || extra->storageFormat != StorageFormat::NONE ||
+            extra->scanFunction) {
+            throw BinderException("Namespace policies require native relationship tables.");
+        }
     }
-    default: {
-        UNREACHABLE_CODE;
-    }
-    }
+    return result;
 }
 
 void Binder::validateNodeTableType(const TableCatalogEntry* entry) {
@@ -506,6 +531,13 @@ std::unique_ptr<BoundStatement> Binder::bindCreateIndex(const Statement& stateme
     }
     const auto isPrimaryIndex =
         StringUtils::caseInsensitiveEquals(nodeTableEntry->getPrimaryKeyName(), info.propertyName);
+    const auto* namespaces = catalog->getNamespaces();
+    const auto* policy =
+        namespaces ? namespaces->getPolicy(transaction, tableEntry->getTableID()) : nullptr;
+    if (isPrimaryIndex && policy && policy->localPrimaryKey) {
+        throw BinderException("LOCAL PRIMARY KEY uses its per-namespace hash directory; replacing "
+                              "it with an unscoped index is not supported.");
+    }
     const auto isArtIndex = StringUtils::caseInsensitiveEquals(indexType,
         storage::ArtPrimaryKeyIndex::getIndexType().typeName);
     if (!isPrimaryIndex && !isArtIndex) {
@@ -561,6 +593,19 @@ std::unique_ptr<BoundStatement> Binder::bindCreateTableAs(const Statement& state
         throw BinderException("Subquery returns no columns");
     }
     auto createInfo = createTable.getInfo();
+    const auto session = clientContext->getNamespaceSelection();
+    const auto target =
+        session.isUnrestricted() ? std::optional{GLOBAL_NAMESPACE_ID} : session.getSingleton();
+    if (!target) {
+        throw BinderException(
+            "CREATE TABLE AS requires a singleton or unrestricted namespace selection.");
+    }
+    const auto policy = createInfo->namespaceSelector ?
+                            bindNamespaceSelector(*createInfo->namespaceSelector) :
+                            NamespaceSet{};
+    if (!policy.contains(*target)) {
+        throw BinderException("CREATE TABLE AS target is excluded by its table namespace policy.");
+    }
     switch (createInfo->type) {
     case TableType::NODE: {
         // first column is primary key column temporarily for now
@@ -573,6 +618,8 @@ std::unique_ptr<BoundStatement> Binder::bindCreateTableAs(const Statement& state
         auto boundCreateInfo = BoundCreateTableInfo(CatalogEntryType::NODE_TABLE_ENTRY,
             createInfo->tableName, createInfo->onConflict, std::move(boundExtraInfo),
             clientContext->useInternalCatalogEntry());
+        boundCreateInfo.namespacePolicy = policy;
+        boundCopyFromInfo.namespaceTarget = *target;
         auto boundCreateTable = std::make_unique<BoundCreateTable>(std::move(boundCreateInfo),
             BoundStatementResult::createSingleStringColumnResult());
         boundCreateTable->setCopyInfo(std::move(boundCopyFromInfo));
@@ -595,9 +642,20 @@ std::unique_ptr<BoundStatement> Binder::bindCreateTableAs(const Statement& state
         auto toTable =
             catalog->getTableCatalogEntry(transaction, extraInfo.connections[0].dstTableName)
                 ->ptrCast<NodeTableCatalogEntry>();
-        auto boundCreateInfo = bindCreateRelTableGroupInfo(createInfo);
+        auto boundCreateInfo = bindCreateTableInfo(createInfo);
         auto boundCopyFromInfo = bindCopyRelFromInfo(createInfo->tableName, propertyDefinitions,
             createTable.getSource(), options_t{}, columnNames, columnTypes, fromTable, toTable);
+        boundCopyFromInfo.namespaceTarget = *target;
+        for (auto& lookup :
+            static_cast<ExtraBoundCopyRelInfo*>(boundCopyFromInfo.extraInfo.get())->infos) {
+            lookup.namespaceTarget = *target;
+            const auto* namespaces = catalog->getNamespaces();
+            const auto* endpointPolicy =
+                namespaces ? namespaces->getPolicy(transaction, lookup.nodeTableID) : nullptr;
+            lookup.namespaceAware = *target != GLOBAL_NAMESPACE_ID ||
+                                    (endpointPolicy && (endpointPolicy->hasMembership ||
+                                                           endpointPolicy->localPrimaryKey));
+        }
         boundCreateInfo.extraInfo->ptrCast<BoundExtraCreateTableInfo>()->propertyDefinitions =
             std::move(propertyDefinitions);
         auto boundCreateTable = std::make_unique<BoundCreateTable>(std::move(boundCreateInfo),
@@ -751,6 +809,22 @@ std::unique_ptr<BoundStatement> Binder::bindAlter(const Statement& statement) {
     }
 
     switch (alter.getInfo()->type) {
+    case AlterType::ADD_NAMESPACES:
+    case AlterType::REMOVE_NAMESPACES:
+    case AlterType::SET_NAMESPACES: {
+        const auto type = alter.getInfo()->type;
+        auto parsed = NamespaceStatement(
+            type == AlterType::ADD_NAMESPACES    ? NamespaceAction::TABLE_ADD :
+            type == AlterType::REMOVE_NAMESPACES ? NamespaceAction::TABLE_REMOVE :
+                                                   NamespaceAction::TABLE_SET);
+        parsed.name = alter.getInfo()->tableName;
+        parsed.selector =
+            alter.getInfo()->extraInfo->constPtrCast<ExtraAlterNamespaces>()->selector;
+        bindNamespaceSelector(parsed.selector); // Resolve errors before planning.
+        Catalog::Get(*clientContext)
+            ->getTableCatalogEntry(transaction::Transaction::Get(*clientContext), parsed.name);
+        return std::make_unique<BoundNamespaceStatement>(parsed);
+    }
     case AlterType::RENAME: {
         return bindRenameTable(statement);
     }

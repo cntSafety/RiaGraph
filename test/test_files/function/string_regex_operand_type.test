@@ -1,0 +1,165 @@
+-DATASET CSV empty
+
+--
+
+# =~ matches STRING against STRING only: a non-STRING operand is a type error, as in Cypher,
+# never a read of its value as a string (#195).
+-CASE RegexFullMatchNonStringOperand
+-STATEMENT CREATE NODE TABLE T(id INT64 PRIMARY KEY, i INT64, s STRING);
+---- ok
+-STATEMENT CREATE (:T {id: 1, i: 15, s: '15'});
+---- ok
+-STATEMENT MATCH (t:T) RETURN t.s =~ t.i;
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but t.i has data type INT64.
+-STATEMENT RETURN 15 =~ '1.*';
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but 15 has data type INT64.
+-STATEMENT MATCH (t:T) WHERE t.i =~ '1.*' RETURN t.id;
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but t.i has data type INT64.
+-STATEMENT WITH 15 AS x RETURN x =~ '1.*';
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but x has data type INT64.
+-STATEMENT RETURN 1 =~ 5;
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but 1 has data type INT64.
+-STATEMENT RETURN -5 =~ 5;
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but -5 has data type INT64.
+-STATEMENT MATCH (n) RETURN 1 =~ 5;
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but 1 has data type INT64.
+-STATEMENT RETURN '1' =~ 5;
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but 5 has data type INT64.
+-STATEMENT UNWIND [1,2] AS p RETURN '15' =~ p;
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but p has data type INT64.
+-STATEMENT RETURN 1.5 =~ '1.5';
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but 1.500000 has data type DOUBLE.
+-STATEMENT RETURN true =~ 'true';
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but True has data type BOOL.
+-STATEMENT RETURN [1] =~ 'x';
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but LIST_CREATION(1) has data type INT64[].
+-STATEMENT RETURN regexp_full_match(15, '1.*');
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but 15 has data type INT64.
+-STATEMENT RETURN null =~ 5;
+---- error
+Binder exception: Type mismatch: the operands of =~ must be STRING, but 5 has data type INT64.
+# The process survives the errors above.
+-STATEMENT MATCH (t:T) RETURN t.id;
+---- 1
+1
+
+# A NULL operand is NULL, not an internal error, as in Cypher.
+-CASE RegexFullMatchNullOperand
+-STATEMENT RETURN null =~ '5';
+---- 1
+
+-STATEMENT RETURN '5' =~ null;
+---- 1
+
+-STATEMENT RETURN null =~ null;
+---- 1
+
+-STATEMENT UNWIND [null, '15'] AS x RETURN x =~ '1.*' ORDER BY x;
+---- 2
+True
+
+
+-CASE RegexFullMatchStringOperand
+-STATEMENT CREATE NODE TABLE T(id INT64 PRIMARY KEY, s STRING, p STRING);
+---- ok
+-STATEMENT CREATE (:T {id: 1, s: '15', p: '1.*'}), (:T {id: 2, s: '25', p: '1.*'}), (:T {id: 3, s: '1', p: '5'});
+---- ok
+-STATEMENT RETURN '15' =~ '1.*', '1' =~ '5';
+---- 1
+True|False
+-STATEMENT MATCH (t:T) RETURN t.id, t.s =~ t.p, t.s =~ '1.*', '15' =~ t.s, t.s =~ t.s ORDER BY t.id;
+---- 3
+1|True|True|True|True
+2|False|False|False|True
+3|False|True|False|True
+-STATEMENT MATCH (t:T) WHERE t.s =~ t.p RETURN t.id;
+---- 1
+1
+-STATEMENT MATCH (t:T) WHERE t.s =~ '.5' RETURN t.id ORDER BY t.id;
+---- 2
+1
+2
+-STATEMENT WITH '15' AS x RETURN x =~ '1.*';
+---- 1
+True
+
+# regexp_replace reads every argument as STRING: a non-STRING argument is cast, as for the other
+# regexp functions, never read as a string (#195).
+-CASE RegexpReplaceNonStringOperand
+-STATEMENT CREATE NODE TABLE T(id INT64 PRIMARY KEY, i INT64, s STRING);
+---- ok
+-STATEMENT CREATE (:T {id: 1, i: 15, s: '15'});
+---- ok
+-STATEMENT MATCH (t:T) RETURN regexp_replace(t.i, '1', 'x');
+---- 1
+x5
+-STATEMENT MATCH (t:T) RETURN regexp_replace(t.s, t.i, 'x');
+---- 1
+x
+-STATEMENT MATCH (t:T) RETURN regexp_replace(t.s, '1', t.i);
+---- 1
+155
+-STATEMENT RETURN regexp_replace(15, '1', 'x');
+---- 1
+x5
+-STATEMENT RETURN regexp_replace('15', 1, 'x');
+---- 1
+x5
+-STATEMENT RETURN regexp_replace('15', '1', 7);
+---- 1
+75
+-STATEMENT RETURN regexp_replace('151', 1, 'x', 'g');
+---- 1
+x5x
+-STATEMENT RETURN regexp_replace(null, '1', 'x');
+---- 1
+
+-STATEMENT RETURN regexp_replace('15', null, 'x');
+---- 1
+
+-STATEMENT RETURN regexp_replace('15', '1', null);
+---- 1
+
+-STATEMENT RETURN regexp_matches(15, '1'), regexp_extract(15, 1), regexp_extract_all(15, 1), regexp_split_to_array(151, 5);
+---- 1
+True|1|[1]|[1,1]
+
+# A key or type name read from a literal must be a STRING literal.
+-CASE StringLiteralArgumentType
+-STATEMENT RETURN struct_extract({a: 1}, 5);
+---- error
+Binder exception: 5 has data type INT64 but STRING was expected.
+-STATEMENT RETURN struct_extract({a: 1}, 'a');
+---- 1
+1
+-STATEMENT RETURN cast(1, 5);
+---- error
+Binder exception: 5 has data type INT64 but STRING was expected.
+-STATEMENT RETURN cast(1, 'STRING');
+---- 1
+1
+-STATEMENT CREATE NODE TABLE N(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N);
+---- ok
+-STATEMENT CREATE (:N {id: 1})-[:R]->(:N {id: 2});
+---- ok
+-STATEMENT MATCH p = (:N)-[:R*1..1]->(:N) RETURN properties(nodes(p), 5);
+---- error
+Binder exception: 5 has data type INT64 but STRING was expected.
+-STATEMENT MATCH p = (:N)-[:R*1..1]->(:N) RETURN properties(nodes(p), 'id');
+---- 1
+[1,2]

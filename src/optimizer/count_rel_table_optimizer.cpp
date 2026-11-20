@@ -2,7 +2,6 @@
 
 #include "binder/binder.h"
 #include "binder/expression/aggregate_function_expression.h"
-#include "binder/expression/case_expression.h"
 #include "binder/expression/expression_util.h"
 #include "binder/expression/literal_expression.h"
 #include "binder/expression/node_expression.h"
@@ -887,7 +886,7 @@ bool CountRelTableOptimizer::isSimpleCount(LogicalOperator* op) const {
     const auto& functionName = aggFuncExpr.getFunction().name;
     // Constant SUM is handled only by the COUNT_REL_TABLE rewrite below. The RelDegreeTable
     // rewrites write the raw degree as INT64 and cannot express SUM(constant) semantics
-    // (no constant multiplier, no NULL-on-empty-input), so isSimpleCount must stay COUNT-only.
+    // (no constant multiplier, no SUM result type), so isSimpleCount must stay COUNT-only.
     if (functionName != function::CountStarFunction::name &&
         functionName != function::CountFunction::name) {
         return false;
@@ -1252,23 +1251,23 @@ std::shared_ptr<LogicalOperator> CountRelTableOptimizer::visitAggregateReplace(
     }
 
     // SUM(1) can use the aggregate's expression as the count output directly. The physical
-    // operator writes the count using SUM's result type and returns NULL for an empty input.
+    // operator writes the count using SUM's result type, so an empty input gives SUM's zero.
     if (!constantSum || directConstantSum) {
         auto countRelTable = std::make_shared<LogicalCountRelTable>(relGroupEntry,
             std::move(relTableIDs), std::move(boundNodeTableIDsVec), boundNode,
-            extend.getDirection(), resultExpr, directConstantSum, rel->getDbName(relGroupEntry));
+            extend.getDirection(), resultExpr, rel->getDbName(relGroupEntry));
         countRelTable->computeFlatSchema();
         return countRelTable;
     }
 
     // For SUM(c), produce an INT64 metadata count and evaluate one typed multiplication above it.
-    // The CASE preserves SUM's NULL-on-empty-input semantics.
+    // An empty input gives count 0 and so SUM's zero of the result type.
     auto binder = Binder(_context);
     auto* expressionBinder = binder.getExpressionBinder();
     auto countExpr = binder.createInvisibleVariable("__count_rel_table", LogicalType::INT64());
     auto countRelTable = std::make_shared<LogicalCountRelTable>(relGroupEntry,
         std::move(relTableIDs), std::move(boundNodeTableIDsVec), boundNode, extend.getDirection(),
-        countExpr, false, rel->getDbName(relGroupEntry));
+        countExpr, rel->getDbName(relGroupEntry));
     countRelTable->computeFlatSchema();
 
     auto resultType = resultExpr->getDataType().copy();
@@ -1276,16 +1275,12 @@ std::shared_ptr<LogicalOperator> CountRelTableOptimizer::visitAggregateReplace(
     auto constantValue = getConstantSumChild(op.get())->constCast<LiteralExpression>().getValue();
     auto constantForProduct = expressionBinder->createLiteralExpression(constantValue);
     constantForProduct = expressionBinder->implicitCastIfNecessary(constantForProduct, resultType);
-    auto product = expressionBinder->bindScalarFunctionExpression(
-        {countForProduct, constantForProduct}, function::MultiplyFunction::name);
-
-    auto zero = expressionBinder->createLiteralExpression(Value{int64_t{0}});
-    auto countIsZero = expressionBinder->createEqualityComparisonExpression(countExpr, zero);
-    auto nullResult =
-        expressionBinder->createNullLiteralExpression(Value::createNullValue(resultType));
-    auto projectedSum =
-        std::make_shared<CaseExpression>(resultType.copy(), product, resultExpr->getUniqueName());
-    projectedSum->addCaseAlternative(countIsZero, nullResult);
+    auto projectedSum = expressionBinder->implicitCastIfNecessary(
+        expressionBinder->bindScalarFunctionExpression({countForProduct, constantForProduct},
+            function::MultiplyFunction::name),
+        resultType);
+    // The projection must produce the aggregate's column, so the product takes its name.
+    projectedSum->setUniqueName(resultExpr->getUniqueName());
     if (resultExpr->hasAlias()) {
         projectedSum->setAlias(resultExpr->getAlias());
     }
@@ -1320,7 +1315,7 @@ static bool isPropertyForNodePrimaryKey(const Expression& expression, const Node
     }
     auto& property = expression.constCast<PropertyExpression>();
     return property.getVariableName() == node.getUniqueName() &&
-           property.isPrimaryKey(node.getTableIDs()[0]);
+           property.isPrimaryKey(node.getTableIDs()[0]) && !property.localPrimaryKey;
 }
 
 static bool literalToOffset(const Expression& expression, offset_t& offset) {

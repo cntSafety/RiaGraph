@@ -25,6 +25,28 @@ bool RelExpression::isMultiLabeled() const {
     return false;
 }
 
+std::shared_ptr<RelExpression> RelExpression::copy() const {
+    DASSERT(recursiveInfo == nullptr);
+    auto result = std::make_shared<RelExpression>(dataType.copy(), uniqueName, variableName,
+        entries, srcNode, dstNode, directionType, relType);
+    result->alias = alias;
+    result->children = children;
+    result->propertyNameToIdx = propertyNameToIdx;
+    result->propertyExprs = propertyExprs;
+    result->labelExpression = labelExpression;
+    result->propertyDataExprs = propertyDataExprs;
+    result->dbNames = dbNames;
+    result->originalLabels = originalLabels;
+    result->hiddenPropertyNames = hiddenPropertyNames;
+    result->namespaceWriteTarget = namespaceWriteTarget;
+    result->namespaceMutable = namespaceMutable;
+    result->namespaceDeleteScope = namespaceDeleteScope;
+    result->leftNode = leftNode;
+    result->rightNode = rightNode;
+    result->directionExpr = directionExpr;
+    return result;
+}
+
 std::string RelExpression::detailsToString() const {
     std::string result = toString();
     switch (relType) {

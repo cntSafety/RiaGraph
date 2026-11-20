@@ -52,6 +52,13 @@ public:
         std::vector<common::LogicalType>& types, type_resolver bothEmpty, type_resolver leftEmpty,
         type_resolver rightEmpty, type_resolver finalEmptyListResolver, type_resolver bothNull,
         type_resolver leftNull, type_resolver rightNull, type_resolver finalNullParamResolver);
+
+    // Two lists of maps (or a list of maps and a map) whose keys differ in order or in set get
+    // one element type, combined by field name (union of the keys), as in a list literal
+    // (cntSafety/RiaGraph#193). types[1] is an element if rightIsElement, else a list. Any
+    // other pair of types is left alone.
+    static void combineMapElementTypes(std::vector<common::LogicalType>& types,
+        bool rightIsElement);
 };
 
 } // namespace function

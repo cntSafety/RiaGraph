@@ -13,6 +13,7 @@ add_library(riag_processor_operator_persistent
         delete_executor.cpp
         index_builder.cpp
         insert.cpp
+        namespace_mutation.cpp
         insert_executor.cpp
         merge.cpp
         set.cpp

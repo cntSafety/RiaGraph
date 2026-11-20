@@ -1,5 +1,6 @@
 #include "processor/operator/scan/scan_multi_rel_tables.h"
 
+#include "common/assert.h"
 #include "processor/execution_context.h"
 #include "storage/local_storage/local_storage.h"
 #include "storage/table/arrow_rel_table.h"
@@ -118,6 +119,7 @@ void ScanMultiRelTable::initLocalStateInternal(ResultSet* resultSet, ExecutionCo
         }
     }
     currentScanner = nullptr;
+    boundNodeState.reset();
 }
 
 bool ScanMultiRelTable::getNextTuplesInternal(ExecutionContext* context) {
@@ -131,11 +133,37 @@ bool ScanMultiRelTable::getNextTuplesInternal(ExecutionContext* context) {
             metrics->numOutputTuple.increase(filteredSize);
             return true;
         }
+        boundNodeState.restore(*boundNodeIDVector->state);
         if (!children[0]->getNextTuple(context)) {
             resetState();
             scanState->releaseScanPin();
             return false;
         }
+        boundNodeState.save(*boundNodeIDVector->state);
+        // The scanner is chosen from the node table of the first selected bound node, and the rel
+        // table scan then takes the whole selection of the bound chunk as one batch
+        // (RelTable::initScanState reads every selected position as a node of that table). That
+        // is only right if the chunk is single-table and has no NULL: a NULL is skipped below by
+        // looking at position 0 alone, and a position from another node table would be scanned
+        // against the wrong rel tables. Node table scans and rel scans emit one table per batch,
+        // and no plan tried (OPTIONAL MATCH, DISTINCT, ORDER BY/LIMIT, UNWIND over multi-label
+        // and undirected patterns; the match/optional_match/subquery/order_by/... e2e suites)
+        // delivers anything else, so this is checked rather than handled. A producer that merges
+        // node tables or NULLs into one unflat chunk has to flatten it, or this operator has to
+        // scan per position. (#151)
+        RUNTIME_CHECK({
+            const auto& boundSelVector = boundNodeIDVector->state->getSelVector();
+            if (boundSelVector.getSelSize() > 1) {
+                DASSERT(!boundNodeIDVector->isNull(boundSelVector[0]));
+                const auto firstTableID =
+                    boundNodeIDVector->getValue<nodeID_t>(boundSelVector[0]).tableID;
+                for (auto i = 1u; i < boundSelVector.getSelSize(); ++i) {
+                    DASSERT(!boundNodeIDVector->isNull(boundSelVector[i]));
+                    DASSERT(boundNodeIDVector->getValue<nodeID_t>(boundSelVector[i]).tableID ==
+                            firstTableID);
+                }
+            }
+        });
         const auto currentIdx = boundNodeIDVector->state->getSelVector()[0];
         if (boundNodeIDVector->isNull(currentIdx)) {
             currentScanner = nullptr;

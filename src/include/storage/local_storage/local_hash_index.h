@@ -47,9 +47,10 @@ public:
         }
     }
 
-    bool discard(KeyType key) {
+    // Removes the insertion of key by the row at `offset` only, and records no deletion.
+    bool discard(KeyType key, common::offset_t offset) {
         std::unique_lock xLock{mtx};
-        return localInsertions.deleteKey(key);
+        return localInsertions.deleteKey(key, offset);
     }
 
     bool insert(OwnedType&& key, common::offset_t value, visible_func isVisible) {

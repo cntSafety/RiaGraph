@@ -2,6 +2,7 @@
 
 #include <filesystem>
 
+#include "common/file_system/file_system.h"
 #include "function/export/export_function.h"
 #include "processor/operator/sink.h"
 #include "processor/result/result_set.h"
@@ -68,7 +69,8 @@ public:
     void executeInternal(ExecutionContext* context) override;
 
     std::pair<std::string, std::atomic<bool>&> getParallelFlag() {
-        return {std::filesystem::path(info.bindData->fileName).filename().string(),
+        return {common::FileSystem::pathToUTF8(
+                    common::FileSystem::pathFromUTF8(info.bindData->fileName).filename()),
             sharedState->parallelFlag};
     }
 

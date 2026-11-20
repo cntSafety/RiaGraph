@@ -62,6 +62,12 @@ private:
     static void twoWayIntersect(common::nodeID_t* leftNodeIDs, common::SelectionVector& lSelVector,
         common::nodeID_t* rightNodeIDs, common::SelectionVector& rSelVector);
     void intersectLists();
+    // The kernels pair up equal entries one to one, but a list holds one entry per relationship,
+    // so a neighbour reached over parallel edges appears several times and every combination of
+    // those entries is a match. These two expand the intersected keys to that cross product.
+    bool collectDuplicateRuns();
+    void emitDuplicateRuns();
+    bool hasPendingDuplicateRuns() const { return nextDuplicateRun < duplicateRunKeys.size(); }
     void populatePayloads();
     bool hasNextTuplesToIntersect();
 
@@ -92,6 +98,15 @@ private:
     std::vector<uint32_t> listIdxes;
     std::vector<common::SelectionVector*> selVectorsForIntersectedLists;
     common::SelectionVector leftSelVector;
+    // Set when an intersected key of the current tuples occurs more than once in some list: every
+    // distinct intersected key, and for each of them the [begin, end) run of positions it occupies
+    // in every list (2 * numLists entries per key). The cross product of the runs is emitted in
+    // vectors of at most DEFAULT_VECTOR_CAPACITY rows; duplicateRunCursor is the position per
+    // list of the next row of run nextDuplicateRun.
+    std::vector<common::nodeID_t> duplicateRunKeys;
+    std::vector<common::sel_t> duplicateRunBounds;
+    std::vector<common::sel_t> duplicateRunCursor;
+    uint32_t nextDuplicateRun = 0;
 };
 
 } // namespace processor

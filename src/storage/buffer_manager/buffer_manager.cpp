@@ -267,7 +267,7 @@ void BufferManager::optimisticRead(FileHandle& fileHandle, page_idx_t pageIdx,
             }
             func(frame);
             pageState->removeReader();
-            if (pageState->getStateAndVersion() == currStateAndVersion) {
+            if (pageState->getStateAndVersionAfterOptimisticRead() == currStateAndVersion) {
                 return;
             }
 #else
@@ -275,7 +275,7 @@ void BufferManager::optimisticRead(FileHandle& fileHandle, page_idx_t pageIdx,
                     fileHandle.getPageSizeClass(), pageState)) {
                 continue;
             }
-            if (pageState->getStateAndVersion() == currStateAndVersion) {
+            if (pageState->getStateAndVersionAfterOptimisticRead() == currStateAndVersion) {
                 return;
             }
 #endif
@@ -586,16 +586,11 @@ void BufferManager::updateFrameIfPageIsInFrame(file_idx_t fileIdx, const uint8_t
     if (!pageState) {
         return;
     }
-    // Use a CAS loop that re-reads state each iteration to handle races with eviction
-    // and concurrent lock/unlock (which change the version).
-    while (true) {
-        auto currentStateAndVersion = pageState->getStateAndVersion();
-        if (PageState::getState(currentStateAndVersion) == PageState::EVICTED) {
-            return;
-        }
-        if (pageState->tryLock(currentStateAndVersion)) {
-            break;
-        }
+    // Wait while another thread holds the lock (for example a reader that is loading the page
+    // after eviction) and take it from UNLOCKED or MARKED. Taking a LOCKED page would let this
+    // thread write the frame and release a lock it does not own.
+    if (!pageState->spinLockUnlessEvicted()) {
+        return;
     }
     memcpy(getFrame(fileHandle, pageIdx), newPage, RIAG_PAGE_SIZE);
     pageState->unlock();
@@ -608,14 +603,31 @@ void BufferManager::removePageFromFrameIfNecessary(FileHandle& fileHandle, page_
     removePageFromFrame(fileHandle, pageIdx, false /* do not flush */);
 }
 
-// NOTE: We assume the page is not pinned (locked) here.
+// NOTE: The caller must not hold a pin on the page: this waits until the page is not locked, so it
+// would never return. Other threads may use the page meanwhile (an eviction, a reader loading the
+// page): the lock waits for them.
 void BufferManager::removePageFromFrame(FileHandle& fileHandle, page_idx_t pageIdx,
     bool shouldFlush) {
     auto pageState = fileHandle.getPageState(pageIdx);
-    if (PageState::getState(pageState->getStateAndVersion()) == PageState::EVICTED) {
+    if (fileHandle.isInMemoryMode()) {
+        // The pages of an in-memory file stay pinned (LOCKED) for as long as they exist, see
+        // FileHandle::addNewPage, and are never evicted. The lock belongs to the file itself, so
+        // there is nobody to wait for.
+        if (PageState::getState(pageState->getStateAndVersion()) == PageState::EVICTED) {
+            return;
+        }
+    } else if (!pageState->spinLockUnlessEvicted()) {
+        // The page may have been evicted by another thread: there is no frame left to release.
         return;
     }
-    pageState->spinLock(pageState->getStateAndVersion());
+#if BM_MALLOC
+    // Optimistic readers do not take the lock, they register in the reader count and recheck the
+    // state afterwards. New readers back off now that the page is locked, so wait for the ones
+    // already reading before the page is freed under them.
+    while (pageState->getReaderCount() > 0) {
+        std::this_thread::yield();
+    }
+#endif
     try {
         if (shouldFlush) {
             fileHandle.flushPageIfDirtyWithoutLock(pageIdx);

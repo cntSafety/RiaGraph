@@ -1,8 +1,10 @@
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include "parser/expression/parsed_expression.h"
+#include "parser/namespace_selector.h"
 
 namespace riag {
 namespace parser {
@@ -25,10 +27,18 @@ public:
         return propertyKeyVals;
     }
 
+    void setNamespaceSelector(NamespaceSelector selector) {
+        namespaceSelector = std::move(selector);
+    }
+    const std::optional<NamespaceSelector>& getNamespaceSelector() const {
+        return namespaceSelector;
+    }
+
 protected:
     std::string variableName;
     std::vector<std::string> tableNames;
     std::vector<s_parsed_expr_pair> propertyKeyVals;
+    std::optional<NamespaceSelector> namespaceSelector;
 };
 
 } // namespace parser

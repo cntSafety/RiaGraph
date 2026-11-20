@@ -1,0 +1,144 @@
+-DATASET CSV empty
+
+--
+
+# A write applies to every row of its query part, whatever joins it afterwards. The planner puts
+# the write on the build side of the join with the next MATCH, so that it completes before the
+# probe side reads. Probe-to-build SIP then masked the scan below the write with the keys the probe
+# side kept: the write ran on the rows that have a matching edge only, and the probe side read
+# before the write (cntSafety/RiaGraph#122).
+#
+# Every statement is followed by a second one that counts the stored state: the value a write
+# query returns is right either way. Node 1 is the only one with an R edge, so only one of the five
+# rows survives the join.
+
+-CASE SetThenJoinWritesEveryRow
+-STATEMENT CREATE NODE TABLE T(id INT64, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:T {id: i, v: 0});
+---- ok
+-STATEMENT MATCH (a:T {id: 1}), (b:T {id: 2}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a MATCH (a)-[:R]->(b:T) RETURN b.v;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = 1 WITH a MATCH (a)-[:R]->(b:T) RETURN a.id;
+---- 1
+1
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T) SET a.v = a.id WITH a MATCH (a)-[:R]->(b:T) RETURN b.v;
+---- 1
+2
+-STATEMENT MATCH (a:T) RETURN sum(a.v);
+---- 1
+15
+# A write on the other side of the join: the new MATCH comes first.
+-STATEMENT MATCH (a:T) SET a.v = 0;
+---- ok
+-STATEMENT MATCH (a:T)-[:R]->(b:T) WITH b MATCH (c:T) SET c.v = 1 WITH c MATCH (c)-[:R]->(d:T) RETURN d.id;
+---- 1
+2
+-STATEMENT MATCH (a:T) WHERE a.v = 1 RETURN count(*);
+---- 1
+5
+
+-CASE CreateThenJoinWritesEveryRow
+-STATEMENT CREATE NODE TABLE T(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE U(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT CREATE REL TABLE S(FROM T TO T);
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:T {id: i});
+---- ok
+-STATEMENT MATCH (a:T {id: 1}), (b:T {id: 2}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T) CREATE (:U {id: a.id}) WITH a MATCH (a)-[:R]->(b:T) RETURN b.id;
+---- 1
+2
+-STATEMENT MATCH (u:U) RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T) CREATE (a)-[:S]->(a) WITH a MATCH (a)-[:R]->(b:T) RETURN b.id;
+---- 1
+2
+-STATEMENT MATCH (a:T)-[s:S]->(a) RETURN count(*);
+---- 1
+5
+
+-CASE MergeThenJoinWritesEveryRow
+-STATEMENT CREATE NODE TABLE T(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE U(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT CREATE REL TABLE S(FROM T TO U);
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:T {id: i});
+---- ok
+-STATEMENT MATCH (a:T {id: 1}), (b:T {id: 2}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T) MERGE (:U {id: a.id}) WITH a MATCH (a)-[:R]->(b:T) RETURN b.id;
+---- 1
+2
+-STATEMENT MATCH (u:U) RETURN count(*);
+---- 1
+5
+-STATEMENT MATCH (a:T), (u:U) WHERE a.id = u.id MERGE (a)-[:S]->(u) WITH a MATCH (a)-[:R]->(b:T) RETURN b.id;
+---- 1
+2
+-STATEMENT MATCH (:T)-[s:S]->(:U) RETURN count(*);
+---- 1
+5
+
+-CASE DeleteThenJoinWritesEveryRow
+-STATEMENT CREATE NODE TABLE T(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE U(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT CREATE REL TABLE S(FROM T TO U);
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:T {id: i});
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:U {id: i});
+---- ok
+-STATEMENT MATCH (a:T {id: 1}), (b:T {id: 2}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T), (u:U) WHERE a.id = u.id CREATE (a)-[:S]->(u);
+---- ok
+-STATEMENT MATCH (a:T)-[s:S]->(u:U) DELETE s WITH a MATCH (a)-[:R]->(b:T) RETURN b.id;
+---- 1
+2
+-STATEMENT MATCH ()-[s:S]->() RETURN count(*);
+---- 1
+0
+
+# A join with no write below it keeps its semi mask and its result.
+-CASE ReadJoinIsUnchanged
+-STATEMENT CREATE NODE TABLE T(id INT64, v INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM T TO T);
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:T {id: i, v: i});
+---- ok
+-STATEMENT MATCH (a:T {id: 1}), (b:T {id: 2}) CREATE (a)-[:R]->(b);
+---- ok
+-STATEMENT MATCH (a:T) WITH a MATCH (a)-[:R]->(b:T) RETURN b.v;
+---- 1
+2

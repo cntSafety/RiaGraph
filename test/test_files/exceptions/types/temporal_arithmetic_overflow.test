@@ -1,0 +1,183 @@
+-DATASET CSV empty
+
+--
+
+# DATE / TIMESTAMP / INTERVAL arithmetic used to wrap silently. Results are shown through CAST ... AS
+# STRING so that no client conversion is involved. Interval division and formatting of INT64_MIN
+# microseconds are covered by interval_division.test and interval_format_min_micros.test.
+
+-CASE IntervalConstructorsAndArithmetic
+
+-LOG ToUnitOutOfRange
+-STATEMENT RETURN cast(to_years(9223372036854775807) AS STRING);
+---- error
+Overflow exception: Value 9223372036854775807 * 12 is not within INT64 range.
+-STATEMENT RETURN cast(to_years(2147483647) AS STRING);
+---- error
+Overflow exception: Value 25769803764 is not within INT32 range.
+-STATEMENT RETURN cast(to_days(4294967297) AS STRING);
+---- error
+Overflow exception: Value 4294967297 is not within INT32 range.
+-STATEMENT RETURN cast(to_months(2147483648) AS STRING);
+---- error
+Overflow exception: Value 2147483648 is not within INT32 range.
+-STATEMENT RETURN cast(to_hours(9223372036854775807) AS STRING);
+---- error
+Overflow exception: Value 9223372036854775807 * 3600000000 is not within INT64 range.
+-STATEMENT RETURN cast(to_minutes(-9223372036854775807) AS STRING);
+---- error
+Overflow exception: Value -9223372036854775807 * 60000000 is not within INT64 range.
+-STATEMENT RETURN cast(to_seconds(9223372036854775807) AS STRING);
+---- error
+Overflow exception: Value 9223372036854775807 * 1000000 is not within INT64 range.
+-STATEMENT RETURN cast(to_milliseconds(9223372036854775807) AS STRING);
+---- error
+Overflow exception: Value 9223372036854775807 * 1000 is not within INT64 range.
+
+-LOG ToUnitBoundaries
+-STATEMENT RETURN cast(to_years(178956970) AS STRING), cast(to_months(2147483647) AS STRING), cast(to_months(-2147483648) AS STRING), cast(to_days(2147483647) AS STRING), cast(to_days(-2147483648) AS STRING);
+---- 1
+178956970 years|178956970 years 7 months|-178956970 years -8 months|2147483647 days|-2147483648 days
+-STATEMENT RETURN cast(to_hours(2562047788) AS STRING), cast(to_seconds(9223372036854) AS STRING), cast(to_milliseconds(-9223372036854775) AS STRING);
+---- 1
+2562047788:00:00|2562047788:00:54|-2562047788:00:54.775
+
+-LOG IntervalPlusInterval
+-STATEMENT RETURN cast(to_days(2147483647) + to_days(1) AS STRING);
+---- error
+Overflow exception: Value 2147483647 + 1 is not within INT32 range.
+-STATEMENT RETURN cast(to_months(2147483647) + to_months(1) AS STRING);
+---- error
+Overflow exception: Value 2147483647 + 1 is not within INT32 range.
+-STATEMENT RETURN cast(to_microseconds(9223372036854775807) + to_microseconds(1) AS STRING);
+---- error
+Overflow exception: Value 9223372036854775807 + 1 is not within INT64 range.
+-STATEMENT RETURN to_microseconds(9223372036854775807) + to_microseconds(1) > to_microseconds(0);
+---- error
+Overflow exception: Value 9223372036854775807 + 1 is not within INT64 range.
+-STATEMENT RETURN cast(to_days(-2147483648) + to_days(-1) AS STRING);
+---- error
+Overflow exception: Value -2147483648 + -1 is not within INT32 range.
+
+-LOG IntervalMinusInterval
+-STATEMENT RETURN cast(to_days(-2147483648) - to_days(1) AS STRING);
+---- error
+Overflow exception: Value -2147483648 - 1 is not within INT32 range.
+-STATEMENT RETURN cast(to_months(2147483647) - to_months(-1) AS STRING);
+---- error
+Overflow exception: Value 2147483647 - -1 is not within INT32 range.
+-STATEMENT RETURN cast(to_microseconds(-9223372036854775807) - to_microseconds(2) AS STRING);
+---- error
+Overflow exception: Value -9223372036854775807 - 2 is not within INT64 range.
+
+-LOG IntervalArithmeticStillWorks
+-STATEMENT RETURN cast(to_days(2147483646) + to_days(1) AS STRING), cast(to_months(5) + to_months(-7) AS STRING), cast(to_hours(1) + to_minutes(30) AS STRING), cast(to_days(3) - to_days(5) AS STRING), cast(to_hours(1) - to_hours(3) AS STRING);
+---- 1
+2147483647 days|-2 months|01:30:00|-2 days|-02:00:00
+-STATEMENT RETURN cast(to_microseconds(9223372036854775806) + to_microseconds(1) AS STRING), cast(to_microseconds(-9223372036854775807) - to_microseconds(1) AS STRING);
+---- 1
+2562047788:00:54.775807|-2562047788:00:54.775808
+
+-CASE DateArithmetic
+
+-LOG DatePlusInteger
+-STATEMENT RETURN cast(date('2020-01-01') + 9223372036854775807 AS STRING);
+---- error
+Overflow exception: Value 18262 + 9223372036854775807 is not within INT64 range.
+-STATEMENT RETURN cast(date('2020-01-01') + 2147483647 AS STRING);
+---- error
+Overflow exception: Value 2147501909 is not within DATE range.
+-STATEMENT RETURN cast(2147483647 + date('2020-01-01') AS STRING);
+---- error
+Overflow exception: Value 2147501909 is not within DATE range.
+-STATEMENT RETURN cast(date('2020-01-01') - 2147483647 AS STRING);
+---- error
+Overflow exception: Value -2147465385 is not within DATE range.
+-STATEMENT RETURN cast(date('2020-01-01') - 9223372036854775807 AS STRING);
+---- error
+Overflow exception: Value -9223372036854757545 is not within DATE range.
+-STATEMENT RETURN cast(date('2020-01-01') - (-9223372036854775807) AS STRING);
+---- error
+Overflow exception: Value 18262 - -9223372036854775807 is not within INT64 range.
+
+-LOG DateBoundaries
+-STATEMENT RETURN cast(date('294247-12-30') + 1 AS STRING), cast(1 + date('294247-12-30') AS STRING), cast(make_date(-290307,1,2) - 1 AS STRING);
+---- 1
+294247-12-31|294247-12-31|290308-01-01 (BC)
+-STATEMENT RETURN cast(date('294247-12-31') + 1 AS STRING);
+---- error
+Overflow exception: Value 106752347 is not within DATE range.
+-STATEMENT RETURN cast(make_date(-290307,1,1) - 1 AS STRING);
+---- error
+Overflow exception: Value -106751982 is not within DATE range.
+-STATEMENT RETURN cast(date('2020-01-01') + 1 AS STRING), cast(date('2020-01-01') - 365 AS STRING);
+---- 1
+2020-01-02|2019-01-01
+
+-LOG DatePlusMinusInterval
+-STATEMENT RETURN cast(date('2020-01-01') + to_years(178956970) AS STRING);
+---- error
+Conversion exception: Date out of range: 178958990-1-1.
+-STATEMENT RETURN cast(date('2020-01-01') + to_days(2147483647) AS STRING);
+---- error
+Overflow exception: Value 2147501909 is not within DATE range.
+-STATEMENT RETURN cast(date('294247-12-31') + to_days(1) AS STRING);
+---- error
+Overflow exception: Value 106752347 is not within DATE range.
+-STATEMENT RETURN cast(date('2020-01-01') - to_days(-2147483648) AS STRING);
+---- error
+Overflow exception: Value 0 - -2147483648 is not within INT32 range.
+-STATEMENT RETURN cast(date('2020-01-01') + to_microseconds(9223372036854775807) AS STRING);
+---- error
+Overflow exception: Value 106770253 is not within DATE range.
+-STATEMENT RETURN cast(date('2020-01-31') + to_months(1) AS STRING), cast(date('2020-03-01') - to_days(1) AS STRING), cast(date('2020-01-01') - to_months(1) AS STRING), cast(date('2020-01-01') + to_hours(48) AS STRING);
+---- 1
+2020-02-29|2020-02-29|2019-12-01|2020-01-03
+
+-LOG DateToTimestamp
+-STATEMENT RETURN cast(cast(date('294247-01-11') AS TIMESTAMP) AS STRING);
+---- error
+Overflow exception: Value 106751992 * 86400000000 is not within INT64 range.
+-STATEMENT RETURN cast(cast(date('294247-01-10') AS TIMESTAMP) AS STRING);
+---- 1
+294247-01-10 00:00:00
+-STATEMENT RETURN cast(cast(make_date(-290307,1,1) AS TIMESTAMP) AS STRING);
+---- 1
+290308-01-01 (BC) 00:00:00
+
+-CASE TimestampArithmetic
+
+-LOG TimestampPlusMinusInterval
+-STATEMENT RETURN cast(timestamp('2020-01-01 00:00:00') + to_days(2147483647) AS STRING);
+---- error
+Overflow exception: Value 2147501909 is not within DATE range.
+-STATEMENT RETURN cast(timestamp('294247-01-10 04:00:54') + to_hours(1) AS STRING);
+---- error
+Overflow exception: Value 9223372022400000000 + 18054000000 is not within INT64 range.
+-STATEMENT RETURN cast(timestamp('2020-01-01 00:00:00') - to_days(-2147483648) AS STRING);
+---- error
+Overflow exception: Value 0 - -2147483648 is not within INT32 range.
+
+-LOG TimestampBoundaries
+-STATEMENT RETURN cast(timestamp('294247-01-10 04:00:54') + to_microseconds(775807) AS STRING);
+---- 1
+294247-01-10 04:00:54.775807
+-STATEMENT RETURN cast(timestamp('2020-01-01 23:00:00') + to_hours(2) AS STRING), cast(timestamp('2020-01-01 01:00:00') - to_hours(2) AS STRING), cast(timestamp('2020-01-31 00:00:00') + to_months(1) AS STRING);
+---- 1
+2020-01-02 01:00:00|2019-12-31 23:00:00|2020-02-29 00:00:00
+
+-LOG TimestampDifference
+-STATEMENT RETURN cast(timestamp('294247-01-10 04:00:54.775807') - timestamp('2020-01-01 00:00:00') AS STRING);
+---- 1
+106733729 days 04:00:54.775807
+-STATEMENT RETURN cast(timestamp('2020-01-02 00:00:01') - timestamp('2020-01-01 00:00:00') AS STRING), cast(timestamp('2020-01-01 00:00:00') - timestamp('2020-01-02 00:00:01') AS STRING);
+---- 1
+1 day 00:00:01|-1 days -00:00:01
+
+-LOG DateTimestampComparison
+-STATEMENT RETURN date('2100-01-01') > timestamp('2020-01-01 00:00:00'), date('2020-01-01') = timestamp('2020-01-01 00:00:00'), date('2020-01-01') < timestamp('2020-01-01 00:00:01'), date('2020-01-01') >= timestamp('2019-12-31 23:59:59'), date('1900-01-01') < timestamp('2020-01-01 00:00:00');
+---- 1
+True|True|True|True|True
+-STATEMENT RETURN date('294247-12-31') > timestamp('2020-01-01 00:00:00');
+---- error
+Overflow exception: Value 106752346 * 86400000000 is not within INT64 range.

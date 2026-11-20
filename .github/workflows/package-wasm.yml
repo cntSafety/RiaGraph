@@ -6,7 +6,7 @@
 #
 # The package has no extensions. It used to link httpfs statically
 # (-DBUILD_EXTENSIONS=httpfs), but the extension submodule still declares its
-# classes in namespace lbug while the engine is riag, so the generated extension
+# classes in namespace lbug while the engine is riag, so the generated extension  # riag-rename:skip upstream extension namespace
 # loader does not compile. Once RiaGraphExtension is ported, check out
 # `extension` again below and restore EXTRA_CMAKE_FLAGS.
 name: Package WebAssembly

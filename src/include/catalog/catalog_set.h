@@ -1,7 +1,10 @@
 #pragma once
 
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "catalog_entry/catalog_entry.h"
 #include "common/case_insensitive_map.h"
@@ -34,7 +37,15 @@ public:
     bool containsEntry(const transaction::Transaction* transaction, const std::string& name);
     CatalogEntry* getEntry(const transaction::Transaction* transaction, const std::string& name);
     common::oid_t createEntry(transaction::Transaction* transaction,
+        std::unique_ptr<CatalogEntry> entry, bool skipLoggingToWAL = false,
+        std::optional<common::oid_t> restoredOID = std::nullopt);
+    CatalogEntry* replaceNamespaceEntry(transaction::Transaction* transaction,
         std::unique_ptr<CatalogEntry> entry, bool skipLoggingToWAL = false);
+    // Renames a namespace definition in place of its identity: the entry under oldName is
+    // dropped and an entry with the same OID is created under newName, logged to the WAL as
+    // that drop and create. Nothing keyed by the OID changes.
+    void renameNamespaceEntry(transaction::Transaction* transaction, const std::string& oldName,
+        const std::string& newName);
     void dropEntry(transaction::Transaction* transaction, const std::string& name,
         common::oid_t oid);
 
@@ -43,6 +54,15 @@ public:
 
     CatalogEntrySet getEntries(const transaction::Transaction* transaction);
     CatalogEntry* getEntryOfOID(const transaction::Transaction* transaction, common::oid_t oid);
+
+    // Optional numeric access to namespace policy/membership MVCC chains. Other
+    // catalog sets retain their existing lookup path and allocate no directory.
+    void enableNamespaceLookup();
+    CatalogEntry* getNamespaceEntry(const transaction::Transaction* transaction,
+        common::table_id_t tableID, uint64_t groupIndex = common::INVALID_ROW_IDX);
+    std::vector<uint64_t> getNamespaceGroupIndices(common::table_id_t tableID) const;
+    void pruneNamespaceMembershipVersions(common::table_id_t tableID, uint64_t groupIndex,
+        common::transaction_t horizon);
 
     void serialize(common::Serializer serializer) const;
     void serializeSnapshot(common::Serializer serializer,
@@ -83,6 +103,7 @@ private:
 
     void emplaceNoLock(std::unique_ptr<CatalogEntry> entry);
     void eraseNoLock(const std::string& name);
+    void indexNamespaceEntryNoLock(CatalogEntry* entry);
 
     static std::unique_ptr<CatalogEntry> createDummyEntryNoLock(std::string name,
         common::oid_t oid);
@@ -98,10 +119,21 @@ public:
     static constexpr common::oid_t INTERNAL_CATALOG_SET_START_OID = 1LL << 63;
 
 private:
+    struct NamespaceLookup {
+        // Identity keys survive rollback to the original dummy/tombstone entry.
+        std::unordered_map<common::oid_t, std::pair<common::table_id_t, uint64_t>> identities;
+        std::unordered_map<common::table_id_t, std::unordered_map<uint64_t, CatalogEntry*>> heads;
+        // Earlier names of renamed namespace definitions. A rename moves an identity to the
+        // version chain of its new name, so a snapshot older than the rename finds the
+        // identity's visible definition through one of these names. Empty unless a namespace
+        // was renamed since the catalog was loaded.
+        std::unordered_map<common::oid_t, std::vector<std::string>> previousNames;
+    };
     mutable std::shared_mutex mtx;
     Catalog* catalog = nullptr;
     common::oid_t nextOID = 0;
     common::case_insensitive_map_t<std::unique_ptr<CatalogEntry>> entries;
+    std::unique_ptr<NamespaceLookup> namespaceLookup;
 };
 
 } // namespace catalog

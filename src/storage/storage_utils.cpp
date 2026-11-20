@@ -6,6 +6,7 @@
 #include <string_view>
 #endif
 
+#include "common/file_system/file_system.h"
 #include "common/null_buffer.h"
 #include "common/types/list_t.h"
 #include "common/types/string_t.h"
@@ -93,7 +94,7 @@ std::string StorageUtils::expandPath(const main::ClientContext* context, const s
     // when the input already names a Windows drive/UNC path because absolute may
     // consult current_path(), which can fail if the process cwd has been deleted.
     std::filesystem::path normalizedPath;
-    std::filesystem::path filePath{fullPath};
+    const auto filePath = FileSystem::pathFromUTF8(fullPath);
     auto shouldAvoidAbsolute = filePath.is_absolute();
 #if defined(_WIN32) || defined(__EMSCRIPTEN__)
     shouldAvoidAbsolute =
@@ -104,7 +105,15 @@ std::string StorageUtils::expandPath(const main::ClientContext* context, const s
     } else {
         normalizedPath = std::filesystem::absolute(filePath).lexically_normal();
     }
-    return normalizedPath.string();
+    return FileSystem::pathToUTF8(normalizedPath);
+}
+
+std::string StorageUtils::getGraphPath(const std::string& dbPath, const std::string& graphName) {
+    const auto path = FileSystem::pathFromUTF8(dbPath);
+    const auto base = FileSystem::pathToUTF8(path.stem());
+    const auto ext = FileSystem::pathToUTF8(path.extension());
+    const auto graphFile = FileSystem::pathFromUTF8(base + "." + graphName + ext);
+    return FileSystem::pathToUTF8(path.parent_path() / graphFile);
 }
 
 uint32_t StorageUtils::getDataTypeSize(const LogicalType& type) {

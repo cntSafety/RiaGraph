@@ -9,9 +9,11 @@
 
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/assert.h"
 #include "common/cast.h"
 #include "common/data_chunk/data_chunk_state.h"
+#include "common/exception/copy.h"
 #include "common/exception/message.h"
 #include "common/exception/runtime.h"
 #include "common/file_system/file_info.h"
@@ -557,6 +559,17 @@ void NodeBatchInsert::initGlobalStateInternal(ExecutionContext* context) {
         if (target.table == nullptr) {
             continue; // remotely routed: PK handling is the wrapper's job
         }
+        // Rows that a CREATE or MERGE of this transaction inserted into the table live in its
+        // local storage, at the node offsets right after the table's rows (the local table's
+        // start offset), until COMMIT appends them. COPY appends to the table itself, at those
+        // same offsets: two rows would share one node ID, a lookup by key could return the other
+        // row, and the copied keys would never be checked against the local ones.
+        if (transaction->getLocalStorage()->getLocalTable(*target.table) != nullptr) {
+            throw CopyException(std::format(
+                "Cannot COPY into node table {} after rows were inserted into it by CREATE or "
+                "MERGE in the same transaction. Commit the transaction before the COPY.",
+                info->tableName));
+        }
         nodeSharedState->initTargetPKIndex(context, target);
     }
 }
@@ -956,6 +969,13 @@ void NodeBatchInsert::writeAndResetNodeGroup(transaction::Transaction* transacti
             info->insertColumnIDs, sliceToWriteToDisk, pageAllocator);
     }
 
+    const auto namespaceTarget = info->ptrCast<NodeBatchInsertInfo>()->namespaceTarget;
+    if (namespaceTarget != GLOBAL_NAMESPACE_ID && numRowsWritten != 0) {
+        auto& namespaces = nodeTable->getOwningCatalog()->getOrCreateNamespaces();
+        catalog::NamespaceWriteState writer(&namespaces, transaction, nodeTable->getTableID(),
+            false);
+        writer.setRange(nodeOffset, numRowsWritten, namespaceTarget);
+    }
     if (indexBuilder) {
         std::vector<ColumnChunkData*> warningChunkData;
         for (const auto warningDataColumn : info->warningDataColumns) {

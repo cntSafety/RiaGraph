@@ -36,8 +36,9 @@ struct RIAG_API date_t {
     bool operator>=(const timestamp_t& rhs) const;
 
     // arithmetic operators
-    date_t operator+(const int32_t& day) const;
-    date_t operator-(const int32_t& day) const;
+    // Raise an OverflowException when the result is outside the DATE range.
+    date_t operator+(const int64_t& day) const;
+    date_t operator-(const int64_t& day) const;
 
     date_t operator+(const interval_t& interval) const;
     date_t operator-(const interval_t& interval) const;
@@ -92,6 +93,9 @@ public:
         int32_t& out_day);
     // Create a Date object from a specified (year, month, day) combination
     RIAG_API static date_t fromDate(int32_t year, int32_t month, int32_t day);
+    // Create a Date object from a day count since 1970-01-01; raises an OverflowException when the
+    // day is outside the range of valid dates (years MIN_YEAR..MAX_YEAR).
+    RIAG_API static date_t fromDaysChecked(int64_t days);
 
     // Helper function to parse two digits from a string (e.g. "30" -> 30, "03" -> 3, "3" -> 3)
     RIAG_API static bool parseDoubleDigit(const char* buf, uint64_t len, uint64_t& pos,
@@ -108,8 +112,6 @@ public:
     RIAG_API static int32_t getDatePart(DatePartSpecifier specifier, date_t date);
 
     RIAG_API static date_t trunc(DatePartSpecifier specifier, date_t date);
-
-    RIAG_API static int64_t getEpochNanoSeconds(const date_t& date);
 
     RIAG_API static const regex::RE2& regexPattern();
 

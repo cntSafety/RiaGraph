@@ -71,7 +71,8 @@ void FSMLeakChecker::checkForLeakedPages(main::Connection* conn) {
             dropQuery = std::format("CALL DROP_FTS_INDEX('{}', '{}');", tableName, indexName);
         } else if (indexType == "HNSW") {
             dropQuery = std::format("CALL DROP_VECTOR_INDEX('{}', '{}');", tableName, indexName);
-        } else if (indexType == "HASH" || indexType == "ART") {
+        } else if (indexType == "HASH" || indexType == "ART" || indexType == "NAMESPACE_HASH") {
+            // Primary-key indexes (NAMESPACE_HASH: a LOCAL primary key) cannot be dropped.
             continue;
         } else {
             EXPECT_TRUE(false) << "Unknown index type: " << indexType << " (table=" << tableName

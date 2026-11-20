@@ -3,7 +3,12 @@
 // ANTLR4 generates code with unused parameters.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
+// The ASSERT keyword gives the generated contexts an ASSERT() accessor, which the ASSERT(condition)
+// macro of common/assert.h would expand. Push/pop to keep the fix local.
+#pragma push_macro("ASSERT")
+#undef ASSERT
 #include "cypher_parser.h"
+#pragma pop_macro("ASSERT")
 #pragma GCC diagnostic pop
 
 namespace riag {

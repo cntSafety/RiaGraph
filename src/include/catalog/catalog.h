@@ -48,6 +48,7 @@ class RelGroupCatalogEntry;
 class FunctionCatalogEntry;
 class SequenceCatalogEntry;
 class IndexCatalogEntry;
+class NamespaceCatalog;
 
 template<typename T>
 concept TableCatalogEntryType =
@@ -58,7 +59,7 @@ class RIAG_API Catalog {
 
 public:
     Catalog();
-    virtual ~Catalog() = default;
+    virtual ~Catalog();
 
     static Catalog* Get(const main::ClientContext& context);
 
@@ -230,7 +231,12 @@ public:
     // Drop graph entry with name.
     void dropGraph(transaction::Transaction* transaction, const std::string& name);
 
-    void incrementVersion() { version.fetch_add(1, std::memory_order_relaxed); }
+    void incrementVersion(bool invalidatePlans = true) {
+        version.fetch_add(1, std::memory_order_relaxed);
+        if (invalidatePlans) {
+            planVersion.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     uint64_t getVersion() const { return version.load(std::memory_order_relaxed); }
     // Returns the number of catalog changes committed since the last checkpoint.
     // Use this for user-visible version numbers (e.g. CALL catalog_version()).
@@ -249,7 +255,8 @@ public:
     // lastCheckpointVersion only), so it changes iff either counter does and equality implies
     // both are unchanged.
     uint64_t getPlanVersion() const {
-        return getVersion() + columnIDsVersion.load(std::memory_order_relaxed);
+        return planVersion.load(std::memory_order_relaxed) +
+               columnIDsVersion.load(std::memory_order_relaxed);
     }
 
     void setCatalogName(const std::string& name) { catalogName = name; }
@@ -270,6 +277,10 @@ public:
     void serialize(common::Serializer& ser) const;
     void serializeSnapshot(common::Serializer& ser, common::transaction_t snapshotTS) const;
     void deserialize(common::Deserializer& deSer);
+    NamespaceCatalog* getNamespaces() const {
+        return namespaceCatalog.load(std::memory_order_acquire);
+    }
+    NamespaceCatalog& getOrCreateNamespaces();
 
     template<class TARGET>
     TARGET* ptrCast() {
@@ -319,12 +330,16 @@ private:
     // incremented whenever a change is made to the catalog
     // reset to lastCheckpointVersion at the end of each checkpoint
     std::atomic<uint64_t> version;
+    std::atomic<uint64_t> planVersion{0};
     uint64_t lastCheckpointVersion = 0;
     std::atomic<uint64_t> columnIDsVersion{0};
     std::string catalogName;
     std::unique_ptr<storage::StorageManager> storageManager;
     // Main catalog for function lookup (nullptr for the main catalog itself).
     Catalog* functionFallback = nullptr;
+    std::unique_ptr<NamespaceCatalog> namespaceOwner;
+    std::atomic<NamespaceCatalog*> namespaceCatalog{nullptr};
+    std::mutex namespaceCatalogMutex;
 };
 
 } // namespace catalog

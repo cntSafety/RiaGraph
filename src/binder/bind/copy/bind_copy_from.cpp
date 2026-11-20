@@ -4,8 +4,10 @@
 #include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
+#include "catalog/namespace_catalog.h"
 #include "common/exception/binder.h"
 #include "common/string_utils.h"
+#include "main/client_context.h"
 #include "parser/copy.h"
 #include "transaction/transaction.h"
 #include <format>
@@ -66,46 +68,104 @@ std::unique_ptr<BoundStatement> Binder::bindLegacyCopyRelGroupFrom(const Stateme
 
 std::unique_ptr<BoundStatement> Binder::bindCopyFromClause(const Statement& statement) {
     auto& copyStatement = statement.constCast<CopyFrom>();
-    auto tableName = copyStatement.getTableName();
-    auto catalog = Catalog::Get(*clientContext);
-    auto transaction = transaction::Transaction::Get(*clientContext);
-    if (!catalog->containsTable(transaction, tableName)) {
-        return bindLegacyCopyRelGroupFrom(statement);
+    prepareNamespaceWrites(copyStatement.namespaceSelector, {}, false);
+    if (!namespaceWriteDefault) {
+        throw BinderException(
+            "COPY requires one target namespace with a multi-namespace session selection.");
     }
-    auto tableEntry = catalog->getTableCatalogEntry(transaction, tableName);
-    switch (tableEntry->getType()) {
-    case CatalogEntryType::NODE_TABLE_ENTRY: {
-        return bindCopyNodeFrom(statement, *tableEntry->ptrCast<NodeTableCatalogEntry>());
-    }
-    case CatalogEntryType::REL_GROUP_ENTRY: {
-        auto entry = tableEntry->ptrCast<RelGroupCatalogEntry>();
-        auto properties = entry->getProperties();
-        DASSERT(entry->getNumRelTables() > 0);
-        if (entry->getNumRelTables() == 1) {
-            auto fromToNodePair = entry->getSingleRelEntryInfo().nodePair;
-            auto fromTable = catalog->getTableCatalogEntry(transaction, fromToNodePair.srcTableID);
-            auto toTable = catalog->getTableCatalogEntry(transaction, fromToNodePair.dstTableID);
-            return bindCopyRelFrom(statement, *entry, fromTable->getName(), toTable->getName());
-        } else {
-            auto options = bindParsingOptions(copyStatement.getParsingOptions());
-            if (!options.contains(CopyConstants::FROM_OPTION_NAME) ||
-                !options.contains(CopyConstants::TO_OPTION_NAME)) {
-                throw BinderException(std::format(
-                    "The table {} has multiple FROM and TO pairs defined in the schema. A "
-                    "specific pair of FROM and TO options is expected when copying data "
-                    "into "
-                    "the {} table.",
-                    tableName, tableName));
+    const auto target = *namespaceWriteDefault;
+    auto result = [&]() -> std::unique_ptr<BoundStatement> {
+        auto tableName = copyStatement.getTableName();
+        auto catalog = Catalog::Get(*clientContext);
+        auto transaction = transaction::Transaction::Get(*clientContext);
+        if (!catalog->containsTable(transaction, tableName)) {
+            return bindLegacyCopyRelGroupFrom(statement);
+        }
+        auto tableEntry = catalog->getTableCatalogEntry(transaction, tableName);
+        switch (tableEntry->getType()) {
+        case CatalogEntryType::NODE_TABLE_ENTRY: {
+            return bindCopyNodeFrom(statement, *tableEntry->ptrCast<NodeTableCatalogEntry>());
+        }
+        case CatalogEntryType::REL_GROUP_ENTRY: {
+            auto entry = tableEntry->ptrCast<RelGroupCatalogEntry>();
+            auto properties = entry->getProperties();
+            DASSERT(entry->getNumRelTables() > 0);
+            if (entry->getNumRelTables() == 1) {
+                auto fromToNodePair = entry->getSingleRelEntryInfo().nodePair;
+                auto fromTable =
+                    catalog->getTableCatalogEntry(transaction, fromToNodePair.srcTableID);
+                auto toTable =
+                    catalog->getTableCatalogEntry(transaction, fromToNodePair.dstTableID);
+                return bindCopyRelFrom(statement, *entry, fromTable->getName(), toTable->getName());
+            } else {
+                auto options = bindParsingOptions(copyStatement.getParsingOptions());
+                if (!options.contains(CopyConstants::FROM_OPTION_NAME) ||
+                    !options.contains(CopyConstants::TO_OPTION_NAME)) {
+                    throw BinderException(std::format(
+                        "The table {} has multiple FROM and TO pairs defined in the schema. A "
+                        "specific pair of FROM and TO options is expected when copying data "
+                        "into "
+                        "the {} table.",
+                        tableName, tableName));
+                }
+                auto from = options.at(CopyConstants::FROM_OPTION_NAME).getValue<std::string>();
+                auto to = options.at(CopyConstants::TO_OPTION_NAME).getValue<std::string>();
+                return bindCopyRelFrom(statement, *entry, from, to);
             }
-            auto from = options.at(CopyConstants::FROM_OPTION_NAME).getValue<std::string>();
-            auto to = options.at(CopyConstants::TO_OPTION_NAME).getValue<std::string>();
-            return bindCopyRelFrom(statement, *entry, from, to);
+        }
+        default: {
+            UNREACHABLE_CODE;
+        }
+        }
+    }();
+    auto* copy = static_cast<BoundCopyFrom*>(result.get());
+    copy->setNamespaceTarget(target);
+    auto& boundInfo = copy->getMutableInfo();
+    auto* catalog = Catalog::Get(*clientContext);
+    auto* transaction = transaction::Transaction::Get(*clientContext);
+    auto* table = catalog->getTableCatalogEntry(transaction, boundInfo.tableName);
+    const auto* namespaces = catalog->getNamespaces();
+    const auto* policy =
+        namespaces ? namespaces->getPolicy(transaction, table->getTableID()) : nullptr;
+    if (policy && !policy->allowed.contains(target)) {
+        throw BinderException("COPY target namespace is not allowed for this table.");
+    }
+    if (target != GLOBAL_NAMESPACE_ID) {
+        for (const auto* index : catalog->getIndexEntries(transaction, table->getTableID())) {
+            const auto type = StringUtils::getUpper(index->getIndexType());
+            if (type != "HASH" && type != "ART" && type != "NAMESPACE_HASH") {
+                throw BinderException(
+                    "Named namespace COPY is not supported for tables with FTS/vector or "
+                    "other extension indexes in this version.");
+            }
+        }
+        if (table->getType() == CatalogEntryType::NODE_TABLE_ENTRY) {
+            auto& node = table->constCast<NodeTableCatalogEntry>();
+            if (node.isPartitioned() || node.isPartitionChild() || node.getScanFunction() ||
+                !node.getStorage().empty() || node.getStorageFormat() != StorageFormat::NONE) {
+                throw BinderException(
+                    "Named namespace COPY requires an unpartitioned native table.");
+            }
+        } else {
+            auto& rel = table->constCast<RelGroupCatalogEntry>();
+            if (rel.getScanFunction() || !rel.getStorage().empty() ||
+                rel.getStorageFormat() != StorageFormat::NONE) {
+                throw BinderException("Named namespace COPY requires a native table.");
+            }
         }
     }
-    default: {
-        UNREACHABLE_CODE;
+    if (boundInfo.tableType == TableType::REL) {
+        auto* extra = static_cast<ExtraBoundCopyRelInfo*>(boundInfo.extraInfo.get());
+        for (auto& lookup : extra->infos) {
+            const auto* nodePolicy =
+                namespaces ? namespaces->getPolicy(transaction, lookup.nodeTableID) : nullptr;
+            lookup.namespaceTarget = target;
+            lookup.namespaceAware =
+                target != GLOBAL_NAMESPACE_ID ||
+                (nodePolicy && (nodePolicy->hasMembership || nodePolicy->localPrimaryKey));
+        }
     }
-    }
+    return result;
 }
 
 static void bindExpectedNodeColumns(const NodeTableCatalogEntry& entry,

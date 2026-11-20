@@ -688,7 +688,7 @@ void PrimaryKeyIndex::delete_(ValueVector* keyVector) {
         [](auto) { UNREACHABLE_CODE; });
 }
 
-void PrimaryKeyIndex::discardPrimaryKey(ValueVector* keyVector) {
+void PrimaryKeyIndex::discardPrimaryKey(ValueVector* keyVector, offset_t firstOffset) {
     DASSERT(indexInfo.keyDataTypes.size() == 1);
     TypeUtils::visit(
         indexInfo.keyDataTypes[0],
@@ -699,7 +699,7 @@ void PrimaryKeyIndex::discardPrimaryKey(ValueVector* keyVector) {
                     continue;
                 }
                 auto key = keyVector->getValue<T>(pos);
-                discardLocal(key);
+                discardLocal(key, firstOffset + pos);
             }
         },
         [](auto) { UNREACHABLE_CODE; });

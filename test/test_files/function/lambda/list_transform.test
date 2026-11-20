@@ -128,3 +128,46 @@ Binder exception: The second argument of LIST_TRANSFORM should be a lambda expre
 3
 3
 3
+
+-CASE LambdaOutsideLambdaFunction
+-LOG LambdaArgumentIsRejectedByFunctionsThatTakeNone
+# A lambda is bound by the list function that takes it. Passed to any other function it was left
+# without a body, and visiting the unbound expression dereferenced a null pointer.
+-STATEMENT RETURN typeof(x->x);
+---- error
+Binder exception: TYPEOF does not support lambda input.
+-STATEMENT RETURN typeof(C->AST([1, 2, 3], "INT32[3]"));
+---- error
+Binder exception: TYPEOF does not support lambda input.
+-STATEMENT RETURN list_extract([1,2,3], x->x);
+---- error
+Binder exception: LIST_EXTRACT does not support lambda input.
+-STATEMENT RETURN abs(x->x);
+---- error
+Binder exception: ABS does not support lambda input.
+-STATEMENT RETURN count(x->x);
+---- error
+Binder exception: COUNT does not support lambda input.
+-STATEMENT RETURN cast(x->x, 'INT64');
+---- error
+Binder exception: CAST does not support lambda input.
+-STATEMENT RETURN list_transform(x->x, [1,2]);
+---- error
+Binder exception: LIST_TRANSFORM does not support lambda input.
+-STATEMENT RETURN list_transform([1,2], x->typeof(y->y));
+---- error
+Binder exception: TYPEOF does not support lambda input.
+
+-LOG LambdaFunctionsStillBindTheirLambda
+-STATEMENT RETURN list_transform([1,2], x->x+1);
+---- 1
+[2,3]
+-STATEMENT RETURN list_filter([1,2,3], x->x>1);
+---- 1
+[2,3]
+-STATEMENT RETURN list_reduce([1,2,3], (x,y)->x+y);
+---- 1
+6
+-STATEMENT RETURN list_transform(list_transform([1,2], x->x+1), y->y*2);
+---- 1
+[4,6]

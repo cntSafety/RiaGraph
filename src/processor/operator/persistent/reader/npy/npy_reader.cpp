@@ -11,6 +11,7 @@
 
 #ifdef _WIN32
 #include "common/exception/buffer_manager.h"
+#include "common/windows_utils.h"
 #include <errhandlingapi.h>
 #include <handleapi.h>
 #include <io.h>
@@ -38,7 +39,12 @@ namespace processor {
 
 NpyReader::NpyReader(const std::string& filePath)
     : filePath{filePath}, dataOffset{0}, type{LogicalTypeID::ANY} {
+#ifdef _WIN32
+    // The path is UTF-8; the narrow CRT open() would decode it per ANSI code page.
+    fd = _wopen(WindowsUtils::utf8ToUnicode(filePath.c_str()).c_str(), O_RDONLY | O_BINARY);
+#else
     fd = open(filePath.c_str(), O_RDONLY);
+#endif
     if (fd == -1) {
         throw CopyException("Failed to open NPY file.");
     }

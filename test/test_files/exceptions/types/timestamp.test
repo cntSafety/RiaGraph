@@ -56,3 +56,70 @@ Conversion exception: Error occurred during parsing TIMESTAMP_SEC. Given: "2112-
 -STATEMENT MATCH (a:person) return timestamp("2112-08-21 08:21:23.005612Z+021")
 ---- error
 Conversion exception: Error occurred during parsing TIMESTAMP. Given: "2112-08-21 08:21:23.005612Z+021". Expected format: (YYYY-MM-DD hh:mm:ss[.zzzzzz][+-TT[:tt]])
+
+-CASE TimestampNanosecondRange
+
+-LOG LargestAndSmallestTimestampNS
+-STATEMENT RETURN cast('2262-04-11 23:47:16.854775', "TIMESTAMP_NS"), cast('1677-09-21 00:12:43.145225', "TIMESTAMP_NS");
+---- 1
+2262-04-11 23:47:16.854775|1677-09-21 00:12:43.145225
+-STATEMENT RETURN cast('2262-04-11 23:47:16.854775807', "TIMESTAMP_NS") = cast('2262-04-11 23:47:16.854775', "TIMESTAMP_NS");
+---- 1
+True
+-STATEMENT RETURN cast('1677-09-21 00:12:43.145224', "TIMESTAMP_NS");
+---- error
+Overflow exception: Value -9223372036854776 * 1000 is not within INT64 range.
+-STATEMENT RETURN cast('2262-04-11 23:47:17', "TIMESTAMP_NS");
+---- error
+Overflow exception: Value 9223372037000000 * 1000 is not within INT64 range.
+
+-LOG StringBeyondTimestampNS
+-STATEMENT RETURN cast('2434-07-31 13:22:30.678559', "TIMESTAMP_NS");
+---- error
+Overflow exception: Value 14660745750678559 * 1000 is not within INT64 range.
+-STATEMENT RETURN cast('9999-07-31 13:22:30', "TIMESTAMP_NS");
+---- error
+Overflow exception: Value 253389043350000000 * 1000 is not within INT64 range.
+-STATEMENT RETURN cast('1000-01-01 00:00:00', "TIMESTAMP_NS");
+---- error
+Overflow exception: Value -30610224000000000 * 1000 is not within INT64 range.
+
+-LOG TimestampToTimestampNS
+-STATEMENT RETURN cast(cast('2434-07-31 13:22:30.678559', "TIMESTAMP"), "TIMESTAMP_NS");
+---- error
+Overflow exception: Value 14660745750678559 * 1000 is not within INT64 range.
+-STATEMENT RETURN cast(cast('2262-04-11 23:47:16.854775', "TIMESTAMP"), "TIMESTAMP_NS");
+---- 1
+2262-04-11 23:47:16.854775
+
+-LOG DateToTimestampNS
+-STATEMENT RETURN cast(date('2434-07-31'), "TIMESTAMP_NS");
+---- error
+Overflow exception: Value 14660697600000000 * 1000 is not within INT64 range.
+-STATEMENT RETURN cast(date('2262-04-11'), "TIMESTAMP_NS");
+---- 1
+2262-04-11 00:00:00
+
+-LOG ListFunctionOnTimestampNS
+-STATEMENT RETURN list_any_value([NULL, cast('4627-05-03 11:13:25', "TIMESTAMP_NS")]);
+---- error
+Overflow exception: Value 83857374805000000 * 1000 is not within INT64 range.
+
+-LOG TimestampSecAndMsToTimestamp
+-STATEMENT RETURN cast(cast('2262-04-11 23:47:16', "TIMESTAMP_SEC"), "TIMESTAMP_NS");
+---- 1
+2262-04-11 23:47:16
+-STATEMENT RETURN cast(cast('2434-07-31 13:22:30', "TIMESTAMP_SEC"), "TIMESTAMP_NS");
+---- error
+Overflow exception: Value 14660745750000000 * 1000 is not within INT64 range.
+-STATEMENT RETURN cast(cast('2434-07-31 13:22:30', "TIMESTAMP_MS"), "TIMESTAMP_NS");
+---- error
+Overflow exception: Value 14660745750000000 * 1000 is not within INT64 range.
+
+-LOG EpochMsBeyondTimestamp
+-STATEMENT RETURN epoch_ms(9223372036854775807);
+---- error
+Overflow exception: Value 9223372036854775807 * 1000 is not within INT64 range.
+-STATEMENT RETURN epoch_ms(1000);
+---- 1
+1970-01-01 00:00:01

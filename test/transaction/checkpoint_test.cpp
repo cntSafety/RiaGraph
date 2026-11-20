@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -75,6 +76,15 @@ public:
     static void resetCheckpointer(main::ClientContext& context) {
         TransactionManager::Get(context)->initCheckpointerFunc =
             TransactionManager::initCheckpointer;
+    }
+
+    // The two mutexes of the transaction manager that tests which pin down an interleaving
+    // need to hold themselves. Lock order is the write gate, then the public lock.
+    static std::mutex& writeGate(TransactionManager& transactionManager) {
+        return transactionManager.mtxForStartingNewTransactions;
+    }
+    static std::mutex& publicFunctionLock(TransactionManager& transactionManager) {
+        return transactionManager.mtxForSerializingPublicFunctionCalls;
     }
 
 private:
@@ -4989,7 +4999,228 @@ protected:
         BaseGraphTest::SetUp();
         createDBAndConn();
     }
+
+    // A checkpoint is draining one active writer (conn1) while a second writer (conn3) begins.
+    // The begin must wait for the checkpoint's write gate without holding the transaction
+    // manager's public-function lock: that lock is what conn1's commit needs in order to leave,
+    // so a begin blocked on the gate while holding it stalls the commit until the checkpoint's
+    // drain times out and fails.
+    void runWriterBeginsDuringCheckpointDrain(bool enableMultiWrites) {
+        // The blocked CHECKPOINT and BEGIN statements each occupy one of the task scheduler's
+        // busy slots (maxNumThreads, 2 by default in tests). With every slot taken the COMMIT
+        // would queue behind them for that reason alone, hiding the lock this test is about.
+        systemConfig->maxNumThreads = 8;
+        createDBAndConn();
+        conn->query("CALL auto_checkpoint=false;");
+        conn->query(std::format("CALL debug_enable_multi_writes={};", enableMultiWrites));
+        ASSERT_TRUE(
+            conn->query("CREATE NODE TABLE drain_begin(id INT64 PRIMARY KEY);")->isSuccess());
+
+        auto conn1 = std::make_unique<riag::main::Connection>(database.get());
+        auto conn2 = std::make_unique<riag::main::Connection>(database.get());
+        auto conn3 = std::make_unique<riag::main::Connection>(database.get());
+        ASSERT_TRUE(conn1->query("BEGIN TRANSACTION;")->isSuccess());
+        ASSERT_TRUE(conn1->query("CREATE (:drain_begin {id: 1});")->isSuccess());
+
+        // The checkpoint takes the write gate and waits for conn1 to leave.
+        std::promise<bool> ckptOk;
+        auto ckptFuture = ckptOk.get_future();
+        std::thread ckptThread(
+            [&]() { ckptOk.set_value(conn2->query("CHECKPOINT;")->isSuccess()); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // A second writer begins inside that drain window.
+        std::promise<bool> beginOk;
+        auto beginFuture = beginOk.get_future();
+        std::thread beginThread(
+            [&]() { beginOk.set_value(conn3->query("BEGIN TRANSACTION;")->isSuccess()); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        const auto start = std::chrono::steady_clock::now();
+        auto commitResult = conn1->query("COMMIT;");
+        const auto commitMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start)
+                                      .count();
+        EXPECT_TRUE(commitResult->isSuccess()) << commitResult->getErrorMessage();
+        // The drain timeout is 5 s; a commit stalled behind the blocked begin takes about that.
+        EXPECT_LT(commitMillis, 2000) << "commit stalled behind a writer waiting on the write gate";
+        GTEST_LOG_(INFO) << "commit took " << commitMillis << " ms";
+
+        EXPECT_TRUE(ckptFuture.get()) << "CHECKPOINT failed";
+        EXPECT_TRUE(beginFuture.get()) << "second writer failed to begin";
+        ckptThread.join();
+        beginThread.join();
+        ASSERT_TRUE(conn3->query("COMMIT;")->isSuccess());
+
+        auto res = conn->query("MATCH (n:drain_begin) RETURN count(n);");
+        ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+        ASSERT_EQ(res->getNext()->getValue(0)->getValue<int64_t>(), 1);
+    }
 };
+
+TEST_F(ReviewFixesTest, WriterBeginningDuringCheckpointDrainDoesNotStallCommit) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runWriterBeginsDuringCheckpointDrain(true /* enableMultiWrites */);
+}
+
+TEST_F(ReviewFixesTest, WriterBeginningDuringCheckpointDrainDoesNotStallCommitSingleWriter) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runWriterBeginsDuringCheckpointDrain(false /* enableMultiWrites */);
+}
+
+// The checkpoint decides which snapshots to retain from the open transactions it sees under the
+// public lock once it holds the write gate. Readers that began after its pre-gate sample are
+// only known through that second look, and so are writers that began between the sample and
+// the gate. When the public lock is busy at that instant (a begin, commit or rollback is in
+// flight) the checkpoint used to fall back to a retention horizon equal to the snapshot
+// timestamp. That drops the commit stamp of everything committed after the reader began but
+// before the snapshot, so the reader saw those rows after the checkpoint.
+//
+// This test pins the interleaving down instead of racing for it:
+//  1. The test holds the write gate. Two writers start BEGIN and queue on it (multi writes, so
+//     they can overlap), and then CHECKPOINT starts and queues behind them. Nothing is
+//     registered as open yet, so whatever the checkpoint samples before it takes the gate is
+//     empty.
+//  2. A reader begins. The checkpoint cannot have seen it.
+//  3. The gate is released. The writers begin first, the checkpoint takes the gate and drains
+//     them. Each writer inserts a row and commits, so the first commit lands after the reader
+//     began and before the snapshot timestamp.
+//  4. Once the drain is over a hook in the checkpointer factory (it runs on the checkpoint
+//     thread, under the gate, before the snapshot is taken) makes another thread hold the
+//     public lock for a while, which is what a commit in its last instructions looks like.
+// The order in which the OS wakes the threads blocked on the gate is not guaranteed, so the
+// scenario is retried if the checkpoint overtook a writer.
+TEST_F(ReviewFixesTest, CheckpointRetainsReaderThatBeganAfterPreGateSampleWhenPublicLockBusy) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    // Blocked statements each occupy a task scheduler slot (maxNumThreads, 2 by default).
+    systemConfig->maxNumThreads = 8;
+    createDBAndConn();
+    conn->query("CALL auto_checkpoint=false;");
+    conn->query("CALL debug_enable_multi_writes=true;");
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE gap_reader(id INT64 PRIMARY KEY);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:gap_reader {id: 0});")->isSuccess());
+
+    auto* transactionManager = TransactionManager::Get(*getClientContext(*conn));
+    auto connCkpt = std::make_unique<riag::main::Connection>(database.get());
+    auto connReader = std::make_unique<riag::main::Connection>(database.get());
+    auto connW1 = std::make_unique<riag::main::Connection>(database.get());
+    auto connW2 = std::make_unique<riag::main::Connection>(database.get());
+    auto countRows = [](riag::main::Connection& connection) {
+        auto res = connection.query("MATCH (n:gap_reader) RETURN count(n);");
+        EXPECT_TRUE(res->isSuccess()) << res->getErrorMessage();
+        return res->isSuccess() ? res->getNext()->getValue(0)->getValue<int64_t>() : -1;
+    };
+
+    std::thread publicLockHolder;
+    std::atomic<bool> publicLockHeld{false};
+    FlakyCheckpointer holdPublicLock([&](main::ClientContext& context) {
+        publicLockHeld = false;
+        publicLockHolder = std::thread([&]() {
+            std::unique_lock lck{FlakyCheckpointer::publicFunctionLock(*transactionManager)};
+            publicLockHeld = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        });
+        while (!publicLockHeld) {
+            std::this_thread::yield();
+        }
+        return std::make_unique<Checkpointer>(context);
+    });
+    holdPublicLock.setCheckpointer(*getClientContext(*conn));
+
+    const auto sleepMillis = [](int millis) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(millis));
+    };
+    const auto isReady = [](std::future<bool>& future) {
+        return future.valid() &&
+               future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    };
+    // Commits a writer that began, whenever its BEGIN has returned.
+    const auto finishWriter = [](std::future<bool>& begin, riag::main::Connection& connection) {
+        if (begin.valid() && begin.get()) {
+            EXPECT_TRUE(connection.query("COMMIT;")->isSuccess());
+        }
+    };
+
+    // Returns whether the interleaving above was reached.
+    const auto runAttempt = [&](int64_t attempt) {
+        // Declared before the gate lock: on any exit the gate is released first, which
+        // unblocks the futures that are destroyed (and waited for) after it.
+        std::future<bool> ckpt, w1Begin, w2Begin;
+        std::unique_lock gate{FlakyCheckpointer::writeGate(*transactionManager), std::defer_lock};
+        gate.lock();
+        w1Begin = std::async(std::launch::async,
+            [&]() { return connW1->query("BEGIN TRANSACTION;")->isSuccess(); });
+        sleepMillis(200);
+        w2Begin = std::async(std::launch::async,
+            [&]() { return connW2->query("BEGIN TRANSACTION;")->isSuccess(); });
+        sleepMillis(200);
+        // The writers are queued on the gate and not registered yet, so the checkpoint sees no
+        // open transaction. It queues on the gate behind them.
+        ckpt = std::async(std::launch::async,
+            [&]() { return connCkpt->query("CHECKPOINT;")->isSuccess(); });
+        sleepMillis(300);
+        EXPECT_TRUE(connReader->query("BEGIN TRANSACTION READ ONLY;")->isSuccess());
+        const auto rowsBefore = countRows(*connReader);
+        gate.unlock();
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+        w1Begin.wait_until(deadline);
+        w2Begin.wait_until(deadline);
+        const auto reached = isReady(w1Begin) && isReady(w2Begin) && !isReady(ckpt);
+        GTEST_LOG_(INFO) << "attempt " << attempt << ": w1 begun " << isReady(w1Begin)
+                         << ", w2 begun " << isReady(w2Begin) << ", checkpoint done "
+                         << isReady(ckpt);
+        if (reached) {
+            EXPECT_TRUE(w1Begin.get());
+            EXPECT_TRUE(w2Begin.get());
+            EXPECT_TRUE(
+                connW1->query(std::format("CREATE (:gap_reader {{id: {}}});", 100 * attempt + 1))
+                    ->isSuccess());
+            EXPECT_TRUE(connW1->query("COMMIT;")->isSuccess());
+            EXPECT_TRUE(
+                connW2->query(std::format("CREATE (:gap_reader {{id: {}}});", 100 * attempt + 2))
+                    ->isSuccess());
+            EXPECT_TRUE(connW2->query("COMMIT;")->isSuccess());
+            EXPECT_TRUE(ckpt.get()) << "CHECKPOINT failed";
+        } else {
+            // The checkpoint overtook a writer: wind everything down and try again.
+            finishWriter(w1Begin, *connW1);
+            finishWriter(w2Begin, *connW2);
+            if (ckpt.valid()) {
+                ckpt.get();
+            }
+            finishWriter(w1Begin, *connW1);
+            finishWriter(w2Begin, *connW2);
+        }
+        if (publicLockHolder.joinable()) {
+            publicLockHolder.join();
+        }
+        if (reached) {
+            EXPECT_EQ(countRows(*connReader), rowsBefore)
+                << "A commit that landed after the reader began leaked into its snapshot "
+                   "through the checkpoint";
+        }
+        EXPECT_TRUE(connReader->query("COMMIT;")->isSuccess());
+        if (reached) {
+            EXPECT_EQ(countRows(*conn), rowsBefore + 2);
+        }
+        return reached;
+    };
+
+    auto reached = false;
+    for (auto attempt = 1; attempt <= 10 && !reached; attempt++) {
+        reached = runAttempt(attempt);
+    }
+    FlakyCheckpointer::resetCheckpointer(*getClientContext(*conn));
+    EXPECT_TRUE(reached) << "never reached the interleaving: the checkpoint always overtook a "
+                            "writer queued on the write gate";
+}
 
 // Fix #1 – lastTimestamp data race
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5672,6 +5903,723 @@ TEST_F(ReviewFixesTest, ConsecutivePinnedCheckpointsRecoverAfterCrash) {
     const std::vector<std::pair<int64_t, int64_t>> expectedRows = {{1, 0}, {2, 0}, {3, 0}, {4, 0},
         {5, 0}, {6, 6}, {7, 7}, {8, 8}};
     EXPECT_EQ(rows, expectedRows);
+}
+
+// A checkpoint taken while a reader pins the WAL appends its CHECKPOINT record to the active WAL
+// without rotating it, and writes the pinned-checkpoint marker once it is complete. A commit that
+// follows lands behind that record. If the process then dies in the middle of the next
+// checkpoint, after its shadow file exists but before its own CHECKPOINT record, recovery must
+// still replay that commit: it was acknowledged.
+//
+// Recovery that treats the first CHECKPOINT record of the WAL as the possibly incomplete one
+// replays the records before it onto a data file that already contains them and drops everything
+// after it.
+//
+// The "crash" is a copy of every file of the database directory taken at the moment the
+// checkpointer would be killed; the copy is what the database is reopened from. The checkpoint
+// itself is let fail normally in the process, which rolls the live files back, so the live files
+// are not what the test recovers from.
+class CheckpointerCrashesBeforeCheckpointRecord final : public Checkpointer {
+public:
+    CheckpointerCrashesBeforeCheckpointRecord(main::ClientContext& context, bool flushShadowFirst,
+        std::function<void()> takeSnapshot)
+        : Checkpointer(context), flushShadowFirst{flushShadowFirst},
+          takeSnapshot{std::move(takeSnapshot)} {}
+
+protected:
+    void logCheckpointAndApplyShadowPages(bool /*walRotated*/) override {
+        if (flushShadowFirst) {
+            // The shadow file holds the checkpoint's pages durably, only the commit point (the
+            // CHECKPOINT record) is missing.
+            mainStorageManager->getShadowFile().flushAll(
+                mainStorageManager->getOrInitDatabaseID(clientContext));
+        }
+        takeSnapshot();
+        throw RuntimeException("simulated crash before the CHECKPOINT record");
+    }
+
+private:
+    bool flushShadowFirst;
+    std::function<void()> takeSnapshot;
+};
+
+class CrashDuringCheckpointAfterPinnedCheckpointTest : public ReviewFixesTest {
+protected:
+    bool markerExists() const {
+        return std::filesystem::exists(StorageUtils::getPinnedCheckpointMarkerPath(databasePath));
+    }
+
+    static void copyFiles(const std::filesystem::path& from, const std::filesystem::path& to) {
+        std::filesystem::create_directories(to);
+        for (const auto& entry : std::filesystem::directory_iterator(from)) {
+            if (entry.is_regular_file()) {
+                std::filesystem::copy_file(entry.path(), to / entry.path().filename(),
+                    std::filesystem::copy_options::overwrite_existing);
+            }
+        }
+    }
+
+    static void removeFiles(const std::filesystem::path& directory) {
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            if (entry.is_regular_file()) {
+                std::filesystem::remove(entry.path());
+            }
+        }
+    }
+
+    std::vector<std::pair<int64_t, int64_t>> readRows() {
+        auto res = conn->query("MATCH (p:P) RETURN p.id, p.v ORDER BY p.id;");
+        EXPECT_TRUE(res->isSuccess()) << res->getErrorMessage();
+        std::vector<std::pair<int64_t, int64_t>> rows;
+        while (res->isSuccess() && res->hasNext()) {
+            auto row = res->getNext();
+            rows.emplace_back(row->getValue(0)->getValue<int64_t>(),
+                row->getValue(1)->getValue<int64_t>());
+        }
+        return rows;
+    }
+
+    // Row A is the table and its five rows (before the first CHECKPOINT), row B the commit made
+    // after it.
+    static std::vector<std::pair<int64_t, int64_t>> expectedRows() {
+        return {{1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}, {6, 6}};
+    }
+
+    void createRowAAndPinnedCheckpoint(std::unique_ptr<riag::main::Connection>& readerConn) {
+        ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+        ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+        ASSERT_TRUE(
+            conn->query("CREATE NODE TABLE P(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+        ASSERT_TRUE(conn->query("UNWIND range(1, 5) AS i CREATE (:P {id: i, v: 0});")->isSuccess());
+        if (readerConn) {
+            ASSERT_TRUE(readerConn->query("BEGIN TRANSACTION READ ONLY;")->isSuccess());
+        }
+        // With a reader open this CHECKPOINT does not rotate the WAL: its record stays in the
+        // active WAL and the pinned-checkpoint marker is written.
+        ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
+    }
+
+    using SnapshotFn = std::function<void()>;
+    using CheckpointerFactory =
+        std::function<std::unique_ptr<Checkpointer>(main::ClientContext&, SnapshotFn)>;
+
+    // Runs a CHECKPOINT whose checkpointer (made by the factory) calls the given function at the
+    // point where the process "dies" and fails afterwards. The function copies every file of the
+    // database directory. Returns after replacing the live files with the files as they were at
+    // that moment, so the next open recovers from them.
+    void crashWith(const CheckpointerFactory& factory,
+        std::unique_ptr<riag::main::Connection>& readerConn, bool* shadowExistedAtCrash = nullptr) {
+        const auto directory = std::filesystem::path(databasePath).parent_path();
+        const auto snapshotDirectory =
+            directory.parent_path() / (directory.filename().string() + "_crash_snapshot");
+        std::filesystem::remove_all(snapshotDirectory);
+        bool snapshotTaken = false;
+        bool shadowExists = false;
+        FlakyCheckpointer flakyCheckpointer([&](main::ClientContext& context) {
+            return factory(context, [&]() {
+                shadowExists =
+                    std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath));
+                copyFiles(directory, snapshotDirectory);
+                snapshotTaken = true;
+            });
+        });
+        flakyCheckpointer.setCheckpointer(*getClientContext(*conn));
+        ASSERT_FALSE(conn->query("CHECKPOINT;")->isSuccess());
+        ASSERT_TRUE(snapshotTaken);
+        if (shadowExistedAtCrash != nullptr) {
+            *shadowExistedAtCrash = shadowExists;
+        }
+        readerConn.reset();
+        conn.reset();
+        database.reset();
+        removeFiles(directory);
+        copyFiles(snapshotDirectory, directory);
+        std::filesystem::remove_all(snapshotDirectory);
+    }
+
+    // Runs a second CHECKPOINT that "dies" before its CHECKPOINT record.
+    void crashDuringNextCheckpoint(bool flushShadowFirst,
+        std::unique_ptr<riag::main::Connection>& readerConn) {
+        bool shadowExistedAtCrash = false;
+        crashWith(
+            [&](main::ClientContext& context, SnapshotFn snapshot) {
+                return std::make_unique<CheckpointerCrashesBeforeCheckpointRecord>(context,
+                    flushShadowFirst, std::move(snapshot));
+            },
+            readerConn, &shadowExistedAtCrash);
+        ASSERT_TRUE(shadowExistedAtCrash)
+            << "The crash has to happen after the shadow file of the checkpoint exists";
+    }
+
+    void reopenAfterCrashAndCheckRows() {
+        try {
+            createDBAndConn();
+        } catch (const std::exception& e) {
+            FAIL() << "Recovery after the crash failed: " << e.what();
+        }
+        EXPECT_EQ(readRows(), expectedRows());
+    }
+};
+
+TEST_F(CrashDuringCheckpointAfterPinnedCheckpointTest, ActiveWALCrashAfterShadowFlushed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    ASSERT_TRUE(markerExists());
+    ASSERT_TRUE(conn->query("CREATE (:P {id: 6, v: 6});")->isSuccess());
+    // The reader is still open: the second CHECKPOINT does not rotate either, the WAL is
+    // [header, C1, CHECKPOINT, C2] at the crash.
+    crashDuringNextCheckpoint(true /* flushShadowFirst */, readerConn);
+    reopenAfterCrashAndCheckRows();
+}
+
+TEST_F(CrashDuringCheckpointAfterPinnedCheckpointTest, ActiveWALCrashBeforeShadowFlushed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    ASSERT_TRUE(conn->query("CREATE (:P {id: 6, v: 6});")->isSuccess());
+    crashDuringNextCheckpoint(false /* flushShadowFirst */, readerConn);
+    reopenAfterCrashAndCheckRows();
+}
+
+// The database is closed and reopened between the commit and the second checkpoint, so that
+// checkpoint runs with no reader open and rotates the active WAL, which still holds the
+// CHECKPOINT record of the first one, into the frozen WAL.
+TEST_F(CrashDuringCheckpointAfterPinnedCheckpointTest, FrozenWALCrashAfterShadowFlushed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    ASSERT_TRUE(conn->query("CREATE (:P {id: 6, v: 6});")->isSuccess());
+    readerConn.reset();
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_EQ(readRows(), expectedRows());
+    crashDuringNextCheckpoint(true /* flushShadowFirst */, readerConn);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)))
+        << "The snapshot of the crash has to hold a frozen WAL";
+    reopenAfterCrashAndCheckRows();
+}
+
+TEST_F(CrashDuringCheckpointAfterPinnedCheckpointTest, FrozenWALCrashBeforeShadowFlushed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    ASSERT_TRUE(conn->query("CREATE (:P {id: 6, v: 6});")->isSuccess());
+    readerConn.reset();
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    crashDuringNextCheckpoint(false /* flushShadowFirst */, readerConn);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)));
+    reopenAfterCrashAndCheckRows();
+}
+
+// The records before the first CHECKPOINT record are replayed onto a data file that already holds
+// them when recovery trusts the wrong CHECKPOINT record. Creating the tables, which makes that
+// replay fail loudly, happens in an earlier checkpoint here, so the replayed prefix only adds a
+// relationship: replaying it again succeeds, doubling that relationship, and the commit behind the
+// CHECKPOINT record is dropped without an error.
+class CrashDuringCheckpointAfterPinnedRelCheckpointTest
+    : public CrashDuringCheckpointAfterPinnedCheckpointTest {
+protected:
+    std::vector<std::pair<int64_t, int64_t>> readRels() {
+        auto res = conn->query("MATCH (a:N)-[e:R]->(b:N) RETURN a.id, b.id ORDER BY a.id, b.id;");
+        EXPECT_TRUE(res->isSuccess()) << res->getErrorMessage();
+        std::vector<std::pair<int64_t, int64_t>> rels;
+        while (res->isSuccess() && res->hasNext()) {
+            auto row = res->getNext();
+            rels.emplace_back(row->getValue(0)->getValue<int64_t>(),
+                row->getValue(1)->getValue<int64_t>());
+        }
+        return rels;
+    }
+
+    void createNodesCheckpointAndRelA(std::unique_ptr<riag::main::Connection>& readerConn) {
+        ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+        ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+        ASSERT_TRUE(conn->query("CREATE NODE TABLE N(id INT64 PRIMARY KEY);")->isSuccess());
+        ASSERT_TRUE(conn->query("CREATE REL TABLE R(FROM N TO N);")->isSuccess());
+        ASSERT_TRUE(conn->query("UNWIND range(1, 3) AS i CREATE (:N {id: i});")->isSuccess());
+        // No reader yet: this checkpoint rotates and retires the WAL, so the tables and nodes
+        // are in the data file and not in the WAL any more.
+        ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
+        ASSERT_FALSE(std::filesystem::exists(StorageUtils::getWALFilePath(databasePath)));
+        ASSERT_TRUE(readerConn->query("BEGIN TRANSACTION READ ONLY;")->isSuccess());
+        ASSERT_TRUE(conn->query("MATCH (a:N), (b:N) WHERE a.id = 1 AND b.id = 2 "
+                                "CREATE (a)-[:R]->(b);")
+                        ->isSuccess());
+        ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
+        ASSERT_TRUE(
+            std::filesystem::exists(StorageUtils::getPinnedCheckpointMarkerPath(databasePath)));
+        ASSERT_TRUE(conn->query("MATCH (a:N), (b:N) WHERE a.id = 2 AND b.id = 3 "
+                                "CREATE (a)-[:R]->(b);")
+                        ->isSuccess());
+    }
+
+    void reopenAfterCrashAndCheckRels() {
+        try {
+            createDBAndConn();
+        } catch (const std::exception& e) {
+            FAIL() << "Recovery after the crash failed: " << e.what();
+        }
+        const std::vector<std::pair<int64_t, int64_t>> expectedRels = {{1, 2}, {2, 3}};
+        EXPECT_EQ(readRels(), expectedRels);
+    }
+};
+
+TEST_F(CrashDuringCheckpointAfterPinnedRelCheckpointTest, ActiveWALCrashAfterShadowFlushed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createNodesCheckpointAndRelA(readerConn);
+    crashDuringNextCheckpoint(true /* flushShadowFirst */, readerConn);
+    reopenAfterCrashAndCheckRels();
+}
+
+TEST_F(CrashDuringCheckpointAfterPinnedRelCheckpointTest, FrozenWALCrashAfterShadowFlushed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createNodesCheckpointAndRelA(readerConn);
+    readerConn.reset();
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_EQ(readRels(), (std::vector<std::pair<int64_t, int64_t>>{{1, 2}, {2, 3}}));
+    crashDuringNextCheckpoint(true /* flushShadowFirst */, readerConn);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)));
+    reopenAfterCrashAndCheckRels();
+}
+
+// Crash windows around a pinned checkpoint. A pinned checkpoint leaves a CHECKPOINT record at the
+// end of the active WAL and, once its cleanup is done, the pinned-checkpoint marker. Every test
+// below recovers from a copy of the database directory taken at one point of the checkpoint
+// protocol (see crashWith), the way the #107 tests do.
+class CheckpointerCrashesInShadowCleanup final : public Checkpointer {
+public:
+    enum class Point { BeforeShadowCleanup, AfterShadowCleanup };
+
+    CheckpointerCrashesInShadowCleanup(main::ClientContext& context, Point point,
+        std::function<void()> takeSnapshot)
+        : Checkpointer(context), point{point}, takeSnapshot{std::move(takeSnapshot)} {}
+
+protected:
+    void beforeShadowCleanup() override {
+        if (point == Point::BeforeShadowCleanup) {
+            crash();
+        }
+    }
+    void afterShadowCleanup() override {
+        if (point == Point::AfterShadowCleanup) {
+            crash();
+        }
+    }
+
+private:
+    void crash() {
+        takeSnapshot();
+        throw RuntimeException("simulated crash in the cleanup of the checkpoint");
+    }
+
+    Point point;
+    std::function<void()> takeSnapshot;
+};
+
+// The CHECKPOINT record is durable, the shadow pages are not applied yet.
+class CheckpointerCrashesAfterCheckpointRecord final : public Checkpointer {
+public:
+    CheckpointerCrashesAfterCheckpointRecord(main::ClientContext& context,
+        std::function<void()> takeSnapshot)
+        : Checkpointer(context), takeSnapshot{std::move(takeSnapshot)} {}
+
+protected:
+    void logCheckpointAndApplyShadowPages(bool walRotated) override {
+        mainStorageManager->getShadowFile().flushAll(
+            mainStorageManager->getOrInitDatabaseID(clientContext));
+        if (walRotated) {
+            WAL::Get(clientContext)->logAndFlushCheckpointToFrozen(&clientContext);
+        } else {
+            WAL::Get(clientContext)->logAndFlushCheckpoint(&clientContext);
+        }
+        takeSnapshot();
+        throw RuntimeException("simulated crash after the CHECKPOINT record");
+    }
+
+private:
+    std::function<void()> takeSnapshot;
+};
+
+// Lets the checkpoint finish, but keeps a second name for the shadow file just before the
+// cleanup removes it, to see what the cleanup did to the file itself.
+class CheckpointerLinksShadowFile final : public Checkpointer {
+public:
+    CheckpointerLinksShadowFile(main::ClientContext& context, std::string shadowPath,
+        std::string linkPath)
+        : Checkpointer(context), shadowPath{std::move(shadowPath)}, linkPath{std::move(linkPath)} {}
+
+protected:
+    void beforeShadowCleanup() override { std::filesystem::create_hard_link(shadowPath, linkPath); }
+
+private:
+    std::string shadowPath;
+    std::string linkPath;
+};
+
+class PinnedCheckpointCrashWindowsTest : public CrashDuringCheckpointAfterPinnedCheckpointTest {
+protected:
+    static std::vector<std::pair<int64_t, int64_t>> rowsOfFirstCheckpoint() {
+        return {{1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}};
+    }
+
+    void reopenAndCheckRows(const std::vector<std::pair<int64_t, int64_t>>& expected) {
+        try {
+            createDBAndConn();
+        } catch (const std::exception& e) {
+            FAIL() << "Recovery after the crash failed: " << e.what();
+        }
+        EXPECT_EQ(readRows(), expected);
+    }
+
+    void createRowsWithReader(std::unique_ptr<riag::main::Connection>& readerConn) {
+        ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+        ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+        ASSERT_TRUE(
+            conn->query("CREATE NODE TABLE P(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+        ASSERT_TRUE(conn->query("UNWIND range(1, 5) AS i CREATE (:P {id: i, v: 0});")->isSuccess());
+        ASSERT_TRUE(readerConn->query("BEGIN TRANSACTION READ ONLY;")->isSuccess());
+    }
+
+    // Reopens the database without a reader: the next checkpoint rotates the WAL.
+    void reopenWithoutReader(std::unique_ptr<riag::main::Connection>& readerConn) {
+        readerConn.reset();
+        conn.reset();
+        database.reset();
+        createDBAndConn();
+        ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+        ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    }
+
+    CheckpointerFactory cleanupCrash(CheckpointerCrashesInShadowCleanup::Point point) {
+        return [point](main::ClientContext& context, SnapshotFn snapshot) {
+            return std::make_unique<CheckpointerCrashesInShadowCleanup>(context, point,
+                std::move(snapshot));
+        };
+    }
+};
+
+// The cleanup of a checkpoint must not truncate the shadow file before it removes it: a crash in
+// between leaves an empty shadow file behind a durable CHECKPOINT record, which recovery has to
+// refuse because it cannot tell it from a shadow file that was lost.
+TEST_F(PinnedCheckpointCrashWindowsTest, ShadowFileIsNotTruncatedBeforeItIsRemoved) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    ASSERT_TRUE(conn->query("CREATE (:P {id: 6, v: 6});")->isSuccess());
+    const auto shadowPath = StorageUtils::getShadowFilePath(databasePath);
+    const auto linkPath = shadowPath + ".link";
+    std::filesystem::remove(linkPath);
+    FlakyCheckpointer flakyCheckpointer([&](main::ClientContext& context) {
+        return std::make_unique<CheckpointerLinksShadowFile>(context, shadowPath, linkPath);
+    });
+    flakyCheckpointer.setCheckpointer(*getClientContext(*conn));
+    ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
+    FlakyCheckpointer::resetCheckpointer(*getClientContext(*conn));
+    ASSERT_FALSE(std::filesystem::exists(shadowPath));
+    ASSERT_TRUE(std::filesystem::exists(linkPath));
+    EXPECT_GT(std::filesystem::file_size(linkPath), 0u)
+        << "The shadow file was truncated before it was removed";
+    std::filesystem::remove(linkPath);
+}
+
+// First pinned checkpoint, the process dies after the shadow file is removed.
+TEST_F(PinnedCheckpointCrashWindowsTest, FirstPinnedCheckpointCrashAfterShadowRemoved) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowsWithReader(readerConn);
+    crashWith(cleanupCrash(CheckpointerCrashesInShadowCleanup::Point::AfterShadowCleanup),
+        readerConn);
+    ASSERT_FALSE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+    reopenAndCheckRows(rowsOfFirstCheckpoint());
+}
+
+// First pinned checkpoint, the process dies before the shadow file is removed.
+TEST_F(PinnedCheckpointCrashWindowsTest, FirstPinnedCheckpointCrashBeforeShadowRemoved) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowsWithReader(readerConn);
+    crashWith(cleanupCrash(CheckpointerCrashesInShadowCleanup::Point::BeforeShadowCleanup),
+        readerConn);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+    reopenAndCheckRows(rowsOfFirstCheckpoint());
+}
+
+// A marker without an offset (written by an older version, or only partly written) does not say
+// which CHECKPOINT record it belongs to; a full shadow file behind the trailing record is applied
+// again, as it always was.
+TEST_F(PinnedCheckpointCrashWindowsTest, MarkerWithoutOffsetKeepsTheShadowFile) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowsWithReader(readerConn);
+    crashWith(cleanupCrash(CheckpointerCrashesInShadowCleanup::Point::BeforeShadowCleanup),
+        readerConn);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+    const auto markerPath = StorageUtils::getPinnedCheckpointMarkerPath(databasePath);
+    ASSERT_TRUE(markerExists());
+    {
+        std::ofstream marker(markerPath, std::ios::binary | std::ios::trunc);
+        marker.put(1);
+    }
+    reopenAndCheckRows(rowsOfFirstCheckpoint());
+}
+
+// A completed pinned checkpoint is the last thing in the WAL, and the next checkpoint crashes
+// once its shadow file exists. Its shadow does not belong to the CHECKPOINT record that ends the
+// WAL: recovery must neither refuse the empty shadow nor apply a complete one.
+TEST_F(PinnedCheckpointCrashWindowsTest, ActiveWALSecondCheckpointCrashShadowNotFlushed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    crashDuringNextCheckpoint(false /* flushShadowFirst */, readerConn);
+    reopenAndCheckRows(rowsOfFirstCheckpoint());
+}
+
+TEST_F(PinnedCheckpointCrashWindowsTest, ActiveWALSecondCheckpointCrashShadowFlushed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    crashDuringNextCheckpoint(true /* flushShadowFirst */, readerConn);
+    reopenAndCheckRows(rowsOfFirstCheckpoint());
+}
+
+// After a reopen the CHECKPOINT record that ended the WAL is gone together with the WAL: recovery
+// retires a WAL that ends in the record of a completed pinned checkpoint. So the next checkpoint
+// cannot rotate a frozen WAL that ends in that record, and the window above has no frozen
+// variant.
+TEST_F(PinnedCheckpointCrashWindowsTest, ReopenRetiresWALEndingInCompletedPinnedCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    ASSERT_TRUE(markerExists());
+    reopenWithoutReader(readerConn);
+    EXPECT_FALSE(std::filesystem::exists(StorageUtils::getWALFilePath(databasePath)));
+    EXPECT_FALSE(markerExists());
+    EXPECT_EQ(readRows(), rowsOfFirstCheckpoint());
+}
+
+// A pinned checkpoint that committed (its record is the last one in the WAL) but did not apply its
+// shadow pages yet, behind an older completed pinned checkpoint. The older marker must not make
+// recovery drop this checkpoint's shadow: the commit it holds is only there.
+TEST_F(PinnedCheckpointCrashWindowsTest, CommittedPinnedCheckpointIsAppliedBehindOlderMarker) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    ASSERT_TRUE(conn->query("CREATE (:P {id: 6, v: 6});")->isSuccess());
+    crashWith(
+        [](main::ClientContext& context, SnapshotFn snapshot) {
+            return std::make_unique<CheckpointerCrashesAfterCheckpointRecord>(context,
+                std::move(snapshot));
+        },
+        readerConn);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+    ASSERT_TRUE(markerExists());
+    reopenAndCheckRows(expectedRows());
+    // The WAL is gone after the recovery, and so is the marker that belonged to it.
+    EXPECT_FALSE(std::filesystem::exists(StorageUtils::getWALFilePath(databasePath)));
+    EXPECT_FALSE(markerExists());
+}
+
+// An unpinned checkpoint after a pinned one retires the WAL before it removes the marker; a crash
+// in between leaves a marker without a WAL.
+TEST_F(PinnedCheckpointCrashWindowsTest, MarkerWithoutWALIsRemovedByRecovery) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowAAndPinnedCheckpoint(readerConn);
+    readerConn.reset();
+    crashWith(cleanupCrash(CheckpointerCrashesInShadowCleanup::Point::AfterShadowCleanup),
+        readerConn);
+    ASSERT_FALSE(std::filesystem::exists(StorageUtils::getWALFilePath(databasePath)));
+    ASSERT_TRUE(markerExists());
+    reopenAndCheckRows(rowsOfFirstCheckpoint());
+    EXPECT_FALSE(markerExists());
+}
+
+// The process dies in the middle of retiring the frozen WAL of an unpinned checkpoint: the file is
+// truncated and synced, but not unlinked yet. The CHECKPOINT record is durable and the shadow pages
+// are applied, the cleanup has not touched the shadow file yet. The truncation is done here by
+// hand, the rest of the files are what the engine left at that point.
+class CheckpointerCrashesWhileRetiringFrozenWAL final : public Checkpointer {
+public:
+    CheckpointerCrashesWhileRetiringFrozenWAL(main::ClientContext& context,
+        std::string frozenWALPath, std::function<void()> takeSnapshot)
+        : Checkpointer(context), frozenWALPath{std::move(frozenWALPath)},
+          takeSnapshot{std::move(takeSnapshot)} {}
+
+protected:
+    void beforeWALRetirement(bool /*walRotated*/) override {
+        std::filesystem::resize_file(frozenWALPath, 0);
+        takeSnapshot();
+        throw RuntimeException("simulated crash while the frozen WAL is retired");
+    }
+
+private:
+    std::string frozenWALPath;
+    std::function<void()> takeSnapshot;
+};
+
+// A pinned checkpoint that crashed before it removed its shadow file leaves the active WAL ending
+// in its CHECKPOINT record, with the pinned-checkpoint marker behind it. Recovery must not keep
+// that WAL: its checkpoint is complete, so nothing in it is left to replay, and after the reopen
+// nothing remembers the CHECKPOINT record (the checkpointer only knows about the records it wrote
+// itself), so the next unpinned checkpoint would rotate the WAL into a frozen WAL that ends in a
+// CHECKPOINT record whose shadow file is not there. A crash of that checkpoint before its own
+// shadow file is durable then makes recovery refuse to open the database.
+TEST_F(PinnedCheckpointCrashWindowsTest, RecoveryRetiresWALEndingInCheckpointCoveredByMarker) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    createRowsWithReader(readerConn);
+    crashWith(cleanupCrash(CheckpointerCrashesInShadowCleanup::Point::BeforeShadowCleanup),
+        readerConn);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+    ASSERT_TRUE(markerExists());
+    // First recovery: the marker covers the trailing CHECKPOINT record.
+    reopenWithoutReader(readerConn);
+    EXPECT_EQ(readRows(), rowsOfFirstCheckpoint());
+    EXPECT_FALSE(std::filesystem::exists(StorageUtils::getWALFilePath(databasePath)))
+        << "Recovery kept a WAL that ends in the CHECKPOINT record of a completed checkpoint";
+    EXPECT_FALSE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+    EXPECT_FALSE(markerExists());
+    // The next checkpoint (no reader, so it rotates a WAL that exists) dies right after the
+    // rotation, before its shadow file holds anything durable.
+    crashWith(
+        [](main::ClientContext& context, SnapshotFn snapshot) {
+            return std::make_unique<CheckpointerCrashesBeforeCheckpointRecord>(context,
+                false /* flushShadowFirst */, std::move(snapshot));
+        },
+        readerConn);
+    // Second recovery.
+    reopenAndCheckRows(rowsOfFirstCheckpoint());
+}
+
+// A completed pinned checkpoint leaves the marker, which names the offset at which its CHECKPOINT
+// record ends. An unpinned checkpoint of a reopened database rotates that WAL and removes the
+// marker only at the very end; when the process dies in between, the marker is stale. The WAL
+// then restarts from empty, and a later pinned checkpoint whose CHECKPOINT record happens to end at
+// the stale offset must not be taken for the completed one: its commits are only in its shadow
+// file until the pages are applied.
+//
+// The statements of the two pinned checkpoints are the same on purpose, so that their CHECKPOINT
+// records end at the same offset of the (twice started) WAL without any file written by hand. The
+// only thing done by hand is the truncation in CheckpointerCrashesWhileRetiringFrozenWAL.
+TEST_F(PinnedCheckpointCrashWindowsTest, StaleMarkerDoesNotCoverALaterCheckpointRecord) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    const auto insertFiveRows = [this](int64_t firstID) {
+        const auto query = std::format("UNWIND range({}, {}) AS i CREATE (:P {{id: i, v: 0}});",
+            firstID, firstID + 4);
+        ASSERT_TRUE(conn->query(query)->isSuccess());
+    };
+    const auto markerOffset = [this]() -> std::optional<uint64_t> {
+        std::array<uint8_t, StorageUtils::PINNED_CHECKPOINT_MARKER_SIZE> content{};
+        std::ifstream marker(StorageUtils::getPinnedCheckpointMarkerPath(databasePath),
+            std::ios::binary);
+        marker.read(reinterpret_cast<char*>(content.data()), content.size());
+        return StorageUtils::parsePinnedCheckpointMarker(content,
+            static_cast<uint64_t>(marker.gcount()));
+    };
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE P(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+    // No reader: the table is in the data file and the WAL is gone, so the WAL of the pinned
+    // checkpoint below starts with the five rows.
+    ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
+    auto readerConn = std::make_unique<riag::main::Connection>(database.get());
+    ASSERT_TRUE(readerConn->query("BEGIN TRANSACTION READ ONLY;")->isSuccess());
+    insertFiveRows(1);
+    ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
+    ASSERT_TRUE(markerExists());
+    const auto staleOffset = markerOffset();
+    ASSERT_TRUE(staleOffset.has_value());
+    // The commit behind the CHECKPOINT record keeps the marker alive across the reopen: without
+    // it the WAL would be retired by the recovery.
+    ASSERT_TRUE(conn->query("CREATE (:P {id: 6, v: 6});")->isSuccess());
+    reopenWithoutReader(readerConn);
+    ASSERT_TRUE(markerExists());
+    ASSERT_EQ(markerOffset(), staleOffset);
+    // The unpinned checkpoint rotates the WAL and dies while it retires the frozen WAL.
+    crashWith(
+        [&](main::ClientContext& context, SnapshotFn snapshot) {
+            return std::make_unique<CheckpointerCrashesWhileRetiringFrozenWAL>(context,
+                StorageUtils::getCheckpointWALFilePath(databasePath), std::move(snapshot));
+        },
+        readerConn);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)));
+    ASSERT_EQ(std::filesystem::file_size(StorageUtils::getCheckpointWALFilePath(databasePath)), 0u);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+    // The marker belongs to a WAL that is being retired: it must not outlive this recovery.
+    reopenWithoutReader(readerConn);
+    EXPECT_EQ(readRows(),
+        (std::vector<std::pair<int64_t, int64_t>>{{1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}, {6, 6}}));
+    EXPECT_FALSE(markerExists())
+        << "The marker of a WAL that is gone survived the recovery that retired it";
+    // New commits, and a pinned checkpoint that dies after its CHECKPOINT record is durable but
+    // before its pages are applied; the record ends at the offset the stale marker names.
+    readerConn = std::make_unique<riag::main::Connection>(database.get());
+    ASSERT_TRUE(readerConn->query("BEGIN TRANSACTION READ ONLY;")->isSuccess());
+    insertFiveRows(11);
+    uint64_t walSizeAtCrash = 0;
+    crashWith(
+        [&](main::ClientContext& context, SnapshotFn snapshot) {
+            return std::make_unique<CheckpointerCrashesAfterCheckpointRecord>(context,
+                [&, snapshot = std::move(snapshot)]() {
+                    walSizeAtCrash =
+                        std::filesystem::file_size(StorageUtils::getWALFilePath(databasePath));
+                    snapshot();
+                });
+        },
+        readerConn);
+    ASSERT_EQ(walSizeAtCrash, *staleOffset)
+        << "The test needs this CHECKPOINT record to end where the first one did";
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+    reopenAndCheckRows({{1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}, {6, 6}, {11, 0}, {12, 0}, {13, 0},
+        {14, 0}, {15, 0}});
 }
 #endif // __SINGLE_THREADED__
 

@@ -3,6 +3,7 @@
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/graph_catalog_entry.h"
 #include "catalog/catalog_entry/index_catalog_entry.h"
+#include "catalog/catalog_entry/namespace_catalog_entry.h"
 #include "catalog/catalog_entry/scalar_macro_catalog_entry.h"
 #include "catalog/catalog_entry/sequence_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
@@ -58,6 +59,11 @@ std::unique_ptr<CatalogEntry> CatalogEntry::deserialize(common::Deserializer& de
     } break;
     case CatalogEntryType::GRAPH_ENTRY: {
         entry = GraphCatalogEntry::deserialize(deserializer);
+    } break;
+    case CatalogEntryType::NAMESPACE_ENTRY:
+    case CatalogEntryType::NAMESPACE_POLICY_ENTRY:
+    case CatalogEntryType::NAMESPACE_MEMBERSHIP_ENTRY: {
+        entry = NamespaceCatalogEntry::deserialize(deserializer, type);
     } break;
     default:
         UNREACHABLE_CODE;

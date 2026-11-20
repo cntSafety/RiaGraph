@@ -1,0 +1,161 @@
+-DATASET CSV empty
+
+--
+
+# A rel MERGE pattern repeated within one statement: the first row creates the rel, every later
+# row matches it and must see what the earlier rows stored.
+
+-CASE MergeDuplicateRelOnMatchReadsCreatedRel
+-STATEMENT CREATE NODE TABLE A(id STRING, w INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE B(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM A TO B, v INT64, w INT64, t STRING);
+---- ok
+-STATEMENT CREATE (:A {id: 'a'}), (:A {id: 'b'}), (:A {id: 'c'}), (:A {id: 'd'}), (:B {id: 1}), (:B {id: 2});
+---- ok
+# A committed rel of the same bound node, so the read-back has to pick the right one.
+-STATEMENT MATCH (a:A {id: 'a'}), (b:B {id: 2}) CREATE (a)-[:R {v: 100, t: 'old'}]->(b);
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A {id: 'a'}), (b:B {id: 1}) MERGE (a)-[r:R]->(b) ON CREATE SET r.v = k ON MATCH SET r.v = r.v + 10 RETURN k, r.v;
+---- 3
+1|1
+2|11
+3|21
+-STATEMENT MATCH (a:A {id: 'a'})-[r:R]->(b:B) RETURN b.id, r.v, r.t;
+---- 2
+1|21|
+2|100|old
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A {id: 'b'}), (b:B {id: 1}) MERGE (a)-[r:R]->(b) ON CREATE SET r.v = k ON MATCH SET r.w = 5 RETURN k, r.v, r.w;
+---- 3
+1|1|
+2|1|5
+3|1|5
+-STATEMENT UNWIND ['x', 'y', 'z'] AS s MATCH (a:A {id: 'c'}), (b:B {id: 1}) MERGE (a)-[r:R]->(b) ON CREATE SET r.t = s ON MATCH SET r.t = r.t + s RETURN s, r.t;
+---- 3
+x|x
+y|xy
+z|xyz
+# ON CREATE SET only: later rows return the stored rel, not the pattern's insert values.
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A {id: 'd'}), (b:B {id: 1}) MERGE (a)-[r:R]->(b) ON CREATE SET r.v = k RETURN k, r.v;
+---- 3
+1|1
+2|1
+3|1
+# Duplicates spanning more than one vector.
+-STATEMENT UNWIND range(1, 3000) AS k MATCH (a:A {id: 'd'}), (b:B {id: 2}) MERGE (a)-[r:R]->(b) ON CREATE SET r.v = k ON MATCH SET r.v = r.v + 10 RETURN count(*);
+---- 1
+3000
+-STATEMENT MATCH (a:A {id: 'd'})-[r:R]->(b:B {id: 2}) RETURN r.v;
+---- 1
+29991
+
+-CASE MergeDuplicatePatternOnMatchReadsCreatedNodeAndRel
+-STATEMENT CREATE NODE TABLE A(id STRING, w INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE B(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM A TO B, v INT64);
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:A {id: 'p'})-[r:R]->(b:B {id: 7}) ON CREATE SET r.v = k ON MATCH SET r.v = r.v + 10, a.w = coalesce(a.w, 0) + 1 RETURN k, r.v, a.w;
+---- 3
+1|1|
+2|11|1
+3|21|2
+-STATEMENT MATCH (a:A)-[r:R]->(b:B) RETURN a.id, a.w, r.v, b.id;
+---- 1
+p|2|21|7
+
+# Duplicate rows that all match one rel committed before the statement: the existence check
+# scanned r.c before any of them was merged, so each ON MATCH SET must read what the earlier rows
+# stored.
+-CASE MergeDuplicateKeyOnMatchExistingRel
+-STATEMENT CREATE NODE TABLE N(id INT64, c INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N, c INT64);
+---- ok
+-STATEMENT CREATE (:N {id: 1, c: 0}), (:N {id: 2, c: 0});
+---- ok
+-STATEMENT MATCH (a:N {id: 1}), (b:N {id: 2}) CREATE (a)-[:R {c: 0}]->(b);
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:N {id: 1}), (b:N {id: 2}) MERGE (a)-[r:R]->(b) ON MATCH SET r.c = r.c + 1;
+---- ok
+-STATEMENT MATCH ()-[r:R]->() RETURN r.c;
+---- 1
+3
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:N {id: 1}), (b:N {id: 2}) MERGE (a)-[r:R]->(b) ON MATCH SET r.c = r.c + 1 RETURN r.c;
+---- 3
+4
+5
+6
+-STATEMENT UNWIND range(1, 3000) AS k MATCH (a:N {id: 1}), (b:N {id: 2}) MERGE (a)-[r:R]->(b) ON MATCH SET r.c = r.c + 1 RETURN count(*);
+---- 1
+3000
+-STATEMENT MATCH ()-[r:R]->() RETURN r.c;
+---- 1
+3006
+-STATEMENT UNWIND [1, 2, 3] AS k MERGE (a:N {id: 1}) ON MATCH SET a.c = a.c + 1;
+---- ok
+-STATEMENT MATCH (a:N {id: 1}) RETURN a.c;
+---- 1
+3
+
+# As MergeSetChangesPatternProperty in dml_node, for rels (#166).
+-CASE MergeSetChangesRelPatternProperty
+-STATEMENT CREATE NODE TABLE A(id STRING, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE NODE TABLE B(id INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM A TO B, v INT64, w INT64);
+---- ok
+-STATEMENT CREATE REL TABLE S(FROM A TO A, v INT64);
+---- ok
+-STATEMENT CREATE (:A {id: 'a'}), (:A {id: 'b'}), (:A {id: 'c'}), (:B {id: 1}), (:B {id: 2});
+---- ok
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A {id: 'a'}), (b:B {id: 1}) MERGE (a)-[r:R {v: 5}]->(b) ON CREATE SET r.v = k RETURN k, r.v;
+---- 3
+1|1
+2|2
+3|3
+-STATEMENT MATCH (:A {id: 'a'})-[r:R]->(:B {id: 1}) RETURN r.v;
+---- 3
+1
+2
+3
+-STATEMENT UNWIND [1, 1, 1] AS k MATCH (a:A {id: 'b'}), (b:B {id: 1}) MERGE (a)-[r:R {v: k}]->(b) ON MATCH SET r.v = r.v + 10 RETURN k, r.v;
+---- 3
+1|1
+1|11
+1|1
+-STATEMENT MATCH (:A {id: 'b'})-[r:R]->(:B {id: 1}) RETURN r.v;
+---- 2
+1
+11
+-STATEMENT UNWIND [1, 2] AS k MATCH (a:A {id: 'c'}), (b:B {id: 1}) MERGE (a)-[r:R {v: k}]->(b) ON CREATE SET r.v = 2 RETURN k, r.v;
+---- 2
+1|2
+2|2
+-STATEMENT MATCH (:A {id: 'c'})-[r:R]->(:B {id: 1}) RETURN r.v;
+---- 1
+2
+# The bound end nodes stay part of the key: rows for B 1 and B 2 never merge into each other.
+-STATEMENT UNWIND [1, 2, 1, 2] AS k MATCH (a:A {id: 'c'}), (b:B {id: k}) MERGE (a)-[r:R {w: 5}]->(b) ON CREATE SET r.w = 6 RETURN k, r.w;
+---- 4
+1|6
+1|6
+2|6
+2|6
+-STATEMENT UNWIND [1, 2, 3] AS k MATCH (a:A {id: 'a'}) MERGE (a)-[r:S {v: 5}]->(a) ON CREATE SET r.v = k RETURN k, r.v;
+---- 3
+1|1
+2|2
+3|3
+-STATEMENT MATCH (x:A)-[r:S]->(y:A) RETURN x.id, y.id, r.v;
+---- 3
+a|a|1
+a|a|2
+a|a|3
+# The pattern's nodes are created again with the rel, so the second row violates B's primary key.
+-STATEMENT UNWIND [1, 2] AS k MATCH (a:A {id: 'a'}) MERGE (a)-[r:R {v: 5}]->(b:B {id: 7}) ON CREATE SET r.v = k RETURN k, r.v;
+---- error
+Runtime exception: Found duplicated primary key value 7, which violates the uniqueness constraint of the primary key column.

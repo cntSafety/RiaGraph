@@ -6,23 +6,10 @@ namespace riag {
 namespace processor {
 
 void PatternCreationInfo::updateID(common::executor_id_t executorID,
-    common::executor_info executorInfo, bool storeInsertedPatternIDs,
     common::nodeID_t nodeID) const {
-    if (storeInsertedPatternIDs) {
-        // Tuple storage is packed without alignment padding; use memcpy for the store.
-        memcpy(tuple + executorID * sizeof(common::nodeID_t), &nodeID, sizeof(common::nodeID_t));
-        return;
-    }
-    if (!executorInfo.contains(executorID)) {
-        return;
-    }
-    // Write the pattern ID to every factorized table column that corresponds to this insert
-    // executor. Multiple columns can map to the same executor when several ON MATCH SET
-    // executors read the ID of the same inserted pattern (e.g. ``ON MATCH SET r.a = ...,
-    // r.b = ...``).
-    for (auto ftColIndex : executorInfo.at(executorID)) {
-        memcpy(tuple + ftColIndex * sizeof(common::nodeID_t), &nodeID, sizeof(common::nodeID_t));
-    }
+    // One ID column per insert executor. Tuple storage is packed without alignment padding; use
+    // memcpy for the store.
+    memcpy(tuple + executorID * sizeof(common::nodeID_t), &nodeID, sizeof(common::nodeID_t));
 }
 
 PatternCreationInfoTable::PatternCreationInfoTable(storage::MemoryManager& memoryManager,

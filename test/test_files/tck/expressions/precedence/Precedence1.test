@@ -113,7 +113,6 @@ True|True|False
 
 #  Null predicate takes precedence over boolean operator
 -CASE Scenario10
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -126,7 +125,6 @@ True|True|False
 
 #  List predicate takes precedence over comparison operator
 -CASE Scenario11
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -139,7 +137,6 @@ False|False|True
 
 #  List predicate takes precedence over negation
 -CASE Scenario12
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -152,7 +149,6 @@ False|False|True
 
 #  List predicate takes precedence over boolean operator
 -CASE Scenario13
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -165,7 +161,6 @@ False|False|True
 
 #  Exclusive disjunction takes precedence over inclusive disjunction in every combination of truth values
 -CASE Scenario14
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -181,7 +176,6 @@ True
 
 #  Conjunction takes precedence over exclusive disjunction in every combination of truth values
 -CASE Scenario15
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -197,7 +191,6 @@ True
 
 #  Conjunction takes precedence over inclusive disjunction in every combination of truth values
 -CASE Scenario16
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -213,7 +206,6 @@ True
 
 #  Negation takes precedence over conjunction in every combination of truth values
 -CASE Scenario17
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -228,7 +220,6 @@ True
 
 #  Negation takes precedence over inclusive disjunction in every combination of truth values
 -CASE Scenario18
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -243,7 +234,6 @@ True
 
 #  Comparison operators takes precedence over boolean negation in every combination of truth values
 -CASE Scenario19
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok
@@ -258,7 +248,6 @@ True
 
 #  Comparison operators takes precedence over boolean negation in every combination of truth values
 -CASE Scenario20
--SKIP
 ## VERIFY
 -STATEMENT CREATE NODE TABLE A(ID SERIAL, name STRING, PRIMARY KEY(ID));
 ---- ok

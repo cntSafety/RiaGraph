@@ -7,6 +7,7 @@
 #include <optional>
 
 #include "common/arrow/arrow_result_config.h"
+#include "common/namespace_set.h"
 #include "common/timer.h"
 #include "common/types/value/value.h"
 #include "function/table/scan_replacement.h"
@@ -89,6 +90,15 @@ public:
     // Client config
     const ClientConfig* getClientConfig() const { return &clientConfig; }
     ClientConfig* getClientConfigUnsafe() { return &clientConfig; }
+    const common::NamespaceSet& getNamespaceSelection() const { return namespaceSelection; }
+    uint64_t getNamespaceSelectionGeneration() const { return namespaceSelectionGeneration; }
+    const catalog::Catalog* getNamespaceSelectionOwner() const { return namespaceSelectionOwner; }
+    void setNamespaceSelection(common::NamespaceSet selection, const catalog::Catalog* owner) {
+        namespaceSelection = std::move(selection);
+        namespaceSelectionOwner = owner;
+        ++namespaceSelectionGeneration;
+    }
+    void resetNamespaceSelection() { setNamespaceSelection(common::NamespaceSet{}, nullptr); }
 
     // Database config
     const DBConfig* getDBConfig() const;
@@ -273,6 +283,14 @@ private:
     std::unique_ptr<graph::GraphEntrySet> graphEntrySet;
     // Whether the query can access internal tables/sequences or not.
     bool useInternalCatalogEntry_ = false;
+    // Set by executeNoLock when an auto-transaction statement found its namespace-dependent plan
+    // stale at transaction start. The statement's auto transaction is already rolled back, so the
+    // caller rebinds and runs it again instead of returning the error.
+    bool rebindStalePlan_ = false;
+    // Rebinds of one statement before the stale-plan error reaches the caller. A rebind binds in
+    // the transaction the statement then runs in, which another connection's schema change
+    // cannot make stale, so one rebind suffices; the bound is a backstop.
+    static constexpr uint32_t MAX_STALE_PLAN_REBINDS = 8;
     // Whether the transaction should be rolled back on destruction. If the parent database is
     // closed, the rollback should be prevented or it will SEGFAULT.
     bool preventTransactionRollbackOnDestruction = false;
@@ -280,6 +298,9 @@ private:
     std::atomic<uint32_t> activeQueryCount{0};
     std::mutex mtxForClose;
     std::condition_variable cvForClose;
+    common::NamespaceSet namespaceSelection;
+    const catalog::Catalog* namespaceSelectionOwner = nullptr;
+    uint64_t namespaceSelectionGeneration = 0;
 };
 
 } // namespace main

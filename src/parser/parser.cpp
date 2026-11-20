@@ -33,6 +33,12 @@ std::vector<std::shared_ptr<Statement>> Parser::parseQuery(std::string_view quer
     // LCOV_EXCL_STOP
 
     auto inputStream = ANTLRInputStream(queryStr);
+    // ANTLR drops a leading UTF-8 byte-order mark when it loads the input, so a query that is only
+    // a BOM (possibly after whitespace) is empty here although queryStr is not. Check the stream
+    // the lexer will actually read.
+    if (inputStream.size() == 0) {
+        throw common::ParserException("Cannot parse empty query.");
+    }
     auto parserErrorListener = ParserErrorListener();
 
     auto cypherLexer = CypherLexer(&inputStream);
